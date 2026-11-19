@@ -1,0 +1,285 @@
+{
+ "advisor_rules.py": [
+  {
+   "id": "automation-1784039316540",
+   "name": "📊【盘中】助理实盘监控",
+   "path": "scripts/advisor_rules.py"
+  },
+  {
+   "id": "automation-1785123941471",
+   "name": "📊【盘中】助理实盘监控-10:00",
+   "path": "scripts/advisor_rules.py"
+  },
+  {
+   "id": "automation-1785123941596",
+   "name": "📊【盘中】助理实盘监控-11:00",
+   "path": "scripts/advisor_rules.py"
+  },
+  {
+   "id": "automation-1785123941709",
+   "name": "📊【盘中】助理实盘监控-13:00",
+   "path": "scripts/advisor_rules.py"
+  },
+  {
+   "id": "automation-1785123941786",
+   "name": "📊【盘中】助理实盘监控-14:00",
+   "path": "scripts/advisor_rules.py"
+  }
+ ],
+ "build_yupen_from_market.py": [
+  {
+   "id": "automation-1784605310235",
+   "name": "🐟 鱼盆主生成（Tushare 主源）",
+   "path": "scripts/build_yupen_from_market.py"
+  }
+ ],
+ "calc_rsi.py": [
+  {
+   "id": "automation-1782817769722",
+   "name": "📊【收盘】综合复盘+晚报（vFinal-E v2）",
+   "path": "scripts/calc_rsi.py"
+  }
+ ],
+ "check_no_double_import.py": [
+  {
+   "id": "automation-1782002834355",
+   "name": "📊【系统维护】工程质量报告",
+   "path": "scripts/check_no_double_import.py"
+  }
+ ],
+ "cost_tracker.py": [
+  {
+   "id": "automation-1780632815958",
+   "name": "📝【周报】每周综合复盘(投顾+项目)",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1780632815958",
+   "name": "📝【周报】每周综合复盘(投顾+项目)",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1780651521929",
+   "name": "📊【炒股助理】宏观数据周报",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1780738597945",
+   "name": "📈【投顾操盘】智能选股",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1781617059257",
+   "name": "📊【炒股助理】资产配置周报",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1781663740184",
+   "name": "📊【系统维护】Quant 数据管线",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1781871850433",
+   "name": "📦 Dependabot 日清 — 午休执行(12:00)",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1782002834355",
+   "name": "📊【系统维护】工程质量报告",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1782188906018",
+   "name": "📈【投顾操盘】午间选股",
+   "path": "scripts/cost_tracker.py"
+  },
+  {
+   "id": "automation-1782817769722",
+   "name": "📊【收盘】综合复盘+晚报（vFinal-E v2）",
+   "path": "scripts/cost_tracker.py"
+  }
+ ],
+ "discover_gzh_accounts.py": [
+  {
+   "id": "automation-1782137216020",
+   "name": "📚【知识库】全网挖掘+文章精读(LLM)",
+   "path": "scripts/discover_gzh_accounts.py"
+  },
+  {
+   "id": "0d18c526-eab5-4402-b949-b9439eb682e1",
+   "name": "📚【知识库】全网挖掘+文章精读 · 槽位3",
+   "path": "scripts/discover_gzh_accounts.py"
+  },
+  {
+   "id": "11a78567-823d-4d13-970b-42ed417e9b5f",
+   "name": "📚【知识库】全网挖掘+文章精读 · 槽位2",
+   "path": "scripts/discover_gzh_accounts.py"
+  }
+ ],
+ "earnings_calendar.py": [
+  {
+   "id": "automation-1783742027380",
+   "name": "📅【持仓】财报日历(每日+周报)",
+   "path": "scripts/earnings_calendar.py"
+  }
+ ],
+ "is_trading_day.py": [
+  {
+   "id": "automation-1780738597945",
+   "name": "📈【投顾操盘】智能选股",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1780738597945",
+   "name": "📈【投顾操盘】智能选股",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1781663740184",
+   "name": "📊【系统维护】Quant 数据管线",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1782002834355",
+   "name": "📊【系统维护】工程质量报告",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1782035436209",
+   "name": "🩺【项目管理】风险巡检+写入JSON",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1782188906018",
+   "name": "📈【投顾操盘】午间选股",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1784013251841",
+   "name": "📊助理选股扫描(含创业板)(收盘)",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1784216360030",
+   "name": "🧪 QTS 策略日评（收盘回测 → 晚报消费）",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1784811393302",
+   "name": "QTS日线全市场回填(腾讯源)",
+   "path": "scripts/is_trading_day.py"
+  },
+  {
+   "id": "automation-1784821193894",
+   "name": "📈投顾·科技红利聚焦扫描",
+   "path": "scripts/is_trading_day.py"
+  }
+ ],
+ "merge_signal_ranking.py": [
+  {
+   "id": "automation-1782137216020",
+   "name": "📚【知识库】全网挖掘+文章精读(LLM)",
+   "path": "scripts/merge_signal_ranking.py"
+  },
+  {
+   "id": "0d18c526-eab5-4402-b949-b9439eb682e1",
+   "name": "📚【知识库】全网挖掘+文章精读 · 槽位3",
+   "path": "scripts/merge_signal_ranking.py"
+  },
+  {
+   "id": "11a78567-823d-4d13-970b-42ed417e9b5f",
+   "name": "📚【知识库】全网挖掘+文章精读 · 槽位2",
+   "path": "scripts/merge_signal_ranking.py"
+  }
+ ],
+ "performance_dashboard.py": [
+  {
+   "id": "automation-1785336744681",
+   "name": "📈【投顾操盘】每周绩效跟踪周报",
+   "path": "scripts/performance_dashboard.py"
+  }
+ ],
+ "price_sanity.py": [
+  {
+   "id": "automation-1780615006148",
+   "name": "🇺🇸【美股监控】盘前+收盘",
+   "path": "scripts/price_sanity.py"
+  },
+  {
+   "id": "automation-1782817769722",
+   "name": "📊【收盘】综合复盘+晚报（vFinal-E v2）",
+   "path": "scripts/price_sanity.py"
+  }
+ ],
+ "run_debate.py": [
+  {
+   "id": "automation-1780738597945",
+   "name": "📈【投顾操盘】智能选股",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1780738597945",
+   "name": "📈【投顾操盘】智能选股",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1782188906018",
+   "name": "📈【投顾操盘】午间选股",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1782188906018",
+   "name": "📈【投顾操盘】午间选股",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1782817769722",
+   "name": "📊【收盘】综合复盘+晚报（vFinal-E v2）",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1782817769722",
+   "name": "📊【收盘】综合复盘+晚报（vFinal-E v2）",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1784013251841",
+   "name": "📊助理选股扫描(含创业板)(收盘)",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1784013251841",
+   "name": "📊助理选股扫描(含创业板)(收盘)",
+   "path": "scripts/run_debate.py"
+  },
+  {
+   "id": "automation-1784506600526",
+   "name": "📈【投顾操盘】策略执行-09:50",
+   "path": "scripts/run_debate.py"
+  }
+ ],
+ "run_yupen_primary.py": [
+  {
+   "id": "automation-1784605310235",
+   "name": "🐟 鱼盆主生成（Tushare 主源）",
+   "path": "scripts/run_yupen_primary.py"
+  }
+ ],
+ "subscription_brief.py": [
+  {
+   "id": "automation-1782137216020",
+   "name": "📚【知识库】全网挖掘+文章精读(LLM)",
+   "path": "scripts/subscription_brief.py"
+  },
+  {
+   "id": "0d18c526-eab5-4402-b949-b9439eb682e1",
+   "name": "📚【知识库】全网挖掘+文章精读 · 槽位3",
+   "path": "scripts/subscription_brief.py"
+  },
+  {
+   "id": "11a78567-823d-4d13-970b-42ed417e9b5f",
+   "name": "📚【知识库】全网挖掘+文章精读 · 槽位2",
+   "path": "scripts/subscription_brief.py"
+  }
+ ]
+}
