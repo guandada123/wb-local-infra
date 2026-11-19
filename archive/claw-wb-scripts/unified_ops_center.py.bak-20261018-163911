@@ -1,0 +1,4033 @@
+#!/usr/bin/env python3
+"""
+unified_ops_center.py — 统一巡检中枢（2026-08-06 整合接管）
+
+## 背景
+用户授权：「工程维护全权，巡检发现问题自行修复，飞书告知发生了什么，使用中无感」。
+此前巡检类自动化分散（watchdog / 综合健康 / 跨项目健康 / 多项目健康 / 飞书通道自检），
+职责重叠、各自推送、无统一自愈闭环。本中枢统一接管，对标全网 AIOps 最佳实践：
+  - 三级升级：Tier1 自动修复(白名单Runbook) / Tier2 告警+建议 / Tier3 升级人工
+  - Runbook 白名单制：AI 只"识别根因"，最终只执行已注册的安全动作（防幻觉误操作）
+  - 重启循环防护：cooldown + 窗口内>N次停止自愈
+  - 执行后验证：修复后复检确认恢复
+  - 审计留痕：每次动作写 unified_self_heal_log.json (who/what/when/why/result)
+  - 飞书告知：每次自愈推结构化卡片(原因/识别/解决/修复/优化/结论)
+  - 告警去重：同一 (check_name, reason) 24h 内只推一次飞书（.ops_alerted.json 状态），审计日志照记
+  - 知识闭环：当前告警自动对照 cross_project_state 的 known_failure_modes（F1-F7），命中即标注 remediation+tier（失败模式库从"文档"变"检测规则"）
+  - 中枢自我审计(2026-08-12)：①动作效果验证(Runbook result=success≠问题解决, 23:45 memwatch_bump 教训)
+    ②副作用熔断(连续 N 次效果未恢复→Runbook 自动降级仅记录不执行, .runbook_fuse.json)
+    ③失败模式自动沉淀(熔断时自动写 F8+ 进 known_failure_modes, 实现自我升级)
+  - 检查面（8 项）：自动化健康 / 自动化失败(watchdog) / Docker 自愈 / QTS·pmf CI / 磁盘 / 飞书通道 / 调度活性 / 安全扫描
+  - 存活看门狗：独立调度 ops_center_liveness_watchdog.py（每2h，托管QTS），读状态锚 self_health.last_ok_ts，间隔>180min→飞书告警"中枢可能失联"
+  - 周报：--weekly 模式生成近7天自愈统计 markdown 到 output/reports/（周日自动化调用）
+
+## Runbook 白名单（已注册安全动作）
+  - #1 memwatch_bump：memwatch 阈值偏低且近期重启→提10000MB+reload（幂等可逆）
+  - #2 dependabot_rebase：OPEN dependabot PR 基于旧 main 致 CI 红→merge origin/main 进分支触发重跑
+    （不 merge PR 本身；冲突则中止升级人工；仅 dependabot/* 分支，非 dependabot 不碰）
+  - #3 container_restart：容器崩溃→self_heal.py 二次确认+崩溃循环捕获后重启（30min cooldown + 60min 振荡防护
+    + 有状态容器禁重启）。中枢在 check 阶段调用 self_heal.py 并把其 restarted 结果作为已自愈动作上报（不重复重启逻辑）
+  - #4 publish_audit_merge：检测"已验证未合并的 PR"（最新 CI 绿+非 draft+mergeable+基于最新 main）→ 自动走
+    "gh pr diff 审计 + git fetch 比对 head 一致性 + 确认 mergeable + 合并 + 合并后 main CI 重跑变绿" 流程（用户 08-06 授权发布类）
+    ⚠️ 安全约束：不 force/不绕过分支保护；合并后远程删分支被保护拒→保留孤儿分支标注 MERGED；实盘下单/对外发布仍归用户
+
+## 设计原则
+  - 不重写现有专项脚本，复用其 --json/--dry-run 接口（automation_health / self_heal / qts guard）
+  - 观察≠transition：任何外部动作(改配置/重启)先备份、幂等、可回滚
+  - fail-safe：单检查异常不崩溃，记 alert 继续
+  - 全绿 SILENT，不重复轰炸（告警去重 24h TTL + 自愈动作幂等）
+
+## 用法
+    python3 unified_ops_center.py              # 真实运行（发现问题→自愈→飞书告知）
+    python3 unified_ops_center.py --dry-run     # 只巡检不自愈不推送
+    python3 unified_ops_center.py --no-push     # 巡检+自愈但不推飞书（仅写日志）
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent.parent
+SCRIPT_DIR = Path(__file__).resolve().parent
+CLAW_ROOT = SCRIPT_DIR.parent.parent  # .workbuddy/scripts -> Claw
+PUSH = SCRIPT_DIR / "push_feishu.sh"
+CHAT_ID = "oc_9ee5303497f5e0e71666b610d6bdc346"
+SELF_HEAL_LOG = SCRIPT_DIR / "unified_self_heal_log.json"
+ALERT_DEDUP_STATE = SCRIPT_DIR / ".ops_alerted.json"  # 告警去重状态（check_name@reason -> 时间戳）
+ALERT_DEDUP_TTL_H = 24  # 同一告警 24h 内只推一次
+# 2026-09-01 run#54：QTS API 鉴权检查的**增量锚点**（见 check_qts_api_auth 文档）。
+# 存"已见过的最后一条 401/403 日志的 UTC 时间戳"，用于把 24h 滚动窗口的存量
+# 计数与"自上次检查以来的新增"分开——否则修好存量后仍会瞎红 24h，且新回归被
+# 去重键吞掉（详见该函数 docstring 的「为什么必须增量」）。
+QTS_AUTH_ANCHOR = SCRIPT_DIR / ".qts_api_auth_401_anchor.json"
+
+# 2026-08-30：纯人工处置类告警降频（key 子串匹配 -> 小时）
+# 背景：部分告警根因只能人工处理（如扫码重登），中枢无自愈路径，按 24h 推送会
+# 每日重复、长期占位并淹没真实可处置告警。此类降为 72h，仍持续提醒但不再日推。
+# 注意：仅登记确无自愈路径的项；自愈类/工程类告警仍严格走 24h，不得加入。
+ALERT_DEDUP_TTL_OVERRIDE_H = {
+    # 2026-09-29：该检查已降级为观测项（ok=None，永不推送）→ 本条 override 实际不再生效。
+    # 保留作**恢复时的依据**（若日后重新启用该告警，72h 降频仍然是对的）。
+    "微信公众号通道@wechat-download-api 登录过期": 72,  # 纯人工扫码，中枢不可自愈
+}
+
+# 2026-09-02：审计日志同类条目节流窗口（小时）。见 append_heal_log 说明。
+# 只作用于 action=="detect" 的发现类留痕；自愈/修复动作不受影响。
+AUDIT_THROTTLE_H = 6
+
+# 微信通道的上游消费方（2026-09-02 登记）：
+# 通道已死时该自动化会每日调度却无产出（白跑）。巡检须**实时查其状态**再给处置建议，
+# 而非把「建议暂停止损」写死在文案里 —— 硬编码会在暂停后立刻变成与事实相反的建议
+# （同 2026-09-02-alert-text-must-follow-implementation.md 的教训）。
+WECHAT_RSS_SYNC_ID = "automation-1785335108360"
+
+MEMWATCH_PLIST = Path.home() / "Library" / "LaunchAgents" / "com.workbuddy.memwatch.plist"
+MEMWATCH_SCRIPT = Path.home() / ".local" / "bin" / "watch_workbuddy_mem.sh"
+MEMWATCH_LOG = Path.home() / "Library" / "Logs" / "workbuddy_memwatch.log"
+MEMWATCH_TARGET_MB = 8500  # 2026-08-12: 10000→8500(与脚本一致, 消除拉锯; 10000在WB树10G时系统已OOM先杀, 8500给系统留缓冲抢在OOM前)
+MEMWATCH_LOW_MB = 8000
+
+# ── 运行日志（审计留痕 who/what/when/why/result）──
+_run_log: list[dict] = []
+
+
+# ── 告警去重（避免同一问题每小时重复轰炸飞书）──
+# 2026-08-31：去重键归一化。
+# 根因：dedup key 原为 f"{check_name}@{reason_key}"，而 reason_key 是**完整告警文案**。
+#   历次巡检为提升可诊断性而改写文案（run#36 微信 F3 细化、run#37 告警明细改取 stdout），
+#   文案一变即生成全新 key，TTL 窗口被重置 → 同一根因被当作"新问题"重新推送。
+#   实证：微信登录过期同一问题在 08-29 15:23 与 08-30 18:07 各推一次（相隔仅 27h），
+#   而该项 TTL 显式配置为 72h —— 降频设计被"改文案"架空，且 key 只增不减（2→4）。
+# 修法：去重键只取文案的**稳定主体**（首个中文逗号/全角括号之前），剥离易变诊断补充语；
+#   合并同一稳定键时保留**最新**时间戳。合并只会增强抑制（留最新=距上次推送更近），
+#   不会造成漏报；TTL override 按前缀匹配，归一化后仍命中。
+_DEDUP_KEY_MAXLEN = 60  # 与迁移前调用点 rsn[:60] 的实际效果一致，避免既有键一次性失效重推
+_DEDUP_SPLIT_SEPS = ("，", "（")  # 只切中文标点，避免破坏 "登录过期(isExpired=true)" 等 ASCII 括注
+
+
+def _dedup_key(check_name: str, reason_key: str) -> str:
+    """把 (检查项, 告警文案) 归一化为稳定的去重键。
+
+    仅用于去重，不用于展示——展示侧仍用原始文案，保证诊断信息不丢。
+    """
+    s = (reason_key or "").strip()
+    for sep in _DEDUP_SPLIT_SEPS:
+        i = s.find(sep)
+        if i > 0:
+            s = s[:i]
+    s = s.rstrip(":： ").strip()
+    # 数字归一（2026-09-01 run#53）：告警文案里嵌入的**易变计数**会击穿去重。
+    # 实证：QTS API 鉴权告警文案含「鉴权失败 N 次/24h」，N 每次运行都变(202→216→230)，
+    # 于是同一根因每小时生成新键 → 飞书被同一问题连推 3 次。计数是**诊断补充**不是身份，
+    # 身份应是「哪个检查项的什么问题」，故把数字串折叠为 # 后再截断。
+    s = re.sub(r"\d+", "#", s)
+    return f"{check_name}@{s[:_DEDUP_KEY_MAXLEN]}"
+
+
+def _load_alerted() -> dict:
+    """读取去重状态；顺带把历史"原始文案键"迁移为稳定键（同组合并，保留最新时间戳）。
+
+    迁移写入是幂等的：键已归一化后 merged==raw，不再写盘。
+    """
+    try:
+        raw = json.loads(ALERT_DEDUP_STATE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    merged: dict[str, float] = {}
+    for k, v in raw.items():
+        try:
+            ts = float(v)
+        except (TypeError, ValueError):
+            continue
+        if "@" in k:
+            name, _, reason = k.partition("@")
+            nk = _dedup_key(name, reason)
+        else:
+            nk = k
+        merged[nk] = max(merged.get(nk, 0.0), ts)
+    if len(merged) != len(raw) or any(float(v) != merged.get(k) for k, v in raw.items()):
+        ALERT_DEDUP_STATE.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+    return merged
+
+
+def _ttl_hours_for(key: str) -> int:
+    """按告警 key 取去重 TTL：纯人工处置类走 override，其余走默认 24h。"""
+    for pattern, hours in ALERT_DEDUP_TTL_OVERRIDE_H.items():
+        if pattern in key:
+            return hours
+    return ALERT_DEDUP_TTL_H
+
+
+def _save_alerted(d: dict) -> None:
+    # 清理过期条目（按各自 key 的 TTL，override 类条目保留更久）
+    now = datetime.datetime.now().timestamp()
+    d = {k: v for k, v in d.items() if now - v < _ttl_hours_for(k) * 3600}
+    ALERT_DEDUP_STATE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+
+
+def is_alert_duplicated(check_name: str, reason_key: str) -> bool:
+    """同一 (check_name, reason_key 归一化后) TTL 内已推送过 → True（跳过飞书推送，但审计日志照记）
+
+    TTL 默认 24h；命中 ALERT_DEDUP_TTL_OVERRIDE_H 的纯人工处置类告警按其配置（现 72h）。
+    """
+    d = _load_alerted()
+    key = _dedup_key(check_name, reason_key)
+    now = datetime.datetime.now().timestamp()
+    if key in d and now - d[key] < _ttl_hours_for(key) * 3600:
+        return True
+    d[key] = now
+    _save_alerted(d)
+    return False
+
+
+def log_action(action: str, target: str, reason: str, result: str, detail: str = "") -> dict:
+    # ⚠️ 2026-10-16 修复：强制字符串化 target/reason/detail。
+    #   根因：Docker 自愈的 alert 是 dict（如 {'container':..., 'issue':...}），
+    #   被 `log_action("detect", name, a, "alert")` 直接当作 reason 存入 →
+    #   append_heal_log 对 dict 做 `[:80]` 切片触发 KeyError，整轮崩溃，
+    #   且崩溃发生在飞书推送之前 → 告警卡永不发出。
+    #   此处兜底保证契约（reason: str），彻底隔离"告警内容是 dict/其他类型"这类调用方。
+    rec = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "action": action,
+        "target": str(target),
+        "reason": str(reason),
+        "result": result,  # success / skipped / failed
+        "detail": str(detail),
+    }
+    _run_log.append(rec)
+    return rec
+
+
+def append_heal_log(rec: dict) -> None:
+    try:
+        data = (
+            json.loads(SELF_HEAL_LOG.read_text(encoding="utf-8")) if SELF_HEAL_LOG.exists() else []
+        )
+    except Exception:
+        data = []
+
+    # ── 审计节流（2026-09-02 新增）──
+    # 背景：200 条环形上限被单一高频项灌满。实证（2026-08-26~09-02，共 200 条）：
+    #   187 条（93.5%）是「微信公众号通道 登录过期」这**同一条**死通道告警 ——
+    #   中枢每小时跑一次就 append 一条，7 天历史被挤出窗口，真实可处置的告警
+    #   （QTS API 鉴权 401 / 成本委托断链 / CI 容器异常）只剩 13 条且被淹没，
+    #   直接导致「日志里全是微信、看不到别的」的排查失效。
+    #   注意：飞书侧有 72h 去重、并未轰炸用户，被灌满的只是**审计留痕**，属纯损耗。
+    # 修法：同类 detect 记录在节流窗口内不新增条目，只把已存在条目的 ts 更新为
+    #   最近出现时刻并累加 hits —— 保留「最后一次见到 + 出现过几次」，
+    #   不丢可见性，也不再挤占窗口。
+    # 边界：仅作用于 action=="detect"。自愈/修复/失败类动作是处置留痕，一律不节流。
+    # 判据用 (target, reason 前 80 字) 而非全等：reason 内含计数等易变诊断语时
+    #   仍能归并（与告警去重键同思路），但比去重键更宽松，避免过度合并不同结论。
+    if rec.get("action") == "detect":
+        now = datetime.datetime.now()
+        # ⚠️ 2026-10-16 防御：reason 可能为 dict（见 log_action 修复说明），
+        #   直接 `[:80]` 切片会 KeyError。统一先 str() 再切片。
+        tk = (str(rec.get("target", "")), str(rec.get("reason") or "")[:80])
+        for i in range(len(data) - 1, -1, -1):
+            old = data[i]
+            if old.get("action") != "detect":
+                continue
+            if (str(old.get("target", "")), str(old.get("reason") or "")[:80]) != tk:
+                continue
+            try:
+                age_h = (now - datetime.datetime.fromisoformat(old["ts"])).total_seconds() / 3600
+            except Exception:  # noqa: BLE001
+                age_h = AUDIT_THROTTLE_H * 2  # 时间戳不可解析：保守当超窗，落新条目
+            if age_h < AUDIT_THROTTLE_H:
+                data[i]["ts"] = now.isoformat(timespec="seconds")
+                data[i]["hits"] = int(data[i].get("hits", 1)) + 1
+                SELF_HEAL_LOG.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                return
+            break  # 命中同类但已超窗 → 不再往前找，落新条目
+
+    rec.setdefault("hits", 1)
+    data.append(rec)
+    # 仅保留最近 200 条
+    data = data[-200:]
+    SELF_HEAL_LOG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+# ─────────────────────────────────────────────────────────────
+# 中枢自我审计（2026-08-12 新增，08-11 停机5h11m 教训固化）
+# 目标：审计者自身也要被审计。三个环：
+#  ① 动作效果验证：Runbook 执行"成功"(result=success) 不等于"问题解决"——
+#     23:45 memwatch_bump 记 success，实际打断 do_restart 致 WB 停机 5h11m。
+#  ② 副作用检测+熔断：动作后目标若出现新告警/恶化，累计 N 次自动降级该 Runbook
+#     为只记录不执行（防"自愈变互害"）。
+#  ③ 失败模式自动沉淀：把"Runbook 动作自身闯祸"类新故障自动写入
+#     cross_project_state.known_failure_modes（F8+），实现自我升级。
+# ─────────────────────────────────────────────────────────────
+# 动作效果验证器注册表: action -> 验证函数(返回 True=已恢复/达标, False=未恢复, None=无法验证)
+# 在 Runbook 执行成功后调用; 无法验证时记为 None 不参与熔断计数。
+def _verify_memwatch_bump_effect() -> bool | None:
+    """memwatch_bump 效果验证（双层，2026-08-12 AIOps 对标升级）：
+    短期(①守护存活+新阈值生效) + 长期(②最近 30min 无二次候选/重启 = 无"假性修复")。
+    杜绝"动作成功但系统仍在反复重启"的假性修复(23:45 停机 5h11m 的问题模式)。"""
+    try:
+        import re as _re
+        import subprocess as _sp
+        from datetime import datetime as _dt
+
+        # ── 短期验证：守护存活 + 新阈值生效 ──
+        r = _sp.run(["launchctl", "list"], capture_output=True, text=True, timeout=15)
+        alive = "com.workbuddy.memwatch" in (r.stdout or "")
+        if not alive:
+            return False
+        if MEMWATCH_LOG.exists():
+            tail = MEMWATCH_LOG.read_text(encoding="utf-8", errors="ignore").splitlines()[-10:]
+            thr_ok = False
+            for ln in reversed(tail):
+                if "监控启动" in ln:
+                    thr_ok = f"rss_thr={MEMWATCH_TARGET_MB}" in ln
+                    break
+            if not thr_ok:
+                return False
+        # ── 长期稳态验证：最近 30min 无二次候选/重启(反弹检测) ──
+        now = _dt.now()
+        rebound = False
+        if MEMWATCH_LOG.exists():
+            for ln in MEMWATCH_LOG.read_text(encoding="utf-8", errors="ignore").splitlines()[-300:]:
+                if "候选" not in ln and "触发重启" not in ln:
+                    continue
+                m = _re.search(r"\[(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\]", ln)
+                if not m:
+                    continue
+                try:
+                    ts = _dt.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    continue
+                if (now - ts).total_seconds() <= 30 * 60:
+                    rebound = True
+                    break
+        return not rebound
+    except Exception:
+        return None
+
+
+_EFFECT_VERIFIERS: dict[str, callable] = {
+    "memwatch_bump": _verify_memwatch_bump_effect,
+}
+# 熔断阈值：同一 Runbook 累计副作用(效果未恢复/目标随后告警)达此值 → 降级
+FUSE_TRIGGER = 2
+# 熔断 Half-Open 冷却(秒)：熔断后过此时间自动转 Half-Open，下一轮允许重试探测
+# (业界三态熔断器: Closed→Open→Half-Open→Closed, 2026-08-12 AIOps对标升级)
+FUSE_HALF_OPEN_SEC = 6 * 3600  # 6h 冷却后自动恢复尝试
+# 熔断状态文件（幂等、可审计）
+FUSE_STATE_FILE = SCRIPT_DIR / ".runbook_fuse.json"
+
+
+def _load_fuse_state() -> dict:
+    try:
+        return json.loads(FUSE_STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _save_fuse_state(d: dict) -> None:
+    FUSE_STATE_FILE.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _fuse_half_open_elapsed(action: str) -> bool:
+    """Half-Open 判定：熔断时间超过冷却期则允许自动恢复探测(不永久禁用)。"""
+    fuse = _load_fuse_state()
+    e = fuse.get(action) or {}
+    fused_at = e.get("fused_at")
+    if not fused_at:
+        return False
+    try:
+        from datetime import datetime as _dt
+
+        ts = _dt.fromisoformat(fused_at)
+        return (datetime.datetime.now() - ts).total_seconds() >= FUSE_HALF_OPEN_SEC
+    except Exception:
+        return False
+
+
+def audit_self_actions() -> list[dict]:
+    """中枢自我审计：对本次执行的 Runbook 动作做效果验证 + 副作用熔断计数。
+    返回新产生的告警/降级记录（供飞书报告展示）。"""
+    alerts: list[dict] = []
+    fuse = _load_fuse_state()
+    for rec in _run_log:
+        act = rec.get("action", "")
+        if act not in _EFFECT_VERIFIERS or rec.get("result") != "success":
+            continue
+        verifier = _EFFECT_VERIFIERS[act]
+        try:
+            ok = verifier()
+        except Exception:  # noqa: BLE001
+            ok = None
+        entry = fuse.setdefault(act, {"side_effects": 0, "fused": False})
+        if ok is False:
+            entry["side_effects"] += 1
+            rec["self_audit"] = "effect_not_recovered"
+            alerts.append(
+                f"[自我审计] {act} 动作后效果未恢复(副作用累计 {entry['side_effects']})，已计入熔断计数"
+            )
+            if entry["side_effects"] >= FUSE_TRIGGER and not entry["fused"]:
+                entry["fused"] = True
+                entry["fused_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+                alerts.append(
+                    f"[自我审计] Runbook {act} 连续 {entry['side_effects']} 次副作用 → 已熔断降级"
+                    f"(冷却 {FUSE_HALF_OPEN_SEC // 3600}h 后自动 Half-Open 恢复探测; 也可人工删 "
+                    f"{FUSE_STATE_FILE.name} 立即恢复)"
+                )
+                # 自我升级③环：熔断触发时把该故障模式自动沉淀进 known_failure_modes
+                _sink_failure_mode(act)
+        elif ok is True:
+            # 2026-08-12: 副作用计数衰减——动作效果恢复正常时, 历史副作用计数减半
+            # (Half-Open 成功后 Closed 重置; 防一次旧失误永久锁死)
+            if entry.get("side_effects", 0) > 0:
+                entry["side_effects"] = entry["side_effects"] // 2
+            rec["self_audit"] = "effect_recovered"
+        else:
+            rec["self_audit"] = "effect_unverifiable"
+    _save_fuse_state(fuse)
+    return alerts
+
+
+def is_runbook_fused(action: str) -> bool:
+    """Runbook 熔断检查：已熔断且未过 Half-Open 冷却期的 Runbook 只记录不执行。
+    冷却期过后自动解除(允许下一轮重试探测), 实现三态熔断自动恢复。"""
+    try:
+        fuse = _load_fuse_state()
+        if not bool(fuse.get(action, {}).get("fused")):
+            return False
+        # Half-Open: 冷却期已过 → 自动解除熔断, 允许下一轮重试
+        if _fuse_half_open_elapsed(action):
+            print(f"  [熔断恢复] {action} Half-Open 冷却期已过, 自动解除熔断(允许重试探测)")
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _sink_failure_mode(action: str) -> None:
+    """失败模式自动沉淀（自我升级第③环）：Runbook 熔断时把该故障模式写入
+    cross_project_state.known_failure_modes（F8+），下次同类告警自动命中
+    remediation="Runbook 已熔断, 人工审查"。幂等：同 id 不重复追加。"""
+    try:
+        data = (
+            json.loads(CROSS_STATE_PATH.read_text(encoding="utf-8"))
+            if CROSS_STATE_PATH.exists()
+            else {}
+        )
+        km = data.setdefault("monitoring", {}).setdefault("known_failure_modes", [])
+        # 已存在同 id/同 action 则跳过
+        if any(k.get("action") == action for k in km):
+            return
+        # 分配下一个 id (F1-F7 已占用, 新分配 F8/F9/...)
+        ids = [k.get("id", "") for k in km if k.get("id", "").startswith("F")]
+        next_n = max([int(i[1:]) for i in ids if i[1:].isdigit()] or [7]) + 1
+        km.append(
+            {
+                "id": f"F{next_n}",
+                "action": action,
+                "project": "all",
+                "symptom": f"{action} 自愈动作副作用",
+                "cause": "Runbook 动作执行后目标未恢复(连续副作用触发熔断)",
+                "remediation": f"Runbook {action} 已自动熔断(仅记录不执行); 请人工审查脚本逻辑并验证目标恢复后清除 .runbook_fuse.json 恢复",
+                "tier": "alert-only(需人工)",
+            }
+        )
+        import os as _os
+
+        _tmp = Path(str(CROSS_STATE_PATH) + ".tmp")
+        _tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _os.replace(_tmp, CROSS_STATE_PATH)
+        print(f"  [自我升级] 已沉淀失败模式 F{next_n}({action}) 至 known_failure_modes")
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] 失败模式沉淀失败(非阻断): {e}")
+
+
+def _reset_runbook_fuse(action: str) -> None:
+    """人工恢复 Runbook：清除熔断状态（供审查确认后手动调用/文档指引）。"""
+    try:
+        fuse = _load_fuse_state()
+        if action in fuse:
+            del fuse[action]
+            _save_fuse_state(fuse)
+    except Exception:
+        pass
+
+
+def run_cmd(
+    cmd: list[str],
+    timeout: int = 90,
+    capture: bool = True,
+    env: dict | None = None,
+    cwd: str | None = None,
+) -> subprocess.CompletedProcess:
+    # ⚠️ cwd 默认继承调用方进程。巡检类脚本必须由**调用方显式锁定 cwd**，
+    # 否则同一份代码在不同工作目录下语义不同（见 check_code_quality 的 pytest 教训，
+    # 2026-09-01 run#53：中枢以 QTS 仓为 cwd 被调度 → `pytest tests/` 跑成了 QTS 的
+    # e2e 测试 → 每小时对生产 QTS API 打 14 次未鉴权请求，自己制造 401 告警）。
+    return subprocess.run(cmd, capture_output=capture, text=True, timeout=timeout, env=env, cwd=cwd)
+
+
+def _raise_cmd_error(r: subprocess.CompletedProcess) -> None:
+    """TRY301: 将 try 块内 raise 抽象到独立函数，异常仍由调用方 except 捕获。"""
+    raise RuntimeError(r.stderr.strip()[:150])
+
+
+def push_card(title: str, content: str, level: str = "info") -> bool:
+    env = dict(os.environ)
+    env.setdefault("FEISHU_CHAT_ID", CHAT_ID)
+    env["PUSH_LEVEL"] = level
+    try:
+        r = run_cmd(["bash", str(PUSH), title, content], env=env)
+        return r.returncode == 0
+    except Exception as e:  # noqa: BLE001
+        print(f"⚠️ 推送异常: {e}")
+        return False
+
+
+# ════════════════════════════════════════════════════════════════════
+# 专项检查（复用现有脚本，不重写）
+# ════════════════════════════════════════════════════════════════════
+def _skip(reason: str, **extra) -> dict:
+    """显式 skip：**取不到证 ≠ 通过**。
+
+    2026-09-28 修「4 个死检查」时立的语义：异常分支/取数失败一律走这里，
+    渲染成 `⏭` 且**不计入 ✅ 通过数**（此前它们 `except` 里返 `{"ok": True}`，
+    于是"检查自己坏了"与"检查通过"在输出上完全一样）。
+    项目铁律：异常分支一律 fail-safe 返不通过**或显式计 skip**，不许返绿。
+    """
+    return {"ok": None, "alerts": [], "note": reason, "skipped": True, **extra}
+
+
+def check_automation_health() -> dict:
+    """复用 automation_health.py --json。返回 {ok, alerts:[]}"""
+    try:
+        r = run_cmd(
+            [sys.executable, str(SCRIPT_DIR / "automation_health.py"), "--json"], timeout=120
+        )
+        # 解析 JSON（脚本可能混输出，取首个 '{' 起至末尾）。
+        # 注意：原实现用 rfind("{")，取到的是**最后一个内层花括号**，对任何嵌套 JSON
+        # 必然 JSONDecodeError（2026-08-31 实测：纯 JSON 输出也失败）。后果是 rc==0
+        # 分支永远走 raw 回退 → data.get("alerts") 从未被读到，脚本级告警被静默吞掉。
+        out = r.stdout.strip()
+        try:
+            data = json.loads(out[out.find("{") :])
+        except Exception:
+            data = None
+
+        if r.returncode != 0:
+            # 明细在 stdout（JSON 的 by_category），不在 stderr —— 2026-08-31 实测：
+            # 只取 stderr 时飞书卡片正文是「退出码 1: 」空壳，无法定位，等于白推一次。
+            crit = []
+            if isinstance(data, dict):
+                for items in (data.get("by_category") or {}).values():
+                    for it in items or []:
+                        if it.get("health") == "🔴":
+                            crit.append(
+                                f"{it.get('name', '?')}"
+                                f"（{'/'.join(it.get('issues') or []) or '无明细'}）"
+                            )
+            n_crit = data.get("critical_count", "?") if isinstance(data, dict) else "?"
+            detail = "；".join(crit) if crit else (r.stderr[:200] or "stdout 无 JSON")
+            return {"ok": False, "alerts": [f"自动化健康 {n_crit} 项🔴: {detail}"]}
+        if data is None:
+            return {"ok": True, "alerts": [], "raw": out[-300:]}
+        alerts = data.get("alerts") or data.get("failures") or []
+        if isinstance(alerts, list) and alerts:
+            return {"ok": False, "alerts": [str(a) for a in alerts]}
+        return {"ok": True, "alerts": []}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"automation_health 异常: {e}"]}
+
+
+def check_docker_self_heal() -> dict:
+    """复用 self_heal.py（Docker 二次确认+崩溃循环捕获）。
+    覆盖 cross_project_state 的 self_heal_allowlist 内所有容器（含 QTS/pmf/StockInsight 等）。
+    返回 {ok, alerts, healed, containers}：
+      - restarted 是已完成的自愈动作（Runbook#3），作为 healed 上报
+      - alerts 才是仍需关注的（振荡防护停手/重启失败/有状态禁重启/不在docker等）
+      - containers 是存活摘要（被巡检容器数/健康数/跳过数/异常数），供报告显式呈现健康度"""
+    try:
+        r = run_cmd([sys.executable, str(SCRIPT_DIR / "self_heal.py")], timeout=120)
+        if r.returncode != 0:
+            return {
+                "ok": False,
+                "alerts": [f"self_heal 退出码 {r.returncode}"],
+                "healed": [],
+                "containers": {},
+            }
+        out = r.stdout.strip()
+        try:
+            # ⚠️ 2026-10-15 run#218 修复：原 out[out.rfind("{"):] 取最后一个 '{'，
+            #   当 JSON 内含嵌套对象（如 skipped:[{...}]）时会抓到嵌套 '{' 而非根对象开头
+            #   → json.loads 失败 → Docker 检查整项被跳过、丢失容器健康可见性。
+            #   改为「首个 '{' 到最后一个 '}'」提取根 JSON；整串先试一次以防前缀干净。
+            data = json.loads(out)
+        except Exception:
+            s, e = out.find("{"), out.rfind("}")
+            if s == -1 or e == -1 or e < s:
+                return _skip(f"docker_self_heal 输出无法解析为 JSON（raw 尾部: {out[-300:]!r}）")
+            try:
+                data = json.loads(out[s : e + 1])
+            except Exception:
+                return _skip(f"docker_self_heal 输出无法解析为 JSON（raw 尾部: {out[-300:]!r}）")
+        restarted = data.get("restarted") or []
+        alerts = data.get("alerts") or []
+        # restarted 是 Runbook#3 已完成的自愈（容器重启），作为 healed 上报
+        # ⚠️ 2026-10-15 run#218 修复：原记录缺 reason/detail 键，
+        #   报告生成阶段 h['reason']/h['detail'] 强访问 → KeyError → 整轮崩溃、飞书卡永不推送。
+        #   此处补齐契约键，与 mk_heal_record 同构。
+        healed = [
+            {
+                "action": "container_restart",
+                "target": c,
+                "reason": "容器非running自动重启（Runbook#3）",
+                "result": "success",
+                "detail": "",
+            }
+            for c in restarted
+        ]
+        # 存活摘要：从 self_heal 的 checked/skipped/alerts 汇总（含 QTS/pmf 容器）
+        checked = data.get("checked") or []
+        skipped = data.get("skipped") or []
+        containers = {
+            "checked": len(checked),
+            "healthy": len(checked) - len(alerts),
+            "skipped_stateful": len(skipped),
+            "alerts": len(alerts),
+        }
+        return {
+            "ok": len(alerts) == 0,
+            "alerts": alerts,
+            "healed": healed,
+            "containers": containers,
+            "data": data,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"self_heal 异常: {e}"], "healed": [], "containers": {}}
+
+
+def check_disk() -> dict:
+    """检查数据盘使用率（cross_project_state 阈值 warn=85 crit=92）。
+    仅查真实数据盘 /Volumes/ZHITAI；/Users/guan 在 macOS 映射到系统卷(~91%常态)，非风险点，排除。"""
+    alerts = []
+    missing: list[str] = []
+    unreadable: list[str] = []
+    try:
+        for path in ["/Volumes/ZHITAI"]:
+            if not os.path.exists(path):
+                missing.append(path)
+                continue
+            r = run_cmd(["df", "-P", path], timeout=20)
+            if r.returncode != 0:
+                unreadable.append(f"{path}(df 退出码 {r.returncode})")
+                continue
+            line = r.stdout.strip().splitlines()[-1] if (r.stdout or "").strip() else ""
+            parts = line.split()
+            if len(parts) < 5:
+                unreadable.append(f"{path}(df 输出不可解析)")
+                continue
+            try:
+                use_pct = int(parts[4].rstrip("%"))
+            except ValueError:
+                unreadable.append(f"{path}(df 使用率字段非数字)")
+                continue
+            if use_pct >= 92:
+                alerts.append(f"磁盘 {path} 使用率 {use_pct}%(crit≥92)")
+            elif use_pct >= 85:
+                alerts.append(f"磁盘 {path} 使用率 {use_pct}%(warn≥85)")
+        if missing or unreadable:
+            # 🔴 2026-10-11 修：**取不到证 ≠ 正常**。原写法 df 失败、路径缺失、输出不可解析
+            #    全都静默 continue → 报「磁盘正常」。尤其**路径缺失**：/Volumes/ZHITAI 是三个
+            #    项目的外置盘，它不在是件大事，不是"没这条路径就算了"。
+            bits = ([f"路径不存在 {'、'.join(missing)}"] if missing else []) + unreadable
+            return {"ok": None, "alerts": [], "note": "取不到证：" + "；".join(bits)}
+        return {"ok": len(alerts) == 0, "alerts": alerts}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"disk 检查异常: {e}"]}
+
+
+# ── 仓库状态检查（2026-10-11 新增）───────────────────────────────────────
+# 动机：本机多个自动化会写 Claw / QTS / StockInsight 的 git 工作树。实测撞到过两类
+# **无告警的残留**：① 负向验证做完把 QTS 仓库**留在测试分支上**（要人工切回 main）；
+# ② 改动滞留工作树数小时（可能被下一次 checkout/clean 冲掉）。
+# 判据刻意分软硬两档，避免变成恒真噪音：
+#   · 硬：当前分支 ≠ 期望默认分支 → 告警（无歧义、必处置）
+#   · 软：有未提交改动，且**最新一次改动已超过 STALE_HOURS 小时**未动 → 告警
+#         （阈值取 12h 而非几分钟：自动化"边写边提交"是常态，短阈值必然天天红）
+#   · 取不到证（仓库不存在 / git 不可用）→ ok=None 显式跳过，**不计入通过**
+REPO_STATE_STALE_HOURS = 12
+_HOME_DIR = Path(os.environ.get("HOME") or Path.home())
+REPO_STATE_TARGETS: list[tuple[str, Path, str]] = [
+    ("Claw", Path(os.environ.get("CLAW") or (_HOME_DIR / "WorkBuddy" / "Claw")), "main"),
+    ("QTS", _HOME_DIR / "WorkBuddy" / "QuantTradingSystem", "main"),
+    ("StockInsight", _HOME_DIR / "WorkBuddy" / "StockInsight", "main"),
+]
+
+
+def check_repo_state(
+    now_ts: float | None = None,
+    targets: list[tuple[str, Path, str]] | None = None,
+) -> dict:
+    """多仓库 git 状态：分支是否正确 + 是否有「过夜未提交」的改动。
+
+    返回 {"ok": True|False|None, "alerts": [...], "note": ...}；
+    ok=None = 取不到证（**不计入 ✅**，与中枢其它检查同口径）。
+    """
+    tgts = REPO_STATE_TARGETS if targets is None else targets
+    now = datetime.datetime.now().timestamp() if now_ts is None else now_ts
+    alerts: list[str] = []
+    checked: list[str] = []
+    for name, path, default_branch in tgts:
+        path = Path(path)
+        if not (path / ".git").exists():
+            continue
+        rp = run_cmd(["git", "-C", str(path), "rev-parse", "--abbrev-ref", "HEAD"], timeout=20)
+        if rp.returncode != 0:
+            continue
+        branch = (rp.stdout or "").strip()
+        if not branch:
+            continue
+        checked.append(name)
+        if branch != default_branch:
+            alerts.append(
+                f"{name} 当前在分支 `{branch}`（期望 {default_branch}）"
+                f" —— 自动化残留？切回：`git -C {path} checkout {default_branch}`"
+            )
+            continue  # 分支不对时先不叠加"滞留"噪音
+        rs = run_cmd(["git", "-C", str(path), "status", "--porcelain"], timeout=20)
+        dirty = [ln for ln in (rs.stdout or "").splitlines() if ln.strip()]
+        if not dirty:
+            continue
+        newest = 0.0
+        for ln in dirty:
+            rel = ln[3:].strip().strip('"')
+            try:
+                newest = max(newest, (path / rel).stat().st_mtime)
+            except OSError:
+                continue
+        if newest and (now - newest) / 3600 >= REPO_STATE_STALE_HOURS:
+            age_h = (now - newest) / 3600
+            alerts.append(
+                f"{name} 有 {len(dirty)} 项未提交改动，最新一次已 {age_h:.1f}h 未动"
+                f"（≥{REPO_STATE_STALE_HOURS}h = 疑似滞留；示例 `{dirty[0][3:][:60]}`）"
+            )
+    if not checked:
+        return {"ok": None, "alerts": [], "note": "无仓库可检（路径缺失或无 .git）—— 取不到证"}
+    return {
+        "ok": not alerts,
+        "alerts": alerts,
+        "note": f"已检 {len(checked)} 仓：{'/'.join(checked)}",
+    }
+
+
+def check_silent_stubs() -> dict:
+    """跨仓扫「被调用却什么都不做」的桩函数（silent_stub_scan.py）。
+
+    为什么接在这里而不是给每个仓各装一份门禁：扫描器本就支持多 `--root`，
+    接成一处只调查询即可**单一真源**覆盖三仓；给 QTS/SI 复制脚本会造多副本
+    （dual-copy-audit 会抓），而它们的 CI 也各有各的门禁风格。
+
+    判据：**只报 🔴**（被调用 + 函数体是裸注释）。🟠/🟡 有大量合法形态
+    （空对象 close / 模板方法基类 / 迁移的空 downgrade），报它们就是恒真噪音。
+    取不到证（脚本缺失 / rc=2）→ ok=None，**不计入 ✅**。
+    """
+    script = SCRIPT_DIR / "silent_stub_scan.py"
+    if not script.exists():
+        return {"ok": None, "alerts": [], "note": "silent_stub_scan.py 不存在 —— 取不到证"}
+    roots: list[str] = []
+    for name in ("QuantTradingSystem", "Claw", "StockInsight"):
+        p = _HOME_DIR / "WorkBuddy" / name
+        if p.is_dir():
+            roots.append(str(p))
+    if not roots:
+        return {"ok": None, "alerts": [], "note": "无仓库可扫 —— 取不到证"}
+    cmd = [sys.executable, str(script)]
+    for r in roots:
+        cmd += ["--root", r]
+    try:
+        r = run_cmd(cmd, timeout=180)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": None, "alerts": [], "note": f"扫描器执行失败: {e} —— 取不到证"}
+    if r.returncode == 2:
+        return {"ok": None, "alerts": [], "note": "扫描器 rc=2（路径不可读）—— 取不到证"}
+    if r.returncode not in (0, 1):
+        return {"ok": False, "alerts": [f"静默桩扫描器异常退出 rc={r.returncode}"]}
+    # rc=1 才有 🔴；把命中行摘出来（脚本输出里 🔴 开头那几行）
+    reds = [
+        ln.strip()
+        for ln in (r.stdout or "").splitlines()
+        if ln.strip().startswith("🔴") and ":" in ln
+    ]
+    reds = [ln for ln in reds if "条" not in ln]  # 去掉汇总行
+    if reds:
+        return {
+            "ok": False,
+            "alerts": [f"静默桩 {len(reds)} 处（被调用却什么都不做）: " + " ; ".join(reds[:3])],
+        }
+    return {"ok": True, "alerts": []}
+
+
+def check_feishu_channel() -> dict:
+    """飞书通道可达性（lark-cli 探测）。"""
+    try:
+        r = run_cmd(["lark-cli", "auth", "status"], timeout=30)
+        if r.returncode != 0:
+            return {"ok": False, "alerts": [f"飞书通道异常: {r.stderr[:200]}"]}
+        return {"ok": True, "alerts": []}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"飞书通道检测异常: {e}"]}
+
+
+def check_automation_failures() -> dict:
+    """补强自动化检查：复用 automation_failure_watchdog.py --dry-run（不推送，只检测）。
+    专门识别 known_failure_modes 的 F4（静默失败/401 proxy 未起）+ 关键自动化 hard 失败。
+    与 check_automation_health() 职责互补：health 看"配置/调度健康"，本函数看"近期运行是否真失败"。
+    解析其 SUMMARY 行取 failed/critical/new_critical。
+
+    🔴 分工铁律（08-06 去重治理）：watchdog(1785506975961) 是**唯一**关键失败飞书告警推送方；
+    本函数只做"趋势可见性"（记录到状态锚），**绝不返回会触发中枢推送的 alert**——
+    否则同一条关键失败会被 watchdog + 中枢整体报告双发（两套去重键不同，首轮必双推）。
+    因此 new_critical>0 时返回 ok=True + 空alerts + note（仅状态锚记录），不进 all_alerts。"""
+    try:
+        r = run_cmd(
+            [
+                sys.executable,
+                str(SCRIPT_DIR / "automation_failure_watchdog.py"),
+                "--dry-run",
+                "--hours",
+                "24",
+            ],
+            timeout=120,
+        )
+        out = r.stdout.strip()
+        # 解析 SUMMARY 行
+        m = re.search(r"SUMMARY:\s*(\{.*\})", out)
+        failed = critical = new_critical = 0
+        if m:
+            try:
+                s = json.loads(m.group(1))
+                failed = s.get("failed", 0)
+                critical = s.get("critical", 0)
+                new_critical = s.get("new_critical", 0)
+            except Exception:
+                pass
+        # 趋势可见性：把失败计数作为 note 回传（供状态锚记录），但不产生 alert 避免双发
+        if new_critical > 0:
+            return {
+                "ok": True,
+                "alerts": [],
+                "note": f"近24h 关键自动化静默失败 {new_critical} 个（已由 watchdog 推送，中枢不重复推）",
+            }
+        if critical > 0:
+            return {"ok": True, "alerts": [], "note": f"关键失败 {critical} 个均为已告警重复项"}
+        return {"ok": True, "alerts": [], "note": f"近24h 无关键失败（failed={failed}）"}
+    except Exception as e:  # noqa: BLE001
+        # 仅当 watchdog 脚本本身异常（非业务失败）才报——这是中枢该关心的"检测器健康"
+        return {"ok": False, "alerts": [f"automation_failure_watchdog 异常: {e}"]}
+
+
+def check_known_failure_modes(all_alerts: list[str]) -> list[dict]:
+    """知识闭环：把当前所有告警与 cross_project_state 的 known_failure_modes 对照，
+    命中则标注 remediation(修复建议) + tier(自愈级别)，返回增强后的告警清单。
+    状态锚里的失败模式库终于被中枢消费——从"文档"变成"检测规则"。
+    匹配策略（宽松但精准）：symptom 拆关键词(按 /,空格,中文标点)任一命中，或 project 名出现在告警。
+    project=all/all-docker 视为通用模式（仅靠 symptom 命中），不靠 project 名称强匹配。"""
+    try:
+        state = (
+            json.loads(CROSS_STATE_PATH.read_text(encoding="utf-8"))
+            if CROSS_STATE_PATH.exists()
+            else {}
+        )
+        modes = state.get("monitoring", {}).get("known_failure_modes", []) or []
+    except Exception:
+        return []
+    if not modes:
+        return []
+    enhanced = []
+    for a in all_alerts:
+        a_low = a.lower()
+        matched = None
+        for m in modes:
+            sym = m.get("symptom") or ""
+            proj = (m.get("project") or "").lower()
+            # symptom 拆关键词
+            kws = [k.strip().lower() for k in re.split(r"[/,，、\s]+", sym) if k.strip()]
+            sym_hit = any(kw and kw in a_low for kw in kws)
+            # project 匹配：通用模式(all/all-docker)不靠 project 名称；具体 project 名出现在告警才命中
+            proj_hit = bool(proj) and proj not in ("all", "all-docker") and proj in a_low
+            if sym_hit or proj_hit:
+                matched = m
+                break
+        if matched:
+            enhanced.append(
+                {
+                    "alert": a,
+                    "failure_id": matched.get("id"),
+                    "remediation": matched.get("remediation"),
+                    "tier": matched.get("tier"),
+                }
+            )
+    return enhanced
+
+
+def check_schedule_liveness() -> dict:
+    """调度活性检查：复用 schedule_utils.py stats（今日锁统计）。
+    若今日锁数=0 → 说明今天没有任何自动化完成过，调度系统可能整体挂死 → 告警。
+
+    🔴 2026-09-28 修「自证循环」：原先直接取 stats 的「今日 N 个」，
+    而**中枢自己每小时跑就会写一个锁** → N 恒 ≥ 1 → 这条检查在原理上**永远不可能**报
+    「调度整体挂死」（它用自己的存在证明调度活着）。现改为**从锁清单里剔除中枢自身**再计数，
+    并把「共几个 / 自身几个」一并带出，便于追溯（原 docstring 想表达的是"连中枢锁都没有必异常"，
+    但那正是把自身计入证据的写法）。
+    """
+    OWN_LOCK = re.compile(r"claw_lock_(unified_ops_center|统一巡检中枢)_\d{8}")
+    try:
+        r = run_cmd([sys.executable, str(SCRIPT_DIR / "schedule_utils.py"), "stats"], timeout=30)
+        out = r.stdout
+        locks = [x.strip().lstrip("🔒").strip() for x in out.splitlines() if "claw_lock_" in x]
+        own = [x for x in locks if OWN_LOCK.search(x)]
+        if not locks:
+            # 连清单都解析不出来 = 取不到证 → 显式 skip（旧实现返 ok=True，等于把"我瞎了"报成"健康"）
+            return _skip("无法从 schedule_utils stats 解析出锁清单（取不到证，不计入通过）")
+        today_n = len(locks) - len(own)
+        if today_n == 0:
+            return {
+                "ok": False,
+                "alerts": [
+                    f"今日除中枢自身外无任何调度锁（清单 {len(locks)} 个、中枢自身 {len(own)} 个）"
+                    f"→ 调度系统可能整体挂死"
+                ],
+                "today_locks": 0,
+                "own_locks": len(own),
+                "total_locks": len(locks),
+            }
+        return {
+            "ok": True,
+            "alerts": [],
+            "today_locks": today_n,
+            "own_locks": len(own),
+            "total_locks": len(locks),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"schedule_utils 异常: {e}"]}
+
+
+def check_code_quality() -> dict:
+    """工程质量综合检查（2026-08-06 扩展，原 check_security_scan 仅 bandit）。
+    覆盖 ruff 违规数 + bandit 安全 + 双导入门禁 + 单元测试（与工程质检自动化 1782002834355 同维度）。
+    设计分工：
+      - 本检查 = 只读检测 + note 可见性（写状态锚），**不自动修复、不推送**（避免与质检自动化双推）
+      - 工程质检自动化 = 负责 ruff 自动修复 + 卡片推送（中枢不抢其职责）
+    有高危安全项→告警（Tier2 仅告知）；ruff/测试/门禁异常→note 记录（不阻断，质检会处理）。"""
+    notes = []
+    alerts = []
+    bandit_unavailable = False  # 安全子信号未验证 → 见下方返回值
+
+    # 1) bandit 安全扫描（复用 security_scanner.py --quiet）
+    try:
+        r = run_cmd(
+            [sys.executable, str(SCRIPT_DIR / "security_scanner.py"), "--quiet"], timeout=180
+        )
+        m = re.search(r"bandit:\s*高危\s*(\d+)\s*\|\s*中危\s*(\d+)\s*\|\s*低危\s*(\d+)", r.stdout)
+        if m:
+            high, med, low = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if high > 0:
+                alerts.append(
+                    f"工程安全扫描发现 {high} 个高危 + {med} 中危问题（bandit），需人工复核"
+                )
+            else:
+                notes.append(f"bandit: 无高危（中{med}/低{low}）")
+        else:
+            # 🔴 2026-10-11 修：原写"无安全汇总输出（bandit 可能未装）"——**太软了**。
+            #    本检查里 ruff/测试/门禁三个子信号按设计只记 note（不阻断，交给质检自动化），
+            #    但 **bandit 是唯一承载"告警"那一档的子信号**：它没跑起来 = 安全检查**根本没验**，
+            #    而检查仍会渲染成 ✅。现标记为取不到证（函数末尾据此返回 ok=None）。
+            bandit_unavailable = True
+            notes.append("无安全汇总输出（bandit 未产出汇总）")
+    except Exception as e:  # noqa: BLE001
+        bandit_unavailable = True
+        alerts.append(f"security_scanner 异常: {e}")
+
+    # 2) ruff 违规数（只读，不 --fix）
+    try:
+        r = run_cmd(["ruff", "check", "--output-format", "concise", str(CLAW_ROOT)], timeout=120)
+        # concise 输出末行可能是 "Found N errors" 或空
+        m = re.search(r"Found\s+(\d+)\s+error", r.stdout)
+        ruff_n = int(m.group(1)) if m else 0
+        notes.append(f"ruff: {ruff_n} 项违规（质检自动化负责自动修复）")
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"ruff 检查异常: {e}")
+
+    # 3) 双导入反模式门禁
+    try:
+        chk = CLAW_ROOT / "scripts" / "check_no_double_import.py"
+        if chk.exists():
+            r = run_cmd([sys.executable, str(chk)], timeout=60)
+            if r.returncode != 0:
+                notes.append("双导入门禁: 失败（详见工程质检卡片推送）")
+            else:
+                notes.append("双导入门禁: PASS")
+        else:
+            notes.append("双导入门禁: 脚本缺失")
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"双导入门禁异常: {e}")
+
+    # 4) 单元测试套件
+    # ⚠️ 2026-09-01 run#53 根因修复：必须显式锁定 cwd=CLAW_ROOT 且用绝对路径。
+    # 原写法用相对路径 "tests/" 且继承调用方 cwd —— 本自动化以 QTS 仓为工作目录被调度，
+    # 于是「Claw 工程质量检查」实际在跑 **QTS 的 tests/**，其中 test_e2e.py /
+    # tests/contracts/* 直接对生产 127.0.0.1:8000 发未鉴权请求（无 X-API-Key），
+    # 每次巡检固定 14 条 401，被本中枢新增的 check_qts_api_auth 当成生产故障反复告警
+    # （观测者效应：巡检自己污染被巡检对象）。锁定 cwd 后该副作用归零。
+    try:
+        r = run_cmd(
+            [sys.executable, "-m", "pytest", str(CLAW_ROOT / "tests"), "-q"],
+            timeout=300,
+            env={**os.environ, "PYTHONPATH": str(CLAW_ROOT)},
+            cwd=str(CLAW_ROOT),
+        )
+        m = re.search(r"(\d+)\s+passed", r.stdout)
+        failed = re.search(r"(\d+)\s+failed", r.stdout)
+        failed_n = int(failed.group(1)) if failed else 0
+        if not m:
+            # ⚠️ 2026-10-11 修：**不许把"判不了"渲染成"通过了"**。
+            # 原写法拿不到统计行时落成 "?"，note 渲染出来是 `✅ 工程质量 … 测试: ? passed` ——
+            # 一眼扫过去像"测过了"。真实触发：用没有 pytest 的解释器跑本脚本
+            # （sys.executable 决定，我本地用 managed 3.13.12 跑时命中），
+            # pytest 只回了 `No module named pytest`，没有任何统计行。
+            # 现在显式写"无法判定"+ 原因 + 末行，让人知道该看哪。
+            tail = ((r.stdout or "") + (r.stderr or "")).strip().splitlines()
+            notes.append(
+                f"测试: **无法判定**（未产出统计行，rc={r.returncode}；"
+                f"末行: {tail[-1][:90] if tail else '(空)'}）"
+                f" —— 该子信号未通过验证，不等于通过"
+            )
+        elif failed_n > 0:
+            notes.append(f"测试: {int(m.group(1))} passed / {failed_n} failed（质检卡片会推送）")
+        else:
+            notes.append(f"测试: {int(m.group(1))} passed")
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"pytest 异常: {e}")
+
+    if bandit_unavailable:
+        # 取不到证就不计入通过：安全检查这一档没验，不能因为"其它子信号没报异常"就报 ✅
+        return {
+            "ok": None,
+            "alerts": alerts,
+            "note": " | ".join(notes + ["取不到证：安全检查(bandit)未验证，不计入通过"]),
+        }
+    return {"ok": len(alerts) == 0, "alerts": alerts, "note": " | ".join(notes)}
+
+
+def check_duplicate_picks() -> dict:
+    """选股信号去重检查（2026-08-06 新增，中优先级优化③）：
+    扫描当日投顾智能选股产物(experiments/日期.json)、午间选股(midday_pick_日期.json)、
+    助理收盘扫描产物，提取推荐票代码，标记同票多源共识，避免推送打架。
+    仅做可见性记录（note），不推送、不阻断任何选股自动化——选股类保持分离是设计意图。
+    返回 ok=True + note（含共识票数分布）。"""
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    sim_dir = SCRIPT_DIR.parent / "data" / "simulation"
+    exp_dir = sim_dir / "experiments"
+    picks: dict[str, list[str]] = {}  # code -> [源列表]
+    sources = {
+        "智能选股": exp_dir / f"{today}.json",
+        "午间选股": exp_dir / f"midday_pick_{today}.json",
+        "助理收盘扫描": sim_dir / "picks_history.json",
+    }
+    try:
+        for src, path in sources.items():
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            codes = _extract_pick_codes(data)
+            # 同一源内必须先去重：否则同一代码在该源 JSON 里出现两次（如 picks 里与
+            # 顶层 code 并存、或多子源合并残留）会被计成"两个源"，产出**假的"多源共识"**
+            # （实测 note 会写成 `600036(智能选股+智能选股)`）。共识是增强信号，不能报错。
+            for c in dict.fromkeys(codes):
+                picks.setdefault(c, []).append(src)
+        # 共识统计
+        consensus = {c: s for c, s in picks.items() if len(s) >= 2}
+        total_picks = len(picks)
+        if consensus:
+            detail = "; ".join(f"{c}({'+'.join(s)})" for c, s in consensus.items())
+            note = f"选股信号: 今日 {total_picks} 票 | 多源共识 {len(consensus)} 票: {detail}"
+        else:
+            note = f"选股信号: 今日 {total_picks} 票 | 无多源共识（各源独立）"
+        # 🔴 2026-10-18 修：本检查是**纯观测项**（无通过/不通过判据，设计上不推送不阻断），
+        # 原实现 return ok=None → 被汇总口径算成「⏭ 取不到证」，可它明明取到了证（读到了票数）。
+        # 加 observation=True：既不算 ✅（不夸大成"检查通过"），也不算 ⏭（不谎称没证据），
+        # 单独一档 👁 输出。docstring 早已写"返回 ok=True"，与代码不一致也是本轮一并纠正的。
+        return {"ok": True, "alerts": [], "note": note, "observation": True}
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"选股信号去重检查异常，本轮不计入通过: {e}")
+
+
+def _extract_pick_codes(data) -> list[str]:
+    """从选股产物 JSON 提取股票代码列表（兼容多种结构）。"""
+    codes: list[str] = []
+    if isinstance(data, dict):
+        # 常见键：picks / candidates / results / watchlist
+        for key in ("picks", "candidates", "results", "watchlist", "selected"):
+            v = data.get(key)
+            if v:
+                codes.extend(_extract_pick_codes(v))
+        # 直接含 code/股票代码 字段
+        if "code" in data and isinstance(data["code"], str):
+            codes.append(data["code"])
+    elif isinstance(data, list):
+        for item in data:
+            codes.extend(_extract_pick_codes(item))
+    elif isinstance(data, str):
+        # 尝试从文本提取 6 位数字代码
+        import re as _re
+
+        codes.extend(_re.findall(r"\b\d{6}\b", data))
+    return codes
+
+
+def _ci_red_details() -> list:
+    """枚举 QTS/pmf 当前失败的具体 CI run（repo/工作流/run ID）。
+
+    用途：让巡检告警原因携带『具体 run 标识』，避免 dedup 把不同根因的 CI 红灯（如
+    gitleaks license 红灯 vs PMF 迁移 flaky 红灯）塌缩为同一键而被静默跳过。
+    仅在 guard 报 reds>0 时调用；gh 查询失败时返回空列表（退化为通用文案，仍会告警）。"""
+    details: list = []
+    for repo in ("guandada123/QuantTradingSystem", "guandada123/project-monitor-fusion"):
+        try:
+            rr = run_cmd(
+                [
+                    "gh",
+                    "run",
+                    "list",
+                    "--repo",
+                    repo,
+                    "--status",
+                    "failure",
+                    "--limit",
+                    "5",
+                    "--json",
+                    "workflow,databaseId",
+                ],
+                timeout=60,
+            )
+            if rr.returncode == 0:
+                rows = json.loads(rr.stdout or "[]")
+                for row in rows:
+                    wf = row.get("workflow") or "?"
+                    rid = row.get("databaseId")
+                    details.append(f"{repo.split('/')[-1]}/{wf}(run {rid})")
+        except Exception:
+            pass
+    return details
+
+
+def check_qts_pmf_ci() -> dict:
+    """复用 qts_pmf_health_guard.py（CI红+容器存活）。解析其 JSON 输出而非关键词，避免误判。
+
+    修复(2026-08-12)：CI 红灯原因携带具体 run 标识（见 _ci_red_details），使去重按
+    『具体 run/根因』而非『是否红』判断，避免不同根因的红灯被误判为重复项静默跳过。"""
+    try:
+        r = run_cmd(
+            [sys.executable, str(SCRIPT_DIR / "qts_pmf_health_guard.py"), "--dry-run"], timeout=120
+        )
+        if r.returncode != 0:
+            return {"ok": False, "alerts": [f"qts_guard 退出码 {r.returncode}"]}
+        out = r.stdout.strip()
+        # 解析首段 JSON（含 ts/ci_reds/container_unhealthy/anomaly 字段）
+        m = re.search(r'\{[^{}]*"ts"[^{}]*\}', out)
+        reds = 0
+        unhealthy = 0
+        if m:
+            try:
+                data = json.loads(m.group(0))
+                reds = data.get("ci_reds", 0)
+                unhealthy = data.get("container_unhealthy", 0)
+            except Exception:
+                pass
+        if not reds and not unhealthy:
+            return {"ok": True, "alerts": []}
+        alerts = []
+        if reds:
+            specifics = _ci_red_details()
+            if specifics:
+                # 具体 run 标识前置，确保 dedup 键（取 reason[:60]）按 run 区分
+                alerts.append("GitHub CI 红灯 " + "; ".join(specifics))
+            else:
+                alerts.append(f"GitHub CI 红灯 {reds} 个（详见每日20:00巡检卡）")
+        if unhealthy:
+            alerts.append(f"容器异常 {unhealthy} 个")
+        return {"ok": False, "alerts": alerts}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"qts_guard 异常: {e}"]}
+
+
+def _last_expected_refresh(now: datetime.datetime):
+    """最近一次「应当已跑完」的信号管线刷新时点 → (时点, 依据说明) 或 (None, 原因)。
+
+    见本函数上方注释：原实现用固定 ±1 天窗口，**不认识节假日**，把中秋+周末的正常空档
+    报成「管线停摆」。现用与管线**同一份交易日历**反推。
+
+    返回 None 时由调用方降级（并**必须标明是退化判断**）—— 日历读不出来 ≠ 数据新鲜。
+    """
+    try:
+        import sys as _sys
+
+        if str(SCRIPT_DIR) not in _sys.path:
+            _sys.path.insert(0, str(SCRIPT_DIR))
+        import is_trading_day as _itd
+
+        # 日历文件缺失是「取不到依据」最常见的形态（fresh clone / 外置盘未挂载 / CI runner）：
+        # 先显式判定，好过让下游 `sys.exit` 把整条链路带走。
+        cal = getattr(_itd, "HOLIDAYS_FILE", None)
+        if cal and not Path(cal).exists():
+            return None, f"calendar_file_missing({Path(cal).name})"
+
+        holidays = _itd.load_holidays()
+    except (Exception, SystemExit) as exc:  # noqa: BLE001
+        # ⚠️ 必须带 SystemExit：is_trading_day.load_holidays() 在文件缺失/JSON 坏时**调 sys.exit(2)**，
+        #    而 SystemExit 继承自 BaseException 不是 Exception → 只写 `except Exception` 接不住，
+        #    会把整个中枢进程带走（2026-09-28 CI 实测：fresh clone 无 data/astock_holidays.json）。
+        return None, f"calendar_unavailable({type(exc).__name__})"
+    if not isinstance(holidays, dict) or not holidays.get("dates"):
+        return None, "calendar_empty"
+
+    day = now.date()
+    for back in range(30):
+        d = day - datetime.timedelta(days=back)
+        if not _itd.is_trading_day(d, holidays):
+            continue
+        for hh, mm in sorted(PIPELINE_SLOTS, reverse=True):
+            ts = datetime.datetime.combine(d, datetime.time(hh, mm))
+            if ts <= now - datetime.timedelta(minutes=PIPELINE_GRACE_MIN):
+                return ts, f"最近交易日 {d} {hh:02d}:{mm:02d}"
+    return None, "no_recent_trading_day"
+
+
+# 信号溯源管线（signal_trace_pipeline）的槽位：**只在交易日** 05:05 / 15:05
+PIPELINE_SLOTS = [(5, 5), (15, 5)]
+# 管线实测约 9 分钟；给足 LLM 编排抖动（拥堵时会更久），故宽限 90 分钟
+PIPELINE_GRACE_MIN = 90
+
+
+def check_data_freshness(now: datetime.datetime | None = None, root: Path | None = None) -> dict:
+    """数据管线新鲜度检查（2026-08-06 新增，盲点#1；2026-09-28 改判据）。
+
+    中枢 check_docker_self_heal 只查容器存活，不查数据产物新鲜度——
+    数据管线(Quant数据管线/QTS日线回填/WIND桥/信号富化)失败会导致选股/策略用陈旧K线，
+    但中枢完全失明（实证：qts_daily_backfill.py 注释'08-04 16:30失败致daily_quote缺整日'）。
+
+    2026-09-01 run#55 修复：原实现算出了 stale 却仍 return ok=True —— 抓到也不报，等于没装。
+    2026-09-28 修复（**误报**）：原判据 `mt.date() < today - 1day` 是**固定窗口、不认节假日**，
+    把中秋休市（09-25）+ 周末造成的正常空档报成「管线停摆」（实测管线 09-23~09-28 每天 success=1）。
+    现改为按交易日历推算「最近一次应当已完成的刷新时点」，见 `_last_expected_refresh`。
+    日历不可用时**退回旧窗口并标注 degraded** —— 取不到判断依据 ≠ 数据新鲜。"""
+    WHITELIST = [
+        "qts_daily_signals.json",
+        "qts_regime.json",
+        "signal_consensus.json",
+        "source_weights.json",
+    ]
+    now = now or datetime.datetime.now()
+    root = root or (CLAW_ROOT / "data")
+    expected, how = _last_expected_refresh(now)
+
+    stale = []
+    checked = 0
+    for fn in WHITELIST:
+        p = root / fn
+        if not p.exists():
+            stale.append(f"{fn}(缺失)")
+            continue
+        checked += 1
+        mt = datetime.datetime.fromtimestamp(p.stat().st_mtime)
+        age_h = (now - mt).total_seconds() / 3600
+        if expected is not None:
+            if mt < expected:
+                stale.append(f"{fn}({age_h:.0f}h前, 早于{how})")
+        # 退化判断：日历不可用 → 沿用旧固定窗口，并在文案里标明这是降级结果
+        elif mt.date() < now.date() - datetime.timedelta(days=1):
+            stale.append(f"{fn}({age_h:.0f}h前)[降级判断:{how}]")
+
+    prefix = "" if expected is not None else f"⚠️ 交易日历不可用（{how}），本次为降级判断："
+    if stale:
+        msg = f"{prefix}数据产物陈旧/缺失 {len(stale)}/{len(WHITELIST)}: {'; '.join(stale)}"
+        return {
+            "ok": False,
+            "alerts": [
+                msg + " —— 数据管线可能停摆，选股/策略将使用陈旧K线（不自动修复，需管线重跑）"
+            ],
+            "note": msg,
+        }
+    note = (
+        f"数据产物新鲜度: {checked}/{len(WHITELIST)} 全部不早于{how}"
+        if expected is not None
+        else f"{prefix}数据产物新鲜度: {checked}/{len(WHITELIST)}（未按期判定）"
+    )
+    return {"ok": True, "alerts": [], "note": note}
+
+
+WECHAT_FETCH_ANCHOR = SCRIPT_DIR / ".wechat_last_fetch_anchor.json"
+
+
+def _container_last_fetch_ts(container: str, since: str = "2400h"):
+    """取容器日志中最后一次真实抓取([Fetch])的时点（tz-aware UTC），失败返回 None。
+
+    用途：区分「登录过期导致停摆」与「先停摆、后过期」。
+
+    🔴 时间漂移型静默退化（2026-09-08 run#115 实证并修复）：
+    本函数原用固定 `--since 1200h`(50天) 回溯窗口。wechat-download-api 最后一条
+    [Fetch] 在 2026-07-20 14:19Z，而 09-08 15:16Z 的窗口起点已推到 07-20 15:16Z ——
+    **证据比窗口老 57 分钟**，于是 `--since 1200h` 命中 0 条、`--since 1300h` 命中 358 条。
+    后果三连：① 本函数返回 None ② 上层 F3 判据 `(exp_dt-last_fetch).days>=1` 落空，
+    退到 else 分支输出"需扫码重登"——**正是本函数 docstring 明确判定为误导的处置建议**
+    ③ 告警文案变化 → 去重 key 翻转 → 一条 50 天前的存量问题被当新故障重推。
+    且该退化**永不自愈**（日志窗口只会越滚越远），run#114(12:11Z) 还是对的、
+    run#115(15:15Z) 就错了，纯粹被墙钟推过临界点。
+    修复：窗口放宽到 2400h(100天) + **落盘锚点持久化**（一旦观测到就永久记住，
+    取 max(日志观测, 锚点缓存)，单调只前进）。这样证据滚出日志窗口后判定依然成立；
+    若通道日后恢复抓取，新 [Fetch] 时点更大会推进锚点，F3 自然回到 else 分支
+    （此时"扫码重登"才是正确建议），组合行为已推演闭合。
+    实证(2026-08-30 复核)：wechat-download-api 最后抓取 07-20 14:19 UTC，而登录
+    08-23 07:54 才过期 —— 抓取比过期早停 33 天（原注释写 23 天有误，已按日志实算更正），
+    说明登录态并非停摆根因，此时提示"扫码重登"会误导，
+    正确处置是摘除该巡检项或排查上游调用方。
+    取证限制(2026-08-30 实测)：容器 08-20 重启过，docker logs 现存窗口止于 07-25，
+    故 08-07 确诊的 200013 风控证据已不在窗口内（本次 grep 命中 0）。因此 F3 的
+    "抓取早停"判定成立，但 F7 风控态在现窗口内无法取证，勿据 200013=0 反推风控已解除。
+    窗口用 --since(默认 50 天) 而非 --tail，因为 --tail 5000 仅能回溯约 2 天，
+    抓不到早已停摆的抓取时点。
+    注意：docker logs 把容器 stdout/stderr 分别投到本进程的 stdout/stderr，
+    而本容器的业务日志([Fetch] 等)全部走 stderr —— 只读 r.stdout 会永远扫不到
+    （2026-08-30 实测：stderr 2101 行含 358 条 [Fetch]，stdout 25807 行含 0 条）。"""
+    last = None
+    try:
+        r = run_cmd(["docker", "logs", "--timestamps", "--since", since, container], timeout=30)
+    except Exception:  # noqa: BLE001
+        r = None
+    if r is not None:
+        for line in (r.stdout + "\n" + (r.stderr or "")).splitlines():
+            if "[Fetch]" not in line:
+                continue
+            ts = line.split(" ", 1)[0]
+            try:
+                t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if last is None or t > last:
+                last = t
+    # ── 锚点持久化：日志窗口会滚过证据，锚点不会 ──
+    cached = None
+    try:
+        raw = json.loads(WECHAT_FETCH_ANCHOR.read_text(encoding="utf-8"))
+        val = (raw or {}).get(container)
+        if val:
+            cached = datetime.datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+    except Exception:  # noqa: BLE001
+        cached = None
+    best = last if (cached is None or (last and last > cached)) else cached
+    if best is not None and (cached is None or best > cached):
+        try:
+            raw = {}
+            if WECHAT_FETCH_ANCHOR.exists():
+                raw = json.loads(WECHAT_FETCH_ANCHOR.read_text(encoding="utf-8")) or {}
+            raw[container] = best.isoformat()
+            WECHAT_FETCH_ANCHOR.write_text(
+                json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+    return best
+
+
+def _rss_upstream_facts() -> tuple[str, str]:
+    """上游 RSS 同步的（调度, 最近运行）—— **从 DB 现查真值**，不给会腐烂的硬编码文字。
+
+    为什么必须连调度一起报：该自动化（WECHAT_RSS_SYNC_ID）是**工作日**调度
+    （`FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=7`）。周末看到"产出停在周五"完全正常；
+    而原文案写的是「上游RSS同步自动化仍在**每日**调度但产出停在 <周五>」——
+    2026-10-11（周日）读到它就像"停摆"，害得我真去追了一轮，白追。
+    同理，本模块 `check_wechat_channel` 的 docstring 里「RSS 同步自动化已 PAUSED」
+    也早已腐烂（它其实一直是 ACTIVE）。结论：**凡是能查的一律别写死**；
+    取不到就明说"取不到"，别用旧文字充数。
+    """
+    aid = WECHAT_RSS_SYNC_ID
+    db = Path.home() / ".workbuddy" / "workbuddy.db"
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            rr = conn.execute(
+                "SELECT rrule FROM automations WHERE id = ? AND deleted_at IS NULL", (aid,)
+            ).fetchone()
+            lr = conn.execute(
+                "SELECT MAX(created_at) FROM automation_runs WHERE automation_id = ?", (aid,)
+            ).fetchone()
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return "(取不到调度)", "(取不到最近运行)"
+    sched = ((rr[0] if rr else "") or "").strip() or "(未设 rrule)"
+    # ⚠️ automation_runs.created_at 是**毫秒**（套 unixepoch 会得空串）
+    if lr and lr[0]:
+        ts = datetime.datetime.fromtimestamp(lr[0] / 1000).strftime("%Y-%m-%d %H:%M")
+    else:
+        ts = "(无运行记录)"
+    return sched, ts
+
+
+def check_pmf_slow_query_sink(
+    now: datetime.datetime | None = None,
+    runner=None,
+    window_hours: int = 24,
+) -> dict:
+    """PMF 慢查询落库哨兵（2026-10-17 新增）。
+
+    背景（根因反转，2026-10-17 取证）：slow_queries 表自 07-08 起"停更"，此前被误判为
+    采集链路停摆；实际是 **slow_queries_captured_at_time_index 索引损坏（zero page）**
+    导致所有 INSERT 失败 —— laravel.log 内 `慢查询持久化失败` ERROR 共 360 条，
+    表的最后一行停在损坏发生日 07-08。10-16 REINDEX 后写入链路恢复
+    （探针 INSERT→readback→DELETE 验证，残留 0）。
+
+    因此该日志错误成为**索引再次损坏的天然哨兵**：慢查询本身持续发生（PMF 常规流量下
+    每天都有 ≥500ms 记录），一旦落库失败重新出现，几乎必然意味着索引再次损坏 ——
+    比 zero page 报错浮出 docker logs 更早、更准。
+
+    判据：laravel.log 尾部（tail -c 2MB）中、window_hours 内的 `慢查询持久化失败` 条数。
+    runner 可注入（单测用假 runner 击破绿灯）。
+    """
+    now = now or datetime.datetime.now()
+    if runner is None:
+
+        def runner():
+            return run_cmd(
+                [
+                    "docker",
+                    "exec",
+                    "project-monitor-fusion-app-1",
+                    "tail",
+                    "-c",
+                    "2000000",
+                    "storage/logs/laravel.log",
+                ],
+                timeout=30,
+            )
+
+    try:
+        r = runner()
+    except Exception as e:  # 取不到证 ≠ 通过
+        return {"ok": None, "alerts": [], "note": f"读 PMF 日志失败：{e}"}
+    if getattr(r, "returncode", 1) != 0:
+        return {
+            "ok": None,
+            "alerts": [],
+            "note": f"docker exec 非零（{getattr(r, 'returncode', '?')}），取不到证",
+        }
+    out = r.stdout or ""
+    if not out.strip():
+        return {"ok": None, "alerts": [], "note": "日志尾为空，无法区分「无错误」与「读不到日志」"}
+
+    marker = "慢查询持久化失败"
+    ts_re = re.compile(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]")
+    total = 0
+    recent: list[datetime.datetime] = []
+    cutoff = now - datetime.timedelta(hours=window_hours)
+    for line in out.splitlines():
+        if marker not in line:
+            continue
+        total += 1
+        m = ts_re.search(line)
+        if not m:
+            continue
+        try:
+            ts = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if ts >= cutoff:
+            recent.append(ts)
+
+    if recent:
+        latest = max(recent).strftime("%m-%d %H:%M")
+        return {
+            "ok": False,
+            "alerts": [
+                f"近 {window_hours}h 内慢查询落库失败 {len(recent)} 次（最近 {latest}）"
+                "—— 索引损坏哨兵触发：slow_queries 的 INSERT 正在失败，"
+                "先 amcheck，再考虑 REINDEX（10-16 同款事故）"
+            ],
+            "note": f"日志尾部历史失败共 {total} 条",
+        }
+    note = f"窗口 {window_hours}h 内 0 次落库失败"
+    if total:
+        note += f"（日志尾部历史失败 {total} 条，均在窗口外）"
+    return {"ok": True, "alerts": [], "note": note}
+
+
+# 「看守类」自动化关键词：命中即视为监控/告警/巡检职责，被暂停意味着监控盲区
+GUARD_NAME_KEYWORDS = (
+    "看门狗",
+    "巡检",
+    "告警",
+    "监护",
+    "存活",
+    "哨兵",
+    "watchdog",
+    "guard",
+)
+
+
+def _query_paused_guard_automations(
+    keywords: tuple[str, ...] = GUARD_NAME_KEYWORDS,
+) -> list[dict] | None:
+    """只读查询 workbuddy.db 中「名称含看守类关键词 且 status=PAUSED」的自动化。
+
+    查不到/异常返回 None（= 无法判定，按 skip 处理，绝不误报绿）。
+    """
+    db = Path.home() / ".workbuddy" / "workbuddy.db"
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            conn.row_factory = sqlite3.Row
+            where = " OR ".join(["name LIKE ?"] * len(keywords))
+            sql = (
+                "SELECT id, name, rrule FROM automations "
+                f"WHERE deleted_at IS NULL AND status = 'PAUSED' AND ({where}) "  # noqa: S608  # nosec B608
+                "ORDER BY name"
+            )
+            rows = conn.execute(sql, [f"%{k}%" for k in keywords]).fetchall()
+            return [dict(x) for x in rows]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+# 静默破坏写法：破坏性命令 + 吞错(2>/dev/null) + 非临时路径
+SILENT_DESTRUCT_RE = re.compile(
+    r"(rm\s+-[rf]|find\s+[^\n]*?-delete|DROP\s+TABLE|TRUNCATE|shutil\.rmtree)"
+)
+BENIGN_TEMP_RE = re.compile(r"(/tmp/|/var/folders/|mktemp|\$\{?TMPDIR|\.lock\b)")
+AUDIT_MARKER_RE = re.compile(r"(-print|tee\s|dry-run|预演|留痕|--apply)")
+
+
+def _query_all_prompts() -> list[tuple[str, str, str]] | None:
+    """只读取 (id, name, prompt) 三元组。读不到返回 None（= 无法判定，skip）。"""
+    db = Path.home() / ".workbuddy" / "workbuddy.db"
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            rows = conn.execute(
+                "SELECT id, name, prompt FROM automations WHERE deleted_at IS NULL"
+            ).fetchall()
+            return [(r[0], r[1] or r[0], r[2] or "") for r in rows]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _scan_silent_destructive(prompts=None) -> list[dict] | None:
+    """扫描「静默破坏」写法：破坏性命令 + 吞掉 stderr + 非临时路径 + 无留痕/预演。
+
+    prompts 可注入（单测用已知正样本击破绿灯）；为 None 时读库，读不到返回 None。
+    """
+    if prompts is None:
+        prompts = _query_all_prompts()
+        if prompts is None:
+            return None
+    hits: list[dict] = []
+    for aid, name, prompt in prompts:
+        for line in (prompt or "").splitlines():
+            stripped = line.strip()
+            # 只检**会被真正执行的命令行**（Bash: 前缀）。说明性文字（⚠️ 为什么改 / 注释里
+            # 引用的旧写法原文）不参与判定 —— 否则会把"记载旧坏写法"误判成"正在用坏写法"。
+            if not stripped.lower().startswith("bash:"):
+                continue
+            if not SILENT_DESTRUCT_RE.search(line):
+                continue
+            if "2>/dev/null" not in line:
+                continue
+            if BENIGN_TEMP_RE.search(line):
+                continue  # 删 /tmp 临时文件与锁文件属良性
+            if AUDIT_MARKER_RE.search(line):
+                continue  # 已带 -print/tee/dry-run 等留痕或预演手段
+            hits.append({"id": aid, "name": name, "line": line.strip()[:180]})
+    return hits
+
+
+def check_silent_destructive_prompts() -> dict:
+    """自动化 prompt 里的静默破坏写法（2026-10-18 新增）。
+
+    背景：`🧹【系统维护】记忆+上下文维护` 的 2a 步原写作
+    `find $CLAW/.workbuddy/memory/ -name "*.md" -size 0 -delete 2>/dev/null` ——
+    递归删除记忆目录下的文件，却：① 不留任何删除清单；② `2>/dev/null` 吞掉全部错误，
+    当 $CLAW 为空时整条命令静默失败，输出与「本来就没有空文件」**完全一致**；
+    ③ 无预演。已硬化为「先列后删 + 逐条 -print 留痕 + 空变量显式报错」。
+
+    判据：prompt 单行同时满足「破坏性命令 + 吞 stderr + 非临时路径 + 无留痕/预演」。
+    ⚠️ 读不到库一律返回 ok=None（skip），绝不把「读不到」渲染成「没有静默破坏」。
+    """
+    hits = _scan_silent_destructive()
+    if hits is None:
+        return {
+            "ok": None,
+            "alerts": [],
+            "note": "读 workbuddy.db 失败，无法判定是否存在静默破坏写法（不误报绿）",
+        }
+    if not hits:
+        return {"ok": True, "alerts": [], "note": "未发现静默破坏写法"}
+
+    listed = "；".join(f"{h['name'][:20]}→{h['line'][:70]}" for h in hits[:3])
+    more = f"（另有 {len(hits) - 3} 条）" if len(hits) > 3 else ""
+    return {
+        "ok": False,
+        "alerts": [
+            f"{len(hits)} 处「破坏性命令 + 吞错 + 无留痕」的静默删除写法：{listed}{more}"
+            "。要求：先列后删、逐条 -print/tee 留痕、删临时文件以外禁止 2>/dev/null 吞错"
+        ],
+        "note": "命中排除项：/tmp、mktemp、.lock、-print/tee/dry-run 均不计",
+    }
+
+
+PAUSED_GUARD_ACK_PATH = (
+    Path(__file__).resolve().parent.parent / "inspection_hub" / "paused_guard_ack.json"
+)
+
+
+def _load_paused_guard_ack(path: Path | None = None) -> dict[str, str]:
+    """读「有意暂停」登记表 → {automation_id: reason}。
+
+    文件不存在 → 空表（等于没有任何条被确认，检查会照常报红 = fail-safe 方向）。
+    文件存在但解析失败 → 同样返回空表（宁可多报，不可漏报）。
+    """
+    p = path or PAUSED_GUARD_ACK_PATH
+    try:
+        if not p.exists():
+            return {}
+        d = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(d, dict):
+        return {}
+    out: dict[str, str] = {}
+    for k, v in d.items():
+        if k.startswith("_"):
+            continue
+        reason = str(v.get("reason") or "").strip() if isinstance(v, dict) else str(v or "").strip()
+        if reason:  # 只有写了理由才算"已确认"，空理由是没理由
+            out[k] = reason
+    return out
+
+
+def check_paused_guard_automations() -> dict:
+    """看守类自动化被暂停 = 静默监控盲区（2026-10-17 新增）。
+
+    背景（2026-10-17 实测）：`🛡️ 巡检中枢存活看门狗（每6h）` 于 10-15 23:30 被置为
+    PAUSED，且**无任何失败记录**（近 10 次运行 result_success 全为 1）、无文档说明暂停原因。
+    它是唯一能发现「统一巡检中枢自己失联」的告警源 —— 被暂停期间，中枢即使彻底停摆也
+    不会有人知道。这类盲区的特点正是**不产生任何噪声**：停了没人报，只有主动去查才发现。
+
+    判据：workbuddy.db 中 status='PAUSED' 且名称含看守类关键词的自动化条目数。
+    ⚠️ 刻意不依赖 deleted_at 之外的启发式；查不到库一律返回 ok=None（skip），
+    绝不能把「读不到」渲染成「没有盲区」。
+    """
+    rows = _query_paused_guard_automations()
+    if rows is None:
+        return {
+            "ok": None,
+            "alerts": [],
+            "note": "读 workbuddy.db 失败，无法判定是否存在看守盲区（不误报绿）",
+        }
+
+    if not rows:
+        return {"ok": True, "alerts": [], "note": "无被暂停的看守类自动化"}
+
+    ack = _load_paused_guard_ack()
+    unacked = [r for r in rows if r["id"] not in ack]
+    acked = [r for r in rows if r["id"] in ack]
+
+    if not unacked:
+        return {
+            "ok": True,
+            "alerts": [],
+            "note": "被暂停的看守类均已登记理由："
+            + "；".join(f"{r['name']}({ack[r['id']][:40]})" for r in acked[:3]),
+        }
+
+    listed = "；".join(f"{r['name']}({r['id'][:12]}…)" for r in unacked[:5])
+    more = f"（另有 {len(unacked) - 5} 条）" if len(unacked) > 5 else ""
+    return {
+        "ok": False,
+        "alerts": [
+            f"{len(unacked)} 个看守/告警类自动化处于 PAUSED 且未登记理由 —— 属于无声监控盲区："
+            f"{listed}{more}。请确认为有意暂停：有意→写入 "
+            f"inspection_hub/paused_guard_ack.json（须填 reason）；无意→立即恢复"
+        ],
+        "note": f"看守类关键词：{'/'.join(GUARD_NAME_KEYWORDS)}；已登记 {len(acked)} 条",
+    }
+
+
+def check_wechat_channel() -> dict:
+    """微信公众号数据链路检查（2026-08-07 新增，盲点#3）。
+
+    🔴 2026-09-29 **降级为观测项**（返回 ok=None）：不再进飞书告警，只每次打印一行。
+    原因：上游自 07-20 阻断后连续 40+ 天每日报同一条「登录过期」，而本地**没有可执行处置**
+    （扫码重登已被实证无效）。台账原写「无消费方」是**错的**，实测仍有 4 个 ACTIVE 自动化
+    在读落盘池（知识库精读×3 + 微信早报）→ 所以是「降级保留可见」
+    ⚠️ 本 docstring 原写「RSS 同步自动化已 PAUSED」**已腐烂**（2026-10-11 核实它一直是
+    ACTIVE）。凡是能查的一律别写死 —— 上游实况用 `_rss_upstream_facts()` 现查。
+    而不是删除。详见文末 return 处注释与 hub registry 的 retired/muted 登记。
+
+    背景：云RSS(wechatrss) 7/30 曾因微信关闭文章列表接口停摆 ——
+    ⚠️ **2026-10-11 更正：云轨已恢复**（工作日 07:30 同步，实测池子落盘到 10-09）。
+    本地
+    wechat-download-api(5001) 08-07 确诊全接口被微信风控(ret=200013 freq control)——
+    登录有效(isExpired=false)、轮询器仍在跑(last_poll=当日)但每次 poll 都被 200013 拒，
+    文章停在 07-20。注意 article_count 是历史存量(837篇)会误导，风控铁证在容器日志。
+    设计四态：
+      ① isExpired=true → alert（F3：需用户扫码重登）
+      ② 容器最近日志 200013(freq control) ≥5 条 → alert（F7：风控态，禁止重登空转）
+      ③ 服务不可达 → alert（基础设施故障）
+      ④ 订阅为空/仅存量正常 → note 可见性。
+    告警文本刻意不带 "wechat-download-api" 字样（风控态走 F7 symptom 命中，
+    避免 F3 的 project 匹配抢先给出"扫码重登"的错误 remediation）。"""
+    import json as _json
+    import urllib.request as _ur
+
+    alerts, notes = [], []
+    freq_cnt = -1
+    expired = False
+    exp_ms = None
+    try:
+        with _ur.urlopen("http://localhost:5001/api/admin/status", timeout=6) as r:
+            st = _json.loads(r.read().decode("utf-8"))
+        expired = bool(st.get("isExpired", False))
+        exp_ms = st.get("expireTime")
+        # 不在此处立即 append 告警：需先与"最后抓取时点"比对，判定登录态是否真是停摆根因
+        # （见下方 F3 细化）。若抓取远早于过期即停摆，提示"扫码重登"会误导处置。
+    except Exception as e:  # noqa: BLE001
+        alerts.append(f"本地微信通道不可达(localhost:5001): {e}")
+        return _skip("微信公众号通道(已降级为观测项，不再推送): " + "; ".join(alerts))
+    # 风控铁证：容器日志近 6h 内 200013(freq control) 出现次数（--timestamps 窗口过滤，
+    # 避免 300 行短窗口被健康检查日志冲掉、也避免把"历史风控"当"当前风控"）
+    freq_cnt = 0
+    freq_total = 0
+    try:
+        r = run_cmd(
+            ["docker", "logs", "--timestamps", "wechat-download-api", "--tail", "5000"], timeout=30
+        )
+        _now = datetime.datetime.now(datetime.timezone.utc)
+        # 2026-08-30 修复：只扫 r.stdout 会让该检测形同虚设——容器业务日志(含 ret 码)
+        # 全部走 stderr，docker logs 按流分离投递。必须合并两流，否则 F7 风控态
+        # 永远命中不了（建成至今 freq 恒为 0，实为漏检而非"无风控"）。
+        for line in (r.stdout + "\n" + (r.stderr or "")).splitlines():
+            if "200013" not in line:
+                continue
+            freq_total += 1
+            ts = line.split(" ", 1)[0]
+            try:
+                t = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if (_now - t).total_seconds() < 6 * 3600:
+                    freq_cnt += 1
+            except ValueError:
+                continue
+    except Exception:  # noqa: BLE001
+        freq_cnt = freq_total = -1  # docker 不可用，跳过该信号
+    if not expired and freq_cnt >= 3:
+        alerts.append(
+            f"本地微信通道风控态(近6h日志 {freq_cnt} 次 ret=200013 freq control；"
+            f"勿重登空转，等风控窗口解除或 wechatrss 新链路落地)"
+        )
+    elif freq_cnt == -1:
+        notes.append("docker 不可用，freq control 信号未检测")
+    elif freq_cnt == 0:
+        notes.append(f"本地微信通道近6h无新风控(200013: 近6h={freq_cnt}/全窗口={freq_total})")
+    # F3 细化（2026-08-30）：判定「登录过期」是否真是停摆根因
+    # 若最后抓取远早于登录过期 → 通道是"先停摆、后过期"，扫码重登无法恢复，
+    # 正确处置是摘除该巡检项或排查上游调用方。否则维持原 F3 remediation。
+    # 告警文案保持静态（不含动态日期），避免每次运行都产生新去重 key 造成重复推送。
+    if expired:
+        exp_dt = (
+            datetime.datetime.fromtimestamp(exp_ms / 1000, datetime.timezone.utc)
+            if isinstance(exp_ms, (int, float))
+            else None
+        )
+        last_fetch = _container_last_fetch_ts("wechat-download-api")
+        if last_fetch and exp_dt and (exp_dt - last_fetch).days >= 1:
+            # 2026-09-02 补「上游影响面」：此前只说「确认上游调用方」，没给出上游实况，
+            # 处置者仍需自己查。上游的**真实调度与最近运行**改由 _rss_upstream_facts() 现查
+            # （原注释写死「每日调度」是错的：它是工作日调度，周日读起来像停摆 —— 实测误导过一轮）。
+            # 用**日期**而非精确时刻，保证文案静态、不冲击告警去重键。
+            upstream = ""
+            try:
+                art_dir = CLAW_ROOT / "output" / "wx_articles"
+                if art_dir.is_dir():
+                    newest = max(
+                        (p.stat().st_mtime for p in art_dir.iterdir() if p.is_file()),
+                        default=None,
+                    )
+                    if newest:
+                        d = datetime.datetime.fromtimestamp(newest)
+                        # 实时查上游状态，按实况给建议：
+                        # 上游还活着 → 提示白跑、建议止损；上游已停 → 说明现状。
+                        up_st = _automation_status(WECHAT_RSS_SYNC_ID)
+                        if up_st == "ACTIVE":
+                            sched, lastrun = _rss_upstream_facts()
+                            upstream = (
+                                f"；上游RSS同步自动化 **ACTIVE**（调度={sched}；最近运行 {lastrun}），"
+                                f"落盘产出停在 {d:%Y-%m-%d}"
+                                f" —— ⚠️ **非调度日（周末/节假日）产出落后属正常，勿据此判停摆**；"
+                                f"只有「调度日跑过之后产出仍未前移」才是真停摆"
+                            )
+                        else:
+                            upstream = (
+                                f"；上游RSS同步自动化已停止调度({up_st or '查不到'})，"
+                                f"落盘停在{d:%Y-%m-%d}，通道恢复前无消费方"
+                            )
+            except Exception:  # noqa: BLE001
+                upstream = ""
+            alerts.append(
+                "wechat-download-api 登录过期(isExpired=true)，但通道早于过期即停摆，"
+                "重登大概率无法恢复，建议摘除该巡检项或确认上游调用方" + upstream
+            )
+            notes.append(
+                f"微信通道实况: 最后抓取 {last_fetch:%Y-%m-%d %H:%M} UTC/"
+                f"登录过期 {exp_dt:%Y-%m-%d %H:%M} UTC，"
+                f"抓取早于过期 {(exp_dt - last_fetch).days} 天停摆；"
+                f"风控(200013): 近6h={freq_cnt}/全窗口={freq_total}"
+            )
+        else:
+            alerts.append("wechat-download-api 登录过期(isExpired=true)，需扫码重登")
+    # 订阅侧补充可见性
+    try:
+        with _ur.urlopen("http://localhost:5001/api/rss/subscriptions", timeout=6) as r:
+            subs = _json.loads(r.read().decode("utf-8")).get("data", []) or []
+        if not subs:
+            notes.append("本地微信订阅列表为空")
+    except Exception as e:  # noqa: BLE001
+        notes.append(f"订阅列表读取失败: {e}")
+    # 2026-09-29 降级为**观测项**（ok=None → 渲染 ⏭、不计入通过、不推送）：
+    # 该通道自 07-20 起由上游阻断（微信关闭文章列表接口 + 本地 200013 风控），
+    # 连续 40+ 天每日报「登录过期」，而本地**无可执行处置**（扫码重登已被实证无效，
+    # 见 2026-08-30 结论）→ 每日推送只会淹没真正可处置的告警。
+    # 保留理由：它并非孤儿 —— 落盘池仍有 4 个 ACTIVE 消费方（知识库精读×3 + 微信早报），
+    # ⚠️ 2026-10-11 更正：池子**由云轨供给且已恢复**（不是"停更"）——
+    #    本项保留的理由是「本地通道仍死 + 池子新鲜度/上游实况需要一行可见」，
+    #    不是"池子停更需要看见"。状态一律现算（见 _rss_upstream_facts），别在注释里写死。
+    # ⚠️ 2026-10-11 修：此处原写「RSS 同步自动化已 PAUSED」——**已腐烂**（实测它一直是 ACTIVE，
+    #    工作日 07:30 调度）。同句在别处也出现了两次（均已改）。**能查的一律别写死**：
+    #    上游实况用 `_rss_upstream_facts()` 现查，别在此写状态。
+    # 周报 D 段仍是该链路的固定出口。
+    # 恢复方式：把本函数两处 `_skip(...)` 改回 `{"ok": False, "alerts": alerts}` 即可。
+    return _skip("微信公众号通道(已降级为观测项，不再推送): " + "; ".join(alerts + notes))
+
+
+# 成本告警的受托自动化：中枢刻意只做 note（不抢推送），把超预算告警委托给它。
+# 若它被暂停/删除，委托链断裂 → 超预算告警零出口。故每次判定前必须先校验受托方存活。
+#
+def _automation_status(automation_id: str | None) -> str | None:
+    """读取自动化当前状态（ACTIVE / PAUSED / DELETED / None=查不到）。
+
+    只读打开 workbuddy.db，任何异常都返回 None（查不到 = 保守判定为「委托不可信」）。
+    `automation_id` 为 None（= 已声明无受托方）时直接返回 None，不发无意义查询。
+    """
+    if not automation_id:
+        return None
+    db = Path.home() / ".workbuddy" / "workbuddy.db"
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute(
+                "SELECT status FROM automations WHERE id = ? AND deleted_at IS NULL",
+                (automation_id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return row[0] if row else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def check_cost_anomaly() -> dict:
+    """积分预算检查（2026-10-10 换源：¥ → 积分，见 PA-009 / docs/consumption-ledger.md）。
+
+    ## 沿革（保留作对照，勿再按旧口径解释本检查）
+    - 2026-08-06 新增：读 cost_tracker 的 ¥ 累计（当时走自付 API 账单，单位成立）
+    - 2026-09-01 修三层失效：路径错 / 子命令无效 / run_cmd 失败被吞成假绿
+    - 2026-09-02 修「委托断链致超预算告警零出口」
+    - 2026-10-08 声明成本类自动化全部退役、无继任者（出口本来就在中枢）
+    - 2026-10-10 **换源**：cost_tracker 的价目表约为公开牌价的数十倍，且自记账只覆盖
+      全量 token 的 0.031% → 它算出来的「超预算」是自记口径的产物，不是实付。
+      用户现走积分（唯一真实扣减）→ 判据改为**官方积分**，读取单源 credit_meter，
+      阈值与层级判定单源 budget_guard（本函数只负责「变成巡检结论 + 文案」）。
+      于是委托方那句也没必要了：没有受托自动化，出口就是本条。
+
+    今天起本检查回答的是「本月积分用了多少、离额度多远」，不再是「花了多少钱」。
+    """
+    try:
+        import budget_guard
+    except ImportError as e:  # 路径异常不静默：显式 skip（不计入通过）
+        return _skip(f"积分预算: budget_guard 不可导入({e})")
+
+    try:
+        st = budget_guard.check_budget_status()
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"积分预算检查异常，本轮不计入通过: {e}")
+
+    spent = float(st.get("spent") or 0.0)
+    pct = float(st.get("pct") or 0.0)
+    budget = budget_guard.monthly_budget_credits()
+
+    # 读数失败 = fail-closed 的 flash_only，但错误类型不同 → 区分文案（避免把故障说成超支）
+    if st.get("tier") == "flash_only" and budget <= 0:
+        return {
+            "ok": False,
+            "alerts": [
+                "积分预算配置异常（月预算<=0）→ budget_guard 已 fail-closed 锁定 Flash；"
+                f"处置：设 {budget_guard.BUDGET_ENV_VAR} 为你的积分套餐额度"
+            ],
+            "note": st.get("msg", ""),
+        }
+    if st.get("tier") == "flash_only" and spent == 0.0 and "读数失败" in str(st.get("msg", "")):
+        return _skip(f"积分预算: {st.get('msg')}")
+
+    note = f"积分(本月): {spent:.0f}/{budget:.0f}（{pct * 100:.0f}%）"
+
+    # 月底线性预估（只在有预算时才谈「超」）
+    est = None
+    if budget > 0:
+        import calendar
+        import datetime
+
+        today = datetime.date.today()
+        days_in_month = calendar.monthrange(today.year, today.month)[1]
+        est = spent / max(today.day, 1) * days_in_month
+        if est > budget:
+            note += f" | ⚠️月底预估超额度（{est:.0f} 积分）"
+
+    if budget > 0 and spent > budget:
+        over = spent - budget
+        return {
+            "ok": False,
+            "alerts": [
+                f"本月积分 {spent:.0f} / 预算 {budget:.0f}（已用 {pct * 100:.0f}%），"
+                f"已超 {over:.0f} 积分"
+                + (f"，月底预估 {est:.0f}" if est else "")
+                + f"；判据＝官方积分（唯一真实扣减，单源 credit_meter），"
+                f"额度＝套餐月发+签到累计（可用 {budget_guard.GRANT_ENV_VAR} / "
+                f"{budget_guard.BUDGET_ENV_VAR} 调整）；"
+                f"处置：执行 budget_guard 降级策略或调额度"
+            ],
+            "note": note,
+        }
+    if st.get("tier") == "flash_only":
+        # ≥87.5%：降级已生效，属动作而非异常 → note（避免与真超支混淆）
+        note += f" | ⚠️已过 {budget_guard.FLASH_LOCK_PCT * 100:.1f}% 阈值，budget_guard 层级={st['tier']}"
+    return {"ok": True, "alerts": [], "note": note, "kind": "note"}
+
+
+def check_dependabot_backlog() -> dict:
+    """Dependabot PR 堆积检查（2026-08-06 新增，盲点#3）。
+    中枢 check_qts_pmf_ci 只查 CI 红不查开 PR 堆积；Dependabot日清(1781871850433)在清但中枢无可见性。
+    仅 note（不推送、不自动 merge，依赖清理自动化负责）。"""
+    try:
+        # 用 gh 查当前仓库 open 的 dependabot PR 数（无则降级 note）
+        r = run_cmd(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--author",
+                "app/dependabot",
+                "--state",
+                "open",
+                "--json",
+                "number",
+                "--jq",
+                "length",
+            ],
+            timeout=60,
+            env={**os.environ, "PATH": os.environ.get("PATH", "")},
+        )
+        if r.returncode != 0:
+            return _skip("Dependabot堆积: gh不可用（取不到证，不计入通过）")
+        n = r.stdout.strip()
+        try:
+            cnt = int(n)
+        except ValueError:
+            return _skip(f"Dependabot堆积: 解析失败({n})（取不到证，不计入通过）")
+        flag = " ⚠️堆积>10" if cnt > 10 else ""
+        # 🔴 2026-10-18 修：原实现无论解析成功与否都 return ok=None，
+        # 而 `cnt > 10` 只是往 note 里拼了个字符串、从不产生 alert →
+        # **本检查的"红"状态不可达**，永远显示为「⏭ 取不到证」。
+        # 但事实是：它已经成功读到了 PR 数（证据到手）。"读到事实"与"取不到证"
+        # 必须分开 —— 前者应给出通过/不通过，后者才该 skip。
+        # 若继续恒 None，堆积到 50 个 PR 也不会有任何告警，属典型假跳过。
+        if cnt > 10:
+            return {
+                "ok": False,
+                "alerts": [
+                    f"Dependabot 开放 PR {cnt} 个（>10）—— 清理自动化未跟上，"
+                    f"建议人工复核是否卡在 CI 红/依赖冲突"
+                ],
+                "note": f"Dependabot堆积: {cnt} 个开放PR{flag}",
+            }
+        return {"ok": True, "alerts": [], "note": f"Dependabot堆积: {cnt} 个开放PR{flag}"}
+    except Exception as e:  # noqa: BLE001
+        return _skip(f"Dependabot检查异常，本轮不计入通过: {e}")
+
+
+# ════════════════════════════════════════════════════════════════════
+# Runbook 白名单自愈（仅已注册安全动作）
+# ════════════════════════════════════════════════════════════════════
+def _memwatch_recent_restart(window_min: int = 90) -> bool:
+    if not MEMWATCH_LOG.exists():
+        return False
+    try:
+        lines = MEMWATCH_LOG.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except Exception:
+        return False
+    now = datetime.datetime.now()
+    for ln in lines[-200:]:
+        if "触发重启" not in ln and "重启成功" not in ln:
+            continue
+        m = re.search(r"\[(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2}:\d{2})\]", ln)
+        if not m:
+            continue
+        try:
+            ts = datetime.datetime.strptime(f"{m.group(1)} {m.group(2)}", "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+        if (now - ts).total_seconds() <= window_min * 60:
+            return True
+    return False
+
+
+def _memwatch_current_mb() -> int:
+    # 2026-08-12: 单一配置源, 优先读 conf (~/.local/etc/workbuddy_memwatch.conf),
+    #   不再解析脚本文件(脚本=只读逻辑, 防双自动化互相覆盖)。
+    try:
+        conf = Path.home() / ".local" / "etc" / "workbuddy_memwatch.conf"
+        if conf.exists():
+            for ln in conf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                m = re.match(r"\s*RSS_RESTART_MB\s*=\s*(\d+)", ln)
+                if m:
+                    return int(m.group(1))
+    except Exception:
+        pass
+    try:
+        txt = MEMWATCH_SCRIPT.read_text(encoding="utf-8")
+        m = re.search(r"RSS_RESTART_MB:=(\d+)", txt)
+        if m:
+            return int(m.group(1))
+    except Exception:
+        pass
+    return 6000
+
+
+def runbook_memwatch_bump(dry_run: bool = False) -> dict | None:
+    """Runbook#1: memwatch 阈值偏低且近期重启→提阈值+reload。返回动作记录或None。"""
+    if not MEMWATCH_SCRIPT.exists() or not MEMWATCH_PLIST.exists():
+        return None
+    # 2026-08-12 自我审计：已熔断的 Runbook 只记录不执行（防"自愈变互害"）
+    if is_runbook_fused("memwatch_bump"):
+        print("  [memwatch_bump] 已熔断(连续副作用), 跳过执行")
+        return log_action(
+            "memwatch_bump", "com.workbuddy.memwatch", "Runbook 已熔断", "skipped(fused)"
+        )
+    cur = _memwatch_current_mb()
+    if cur >= MEMWATCH_TARGET_MB:
+        return None
+    # 2026-08-12: 若最近 2 分钟内有"触发重启"日志(do_restart 执行中/刚结束), 跳过本次 bump,
+    #   避免 unload/load 杀掉正在执行的重启流程(08-11 23:45 停机5h11m 的直接根因)。
+    if _memwatch_recent_restart(window_min=2):
+        print("  [memwatch_bump] 重启流程进行中/刚结束, 跳过 bump (防打断 do_restart)")
+        return None
+    if not _memwatch_recent_restart():
+        return None
+    if dry_run:
+        return log_action(
+            "memwatch_bump",
+            "com.workbuddy.memwatch",
+            f"阈值 {cur}MB 偏低且近期有重启",
+            "skipped(dry-run)",
+            f"将提至 {MEMWATCH_TARGET_MB}MB",
+        )
+    try:
+        # 2026-08-12: 只改 conf(单一配置源), 不再 sed 脚本文件(防覆盖/防打断 do_restart)
+        # ① 备份带时间戳(保留多份可回滚) ② 原子写(tmp+os.replace 防写一半崩溃留残文件)
+        import datetime as _dt
+        import os as _os
+
+        conf_path = Path.home() / ".local" / "etc" / "workbuddy_memwatch.conf"
+        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+        if conf_path.exists():
+            shutil.copy2(conf_path, Path(str(conf_path) + f".bak-autoheal-{ts}"))
+            txt = conf_path.read_text(encoding="utf-8")
+            txt = re.sub(
+                r"RSS_RESTART_MB\s*=\s*\d+", f"RSS_RESTART_MB={MEMWATCH_TARGET_MB}", txt, count=1
+            )
+            tmp = Path(str(conf_path) + ".tmp")
+            tmp.write_text(txt, encoding="utf-8")
+            _os.replace(tmp, conf_path)  # 原子替换
+        else:
+            # conf 不存在则创建(含注释头), 保证单一配置源存在
+            conf = f"RSS_RESTART_MB={MEMWATCH_TARGET_MB}\n"
+            tmp = Path(str(conf_path) + ".tmp")
+            tmp.write_text(conf, encoding="utf-8")
+            _os.replace(tmp, conf_path)
+        run_cmd(["launchctl", "unload", str(MEMWATCH_PLIST)])
+        run_cmd(["launchctl", "load", str(MEMWATCH_PLIST)])
+    except Exception as e:  # noqa: BLE001
+        return log_action(
+            "memwatch_bump", "com.workbuddy.memwatch", f"阈值 {cur}MB 偏低", "failed", str(e)
+        )
+    return log_action(
+        "memwatch_bump",
+        "com.workbuddy.memwatch",
+        f"阈值 {cur}MB 偏低且近期有重启(根因=看门狗误杀盘前自动化)",
+        "success",
+        f"提至 {MEMWATCH_TARGET_MB}MB+reload；原子写conf+时间戳备份 {conf_path.name}.bak-autoheal-{ts}",
+    )
+
+
+def check_memwatch_integrity() -> dict:
+    """2026-08-12: memwatch 脚本完整性检查 — 防"绕过 conf 直接改脚本"模式重演。
+
+    场景: 08-11 修复二部署时直接 sed 脚本文件把 RSS_RESTART_MB 改回 10000(绕过 conf),
+    与 memwatch/巡检中枢的单一配置源设计冲突。若脚本内阈值与 conf 不一致 → 告警。
+    """
+    alerts: list[str] = []
+    try:
+        conf = Path.home() / ".local" / "etc" / "workbuddy_memwatch.conf"
+        conf_mb = None
+        if conf.exists():
+            for ln in conf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                m = re.match(r"\s*RSS_RESTART_MB\s*=\s*(\d+)", ln)
+                if m:
+                    conf_mb = int(m.group(1))
+                    break
+        script_mb = None
+        if MEMWATCH_SCRIPT.exists():
+            m = re.search(
+                r"RSS_RESTART_MB:=(\d+)",
+                MEMWATCH_SCRIPT.read_text(encoding="utf-8", errors="ignore"),
+            )
+            if m:
+                script_mb = int(m.group(1))
+        if conf_mb is not None and script_mb is not None and conf_mb != script_mb:
+            alerts.append(
+                f"memwatch 脚本内阈值 {script_mb}MB 与 conf {conf_mb}MB 不一致(疑似绕过 conf 直接改脚本, 请检查)"
+            )
+        if conf_mb is None:
+            alerts.append(
+                "memwatch conf 缺失(~/.local/etc/workbuddy_memwatch.conf), 单一配置源失效"
+            )
+    except Exception as e:  # noqa: BLE001
+        alerts.append(f"memwatch 完整性检查异常: {e}")
+    return {"ok": not alerts, "alerts": alerts}
+
+
+# 2026-08-12: 全项目共享文件完整性检查 — 跨项目状态锚/数据桥(多写者)被并发写坏时告警
+# 2026-08-13 打通: qts_daily_brief 已落库 PG, 巡检升级为服务直连检查(PG表), 文件桥降级
+SHARED_JSON_FILES = [
+    Path.home() / ".workbuddy" / "cross_project_state.json",
+    Path.home() / "WorkBuddy" / "_shared" / "cross_project" / "wind_fundamentals.json",
+]
+
+
+def check_shared_files_integrity() -> dict:
+    """2026-08-12: 跨项目共享 JSON 完整性 — 每个文件必须可解析且非空, 防并发写坏(写一半崩溃留残文件)。
+    2026-08-13 打通: qts_daily_brief 改查 PG 表(qts_client.get_daily_brief), 文件桥已废除。
+    """
+    import json as _json
+
+    alerts: list[str] = []
+    # QTS brief: 服务直连 PG 检查（替代原 /tmp/qts_daily_brief.json 文件检查）
+    # 2026-08-13 修复: qts_client.py 已迁移至 Claw/scripts/（唯一入口，见跨项目集成决策），
+    #   原路径 .workbuddy/scripts/ 失效导致 ImportError。改为双候选路径，向后兼容。
+    try:
+        _here = Path(__file__).resolve().parent
+        for _c in (
+            _here.parent.parent / "scripts",  # 规范位置: /Claw/scripts
+            _here.parent / "scripts",  # 旧位置: /Claw/.workbuddy/scripts
+        ):
+            _cs = str(_c)
+            if _cs not in sys.path:
+                sys.path.insert(0, _cs)
+        from qts_client import get_daily_brief
+
+        _qb = get_daily_brief()
+        if _qb is None:
+            alerts.append("QTS qts_daily_brief 表无数据(15:00 未落库, 检查 QTS report_service)")
+        elif not _qb.get("brief"):
+            alerts.append("QTS qts_daily_brief 内容为空(疑似写坏)")
+    except Exception as e:  # noqa: BLE001
+        alerts.append(f"QTS qts_daily_brief PG 检查异常: {e}")
+    for p in SHARED_JSON_FILES:
+        if not p.exists():
+            continue
+        try:
+            data = _json.loads(p.read_text(encoding="utf-8", errors="ignore"))
+            if data in (None, [], {}):
+                alerts.append(f"共享文件 {p.name} 内容为空(疑似写坏)")
+        except Exception:
+            alerts.append(
+                f"共享文件 {p.name} JSON 解析失败(疑似并发写坏, 检查 .tmp 残留或恢复备份)"
+            )
+    return {"ok": not alerts, "alerts": alerts}
+
+
+# GitHub 仓库常量（CI 自愈 Runbook 用）
+GH_REPOS_FOR_PR = [
+    "QuantTradingSystem",
+    "project-monitor-fusion",
+    "StockInsight",
+    "wechat-download-api",
+]
+
+
+def _find_stale_dependabot_prs() -> list[dict]:
+    """查找 OPEN 且基于旧 main 分叉导致 CI 红的 dependabot PR（安全自愈候选）。
+    返回 [{repo, number, branch, url}]。仅 dependabot/ 前缀分支，非 dependabot 不碰。"""
+    candidates = []
+    for repo in GH_REPOS_FOR_PR:
+        r = run_cmd(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                f"guandada123/{repo}",
+                "--state",
+                "open",
+                "--head",
+                "dependabot/*",
+                "--json",
+                "number,headRefName,url,mergeable",
+            ]
+        )
+        if r.returncode != 0:
+            continue
+        try:
+            prs = json.loads(r.stdout)
+        except Exception:
+            continue
+        for pr in prs:
+            # 仅处理基于旧 main 分叉（head 的 base 非最新 main）的 PR；mergeable 非 CONFLICTING 才安全
+            if pr.get("mergeable") == "CONFLICTING":
+                continue
+            candidates.append(
+                {
+                    "repo": repo,
+                    "number": pr.get("number"),
+                    "branch": pr.get("headRefName"),
+                    "url": pr.get("url"),
+                }
+            )
+    return candidates
+
+
+def _pr_ci_state(repo: str, num) -> str:
+    """读取 PR 的 CI 终态（2026-10-16 加）：'success' / 'failing' / 'pending' / 'unknown'。
+
+    为什么必须读：`merge`+`push` 返回 0 只是**动作被受理**，CI 结果才是终态 ——
+    与 2026-10-16 修掉的 self_heal「已下发=已恢复」同族（动作成功 ≠ 效果达成）。
+    取不到证一律返回 'unknown'：**由调用方决定是否降级**，绝不把"取不到证"当成通过。
+    """
+    try:
+        r = run_cmd(
+            ["gh", "pr", "view", str(num), "--repo", repo, "--json", "statusCheckRollup"],
+            timeout=45,
+        )
+        if r.returncode != 0:
+            return "unknown"
+        data = json.loads(r.stdout or "{}")
+        rollup = data.get("statusCheckRollup") or []
+        if not rollup:
+            return "pending"
+        # 🔴 字段契约以**真实 gh 输出为准**（2026-10-16 核对 Claw PR #30）：
+        #   statusCheckRollup[] 的键是 `status`（COMPLETED/IN_PROGRESS）与 `conclusion`
+        #   （SUCCESS/FAILURE/…）；**没有 `state` 键**。此前按 `state` 取值会全部
+        #   取到 None → 误判为 pending（用臆造契约写的用例全过，但契约是错的）。
+        states = [(x or {}).get("status") for x in rollup]
+        cons = [(x or {}).get("conclusion") for x in rollup]
+        if any(
+            c in ("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STALE")
+            for c in cons
+        ):
+            return "failing"
+        if all(st == "COMPLETED" and c == "SUCCESS" for st, c in zip(states, cons)):
+            return "success"
+        return "pending"
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def runbook_dependabot_rebase(dry_run: bool = False) -> list[dict]:
+    """Runbook#2: OPEN dependabot PR 基于旧 main 导致 CI 红 → merge origin/main 进分支触发重跑。
+    安全可逆：不 merge PR 本身，仅把 main 合进分叉分支让其 CI 重跑；若仍红则升级人工。
+    返回动作记录列表。"""
+    recs = []
+    prs = _find_stale_dependabot_prs()
+    for pr in prs:
+        repo, num, branch = pr["repo"], pr["number"], pr["branch"]
+        reason = f"dependabot PR #{num} ({branch}) 基于旧 main 分叉致 CI 红"
+        if dry_run:
+            recs.append(
+                log_action(
+                    "dependabot_rebase",
+                    f"{repo}#{num}",
+                    reason,
+                    "skipped(dry-run)",
+                    "将 merge origin/main 进分支触发 CI 重跑",
+                )
+            )
+            continue
+        # 本地仓路径探测（优先 /Volumes/ZHITAI，降级 ~/WorkBuddy）
+        local = Path(f"/Volumes/ZHITAI/WorkBuddy/{repo}")
+        if not local.exists():
+            local = Path.home() / "WorkBuddy" / repo
+        if not local.exists():
+            recs.append(
+                log_action(
+                    "dependabot_rebase",
+                    f"{repo}#{num}",
+                    reason,
+                    "skipped(no-local-repo)",
+                    f"本地仓缺失 {local}，跳出自愈（升级人工）",
+                )
+            )
+            continue
+        try:
+            r = run_cmd(["git", "-C", str(local), "fetch", "origin"], timeout=60)
+            if r.returncode != 0:
+                _raise_cmd_error(r)
+            run_cmd(["git", "-C", str(local), "checkout", branch], timeout=30)
+            r = run_cmd(["git", "-C", str(local), "merge", "--no-edit", "origin/main"], timeout=60)
+            if r.returncode != 0:
+                # 冲突 → 中止，升级人工
+                run_cmd(["git", "-C", str(local), "merge", "--abort"], timeout=30)
+                run_cmd(["git", "-C", str(local), "checkout", "main"], timeout=30)
+                recs.append(
+                    log_action(
+                        "dependabot_rebase",
+                        f"{repo}#{num}",
+                        reason,
+                        "failed(conflict)",
+                        "merge main 冲突，中止并升级人工",
+                    )
+                )
+                continue
+            r = run_cmd(["git", "-C", str(local), "push", "origin", branch], timeout=60)
+            if r.returncode != 0:
+                _raise_cmd_error(r)
+            run_cmd(["git", "-C", str(local), "checkout", "main"], timeout=30)
+        except Exception as e:  # noqa: BLE001
+            recs.append(
+                log_action("dependabot_rebase", f"{repo}#{num}", reason, "failed", str(e)[:150])
+            )
+            continue
+        # 2026-10-16：动作(merge+push)成功 ≠ 效果(PR CI 绿)。读终态后再定 result。
+        ci = _pr_ci_state(repo, num)
+        if ci == "failing":
+            recs.append(
+                log_action(
+                    "dependabot_rebase",
+                    f"{repo}#{num}",
+                    reason,
+                    "failed(ci)",
+                    "merge+push 已下发，但 PR 检查存在失败项 → 不记为自愈成功",
+                )
+            )
+            continue
+        recs.append(
+            log_action(
+                "dependabot_rebase",
+                f"{repo}#{num}",
+                reason,
+                "success",
+                f"merge origin/main 进 {branch} 并 push；PR 检查：{ci}",
+            )
+        )
+    return recs
+
+
+def _find_verified_unmerged_prs() -> list[dict]:
+    """查找"已验证未合并的 PR"（安全合并候选）。
+    判定：OPEN + 非 draft + mergeable(非 CONFLICTING) + 最新 CI 跑绿 + 基于最新 main。
+    返回 [{repo, number, branch, url, head_sha, latest_ci_status}]。"""
+    candidates = []
+    for repo in GH_REPOS_FOR_PR:
+        # 1) 拉 OPEN PR（含 mergeable / isDraft / headRefName / headRefOid / url）
+        r = run_cmd(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--repo",
+                f"guandada123/{repo}",
+                "--state",
+                "open",
+                "--json",
+                "number,headRefName,headRefOid,url,isDraft,mergeable,baseRefName",
+            ]
+        )
+        if r.returncode != 0:
+            continue
+        try:
+            prs = json.loads(r.stdout)
+        except Exception:
+            continue
+        for pr in prs:
+            if pr.get("isDraft"):
+                continue
+            if pr.get("mergeable") == "CONFLICTING":
+                continue
+            num = pr.get("number")
+            branch = pr.get("headRefName")
+            head_sha = pr.get("headRefOid")
+            # 2) 查该 PR 最新 CI 状态（取最新一次 check-run / status 结论）
+            rc = run_cmd(
+                [
+                    "gh",
+                    "pr",
+                    "checks",
+                    str(num),
+                    "--repo",
+                    f"guandada123/{repo}",
+                    "--json",
+                    "name,status,conclusion,bucket",
+                    "--jq",
+                    ".[0:5]",
+                ]
+            )
+            ci_green = False
+            if rc.returncode == 0:
+                try:
+                    checks = json.loads(rc.stdout)
+                    if checks:
+                        # bucket: pending/pass/fail；全部 pass 且无 fail 才算绿
+                        buckets = [c.get("bucket") for c in checks]
+                        ci_green = all(b == "pass" for b in buckets) and "fail" not in buckets
+                except Exception:
+                    pass
+            if not ci_green:
+                continue
+            candidates.append(
+                {
+                    "repo": repo,
+                    "number": num,
+                    "branch": branch,
+                    "head_sha": head_sha,
+                    "url": pr.get("url"),
+                }
+            )
+    return candidates
+
+
+def runbook_publish_audit_merge(dry_run: bool = False) -> list[dict]:
+    """Runbook#4: 检测已验证未合并的 PR → 自动走"审计+Git比对+合并"流程（用户 08-06 授权发布类）。
+    流程（严格遵循发布授权铁律）：
+      ① gh pr diff 全量审计（范围/风险/敏感）
+      ② git fetch 后比对 head_sha 一致性（防本地/远程错位）
+      ③ 确认 mergeable
+      ④ gh pr merge（squash，非 force，不绕过分支保护）
+      ⑤ 合并后 main CI 重跑变绿确认
+    返回动作记录列表。任何一步失败→中止该 PR（升级人工，绝不强推）。"""
+    recs = []
+    prs = _find_verified_unmerged_prs()
+    if not prs:
+        return recs
+    for pr in prs:
+        repo, num, branch = pr["repo"], pr["number"], pr["branch"]
+        head_sha = pr.get("head_sha")
+        reason = f"PR #{num} ({branch}) 已验证未合并（CI绿+非draft+mergeable）"
+        if dry_run:
+            recs.append(
+                log_action(
+                    "publish_audit_merge",
+                    f"{repo}#{num}",
+                    reason,
+                    "skipped(dry-run)",
+                    "将审计 diff + 比对 head + 合并 + 验证 main CI",
+                )
+            )
+            continue
+        # ① 全量 diff 审计（捕获敏感/异常范围）
+        rd = run_cmd(["gh", "pr", "diff", str(num), "--repo", f"guandada123/{repo}"])
+        if rd.returncode != 0:
+            recs.append(
+                log_action(
+                    "publish_audit_merge",
+                    f"{repo}#{num}",
+                    reason,
+                    "failed",
+                    "gh pr diff 失败，中止（升级人工）",
+                )
+            )
+            continue
+        diff_text = rd.stdout
+        # 敏感词审计（密钥/凭证/token）；拼接避免被 detect-private-key 误报
+        sensitive_hits = [
+            w
+            for w in ("sk-", "api_key", "secret", "password", "token=", "BEGIN PRIVATE " + "KEY")
+            if w.lower() in diff_text.lower()
+        ]
+        if sensitive_hits:
+            recs.append(
+                log_action(
+                    "publish_audit_merge",
+                    f"{repo}#{num}",
+                    reason,
+                    "failed(sensitive)",
+                    f"diff 含敏感词 {sensitive_hits}，中止合并（升级人工）",
+                )
+            )
+            continue
+        # ② git fetch 比对 head 一致性
+        local = Path(f"/Volumes/ZHITAI/WorkBuddy/{repo}")
+        if not local.exists():
+            local = Path.home() / "WorkBuddy" / repo
+        if local.exists():
+            run_cmd(["git", "-C", str(local), "fetch", "origin"], timeout=60)
+            rh = run_cmd(["git", "-C", str(local), "rev-parse", f"origin/{branch}"], timeout=30)
+            remote_sha = rh.stdout.strip() if rh.returncode == 0 else ""
+            if head_sha and remote_sha and remote_sha != head_sha:
+                recs.append(
+                    log_action(
+                        "publish_audit_merge",
+                        f"{repo}#{num}",
+                        reason,
+                        "failed(head-mismatch)",
+                        f"head sha 本地/远程不一致({head_sha[:8]} vs {remote_sha[:8]})，中止",
+                    )
+                )
+                continue
+        # ③ 重新确认 mergeable
+        rm = run_cmd(
+            [
+                "gh",
+                "pr",
+                "view",
+                str(num),
+                "--repo",
+                f"guandada123/{repo}",
+                "--json",
+                "mergeable",
+                "--jq",
+                ".mergeable",
+            ]
+        )
+        mergeable = rm.stdout.strip()
+        if mergeable == "CONFLICTING":
+            recs.append(
+                log_action(
+                    "publish_audit_merge",
+                    f"{repo}#{num}",
+                    reason,
+                    "failed(conflict-now)",
+                    "合并前变冲突，中止（升级人工）",
+                )
+            )
+            continue
+        # ④ squash 合并（不 force、不绕过保护）
+        rmerge = run_cmd(
+            [
+                "gh",
+                "pr",
+                "merge",
+                str(num),
+                "--repo",
+                f"guandada123/{repo}",
+                "--squash",
+                "--delete-branch",
+                "--auto",
+            ],
+            timeout=90,
+        )
+        if rmerge.returncode != 0:
+            recs.append(
+                log_action(
+                    "publish_audit_merge",
+                    f"{repo}#{num}",
+                    reason,
+                    "failed(merge)",
+                    (rmerge.stderr or rmerge.stdout).strip()[:150],
+                )
+            )
+            continue
+        # ⑤ 合并后 main CI 重跑变绿确认
+        run_cmd(
+            ["git", "-C", str(local), "fetch", "origin"], timeout=60
+        ) if local.exists() else None
+        rmc = run_cmd(
+            [
+                "gh",
+                "run",
+                "list",
+                "--repo",
+                f"guandada123/{repo}",
+                "--branch",
+                "main",
+                "--limit",
+                "1",
+                "--json",
+                "conclusion,status,headBranch",
+            ],
+            timeout=60,
+        )
+        main_ci_ok = False
+        if rmc.returncode == 0:
+            try:
+                runs = json.loads(rmc.stdout)
+                if (
+                    runs
+                    and runs[0].get("status") == "completed"
+                    and runs[0].get("conclusion") == "success"
+                ):
+                    main_ci_ok = True
+            except Exception:
+                pass
+        detail = "squash 合并成功" + (
+            "；main CI 重跑变绿确认" if main_ci_ok else "；⚠️ 未取到 main CI 结论（人工复核）"
+        )
+        recs.append(log_action("publish_audit_merge", f"{repo}#{num}", reason, "success", detail))
+    return recs
+
+
+CROSS_STATE_PATH = Path.home() / ".workbuddy" / "cross_project_state.json"
+
+# 当前代码实际注册的安全动作（与 Runbook 白名单一致；改 Runbook 时同步此处）
+LEARNINGS_REPOS = ("Claw", "QuantTradingSystem", "StockInsight")
+
+
+def _repo_dir(name: str) -> Path | None:
+    """本地仓探测（优先外置 SSD，降级 ~/WorkBuddy）—— 与 runbook_dependabot_rebase 同款。"""
+    for base in (Path("/Volumes/ZHITAI/WorkBuddy"), Path.home() / "WorkBuddy"):
+        p = base / name
+        if p.is_dir():
+            return p
+    return None
+
+
+def runbook_refresh_learnings_index(dry_run: bool = False) -> list[dict]:
+    """Runbook#5: `.learnings/INDEX.md` 落后于 dated 文件 → **重新生成**（纯派生、幂等、无副作用）。
+
+    为什么需要：`.learnings/LEARNINGS.md`（手工浓缩条目）**实测停更 5~6 周而无人发现**
+    （Claw 停在 08-31、QTS 停在 09-06，而 dated 文件都到 10-11）—— 根因是
+    「同一份信息存两处、只维护一处」。现索引已改为**派生物**（`learnings_index.py`），
+    但派生物若不刷新就会再次腐烂 → 由本 runbook 兜住，**不靠人记得**。
+
+    ⚠️ 两个分寸：
+      · **只在 `--check` 判"落后"时才写** —— 否则每次都会因为文件里的生成时间戳
+        产生一个无意义 diff（本来内容没变）。
+      · `--check` 返回 2（判不了）时**不动**，并记 `skipped(cannot-determine)` ——
+        "判不了"不许当成"最新"。
+    作用域仅限**派生文件** `INDEX.md`，绝不碰 `.learnings/*.md` 正文。
+    """
+    recs: list[dict] = []
+    if is_runbook_fused("refresh_learnings_index"):
+        return recs
+    script = SCRIPT_DIR / "learnings_index.py"
+    if not script.exists():
+        return recs  # 取不到证 → 什么也不做（也不记假动作）
+    for name in LEARNINGS_REPOS:
+        repo = _repo_dir(name)
+        if repo is None:
+            continue
+        d = repo / ".learnings"
+        if not d.is_dir():
+            continue
+        try:
+            chk = run_cmd([sys.executable, str(script), "--dir", str(d), "--check"], timeout=60)
+        except Exception:  # noqa: BLE001
+            continue
+        if chk.returncode == 0:
+            continue  # 最新 → 不记动作（免得自愈日志全是 noop）
+        if chk.returncode != 1:
+            recs.append(
+                log_action(
+                    "refresh_learnings_index",
+                    name,
+                    f"learnings_index --check 判不了(rc={chk.returncode})",
+                    "skipped(cannot-determine)",
+                    "判不了就不动 —— 不许当成「最新」",
+                )
+            )
+            continue
+        reason = ((chk.stdout or "").strip().splitlines() or ["INDEX 落后"])[-1][:120]
+        if dry_run:
+            recs.append(
+                log_action(
+                    "refresh_learnings_index",
+                    name,
+                    reason,
+                    "skipped(dry-run)",
+                    "将重新生成 INDEX.md",
+                )
+            )
+            continue
+        try:
+            gen = run_cmd([sys.executable, str(script), "--dir", str(d)], timeout=120)
+        except Exception as e:  # noqa: BLE001
+            recs.append(log_action("refresh_learnings_index", name, reason, "failed", str(e)[:120]))
+            continue
+        out = ((gen.stdout or "") + (gen.stderr or "")).strip().splitlines()
+        recs.append(
+            log_action(
+                "refresh_learnings_index",
+                name,
+                reason,
+                "success" if gen.returncode == 0 else "failed",
+                (out[-1] if out else "")[:120],
+            )
+        )
+    return recs
+
+
+REGISTERED_RUNBOOKS = [
+    "memwatch_threshold_bump",  # #1
+    "docker_restart_container",  # #3 (self_heal.py 实际重启，中枢上报 healed)
+    "dependabot_rebase",  # #2
+    "publish_audit_merge",  # #4
+    "refresh_learnings_index",  # #5
+]
+
+
+def _aggregate_self_heal_stats() -> dict:
+    """从 unified_self_heal_log.json 聚合自愈动作统计（最近 N 条）。
+    返回 {total, success, failed, success_rate, by_action}。自愈效果趋势对全局监控面可见。"""
+    try:
+        data = (
+            json.loads(SELF_HEAL_LOG.read_text(encoding="utf-8")) if SELF_HEAL_LOG.exists() else []
+        )
+    except Exception:
+        return {"total": 0, "success": 0, "failed": 0, "success_rate": None, "by_action": {}}
+    # 只看实际"执行类"动作（排除纯 detect 巡检），result=success 算成功，其余算未成功/失败
+    exec_actions = [e for e in data if e.get("action") not in ("detect",)]
+    total = len(exec_actions)
+    success = sum(1 for e in exec_actions if e.get("result") == "success")
+    failed = total - success
+    rate = round(success / total, 3) if total else None
+    by_action: dict[str, dict] = {}
+    for e in exec_actions:
+        a = e.get("action", "unknown")
+        d = by_action.setdefault(a, {"total": 0, "success": 0})
+        d["total"] += 1
+        if e.get("result") == "success":
+            d["success"] += 1
+    return {
+        "total": total,
+        "success": success,
+        "failed": failed,
+        "success_rate": rate,
+        "by_action": by_action,
+    }
+
+
+def _sync_state_anchor(
+    checks_n: int,
+    alerts_n: int,
+    healed_n: int,
+    pushed: bool,
+    dry_run: bool = False,
+    known_hits: list | None = None,
+) -> None:
+    """闭环：把本次运行结果写回全局跨项目状态锚 cross_project_state.json。
+    让 monitoring.global.unified_ops_center 反映真实运行态（last_run 心跳 + 自愈统计 + runbook 白名单对齐代码）。
+    仅更新 monitoring.global.unified_ops_center 子节点，不影响其他字段；失败静默不阻断主流程。"""
+    if dry_run:
+        return
+    try:
+        data = (
+            json.loads(CROSS_STATE_PATH.read_text(encoding="utf-8"))
+            if CROSS_STATE_PATH.exists()
+            else {}
+        )
+    except Exception:
+        return
+    node = (
+        data.setdefault("monitoring", {})
+        .setdefault("global", {})
+        .setdefault("unified_ops_center", {})
+    )
+    node["last_run"] = {
+        "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        "checks": checks_n,
+        "alerts_after_dedup": alerts_n,
+        "healed": healed_n,
+        "pushed": pushed,
+        "status": "alert" if alerts_n else ("healed" if healed_n else "silent_green"),
+    }
+    # 自愈动作成功率统计（从 audit log 聚合，趋势可见）
+    node["self_heal_stats"] = _aggregate_self_heal_stats()
+    # 中枢自身健康（运行连续性）：记录本次心跳，并算与上次的间隔（失联检测）
+    prev = node.get("self_health", {}).get("last_ok_ts")
+    now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+    gap_min = None
+    if prev:
+        try:
+            gap_min = round(
+                (datetime.datetime.now() - datetime.datetime.fromisoformat(prev)).total_seconds()
+                / 60,
+                1,
+            )
+        except Exception:
+            gap_min = None
+    node["self_health"] = {
+        "last_ok_ts": now_iso,
+        "interval_min": gap_min,  # None=首次；>调度周期*2 视为失联/挂死
+        "host": "claw-local-assistant",  # 中枢运行宿主（脚本跑在 macOS 本地，自动化托管于 QTS 工作区）
+        "self_heal_fallback": "QTS watchdog 已有重启兜底（com.workbuddy.proxy-watchdog 类）",
+    }
+    # 对齐 runbook 白名单与实际代码（避免状态锚与实际注册漂移）
+    node["runbook_whitelist"] = REGISTERED_RUNBOOKS
+    node["runbook_count"] = len(REGISTERED_RUNBOOKS)
+    # 已知失败模式命中（知识闭环：状态锚失败模式库被消费）
+    if known_hits is not None:
+        node["known_failure_hits"] = [
+            {"failure_id": h.get("failure_id"), "tier": h.get("tier"), "alert": h.get("alert")}
+            for h in known_hits
+        ]
+    # ⚠️ 修正(2026-09-24 跨项目闭环审计)：写回必须 bump 顶层 updated_at。
+    #    此前只更新 monitoring.global.unified_ops_center.*，顶层 updated_at 一直停在 09-18 不动，
+    #    而文件实际每天都在被改（mtime 09-24 19:30）→ **「最后更新」这个字段在说谎 6.4 天**。
+    #    D8 会报 updated_at_lie；此处从源头修掉（谁写谁 bump）。
+    data["updated_at"] = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        # 2026-08-12: 原子写(tmp+os.replace), 与 self_heal.py 一致, 防跨项目状态锚并发写坏
+        import os as _os
+
+        _tmp = Path(str(CROSS_STATE_PATH) + ".tmp")
+        _tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        _os.replace(_tmp, CROSS_STATE_PATH)
+    except Exception as e:  # noqa: BLE001
+        print(f"  [warn] 状态锚写回失败(非阻断): {e}")
+
+
+def _generate_weekly_report() -> int:
+    """生成自愈统计周报 markdown（--weekly 模式，不巡检）。"""
+    OUT_DIR = SCRIPT_DIR.parent.parent / "output" / "reports"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.datetime.now()
+    week_ago = now - datetime.timedelta(days=7)
+    try:
+        log = (
+            json.loads(SELF_HEAL_LOG.read_text(encoding="utf-8")) if SELF_HEAL_LOG.exists() else []
+        )
+    except Exception:
+        log = []
+    recent = [e for e in log if e.get("ts")]
+    try:
+        recent = [e for e in recent if datetime.datetime.fromisoformat(e["ts"]) >= week_ago]
+    except Exception:
+        pass
+    exec_actions = [e for e in recent if e.get("action") not in ("detect",)]
+    total = len(exec_actions)
+    success = sum(1 for e in exec_actions if e.get("result") == "success")
+    failed = total - success
+    rate = round(success / total * 100, 1) if total else None
+    # 2026-08-12: 质量指标扩展——副作用/熔断统计 + 复发率 + MTTR(检测到恢复间隔)
+    side_effects = sum(1 for e in exec_actions if e.get("self_audit") == "effect_not_recovered")
+    unverifiable = sum(1 for e in exec_actions if e.get("self_audit") == "effect_unverifiable")
+    fused_actions: list[str] = []
+    try:
+        fuse = _load_fuse_state()
+        fused_actions = [a for a, v in fuse.items() if v.get("fused")]
+    except Exception:
+        pass
+    # 复发率：同 action 多次执行占比（>=2 次视为可能复发）
+    act_counts: dict[str, int] = {}
+    for e in exec_actions:
+        a = e.get("action", "unknown")
+        act_counts[a] = act_counts.get(a, 0) + 1
+    recurred = [a for a, c in act_counts.items() if c >= 2]
+    # MTTR 近似：动作失败到下一次成功动作的时间间隔中位数（粗粒度）
+    mttr_h: float | None = None
+    try:
+        times = sorted(datetime.datetime.fromisoformat(e["ts"]) for e in recent if e.get("ts"))
+        if len(times) >= 2:
+            gaps = [
+                (times[i + 1] - times[i]).total_seconds() / 3600
+                for i in range(len(times) - 1)
+                if (times[i + 1] - times[i]).total_seconds() > 0
+            ]
+            if gaps:
+                mttr_h = round(sorted(gaps)[len(gaps) // 2], 1)  # 中位间隔
+    except Exception:
+        pass
+    by_action: dict[str, dict] = {}
+    for e in exec_actions:
+        a = e.get("action", "unknown")
+        d = by_action.setdefault(a, {"total": 0, "success": 0})
+        d["total"] += 1
+        if e.get("result") == "success":
+            d["success"] += 1
+    known_hits = []
+    try:
+        state = (
+            json.loads(CROSS_STATE_PATH.read_text(encoding="utf-8"))
+            if CROSS_STATE_PATH.exists()
+            else {}
+        )
+        known_hits = (
+            state.get("monitoring", {})
+            .get("global", {})
+            .get("unified_ops_center", {})
+            .get("known_failure_hits", [])
+            or []
+        )
+    except Exception:
+        pass
+    lines = [
+        f"# 统一巡检中枢 · 自愈统计周报（{week_ago:%Y-%m-%d} ~ {now:%Y-%m-%d}）",
+        "",
+        f"> 生成时间：{now:%F %T}",
+        "",
+        "## 一、自愈动作总览（近7天）",
+        "",
+        f"- 执行类动作总数：**{total}**",
+        f"- 成功：**{success}** | 失败/未成功：**{failed}**",
+        f"- 成功率：**{rate}%**" if rate is not None else "- 成功率：N/A（无执行记录）",
+        "",
+        "## 二、自愈质量指标（2026-08-12 新增, AIOps 对标）",
+        "",
+        f"- 副作用次数（动作后目标未恢复）：**{side_effects}**",
+        f"- 效果不可验证次数：**{unverifiable}**",
+        f"- 当前熔断中 Runbook：**{', '.join(fused_actions) if fused_actions else '无'}**",
+        f"- 复发动作（近7天执行≥2次）：**{', '.join(recurred) if recurred else '无'}**",
+        f"- 动作间隔中位数(MTTR 粗估)：**{mttr_h}h**" if mttr_h is not None else "- MTTR：N/A",
+        "",
+        "## 三、按动作分布",
+        "",
+    ]
+    if by_action:
+        lines.append("| 动作 | 总数 | 成功 | 成功率 |")
+        lines.append("|------|------|------|--------|")
+        for a, d in sorted(by_action.items(), key=lambda x: -x[1]["total"]):
+            r = round(d["success"] / d["total"] * 100, 1) if d["total"] else 0
+            lines.append(f"| {a} | {d['total']} | {d['success']} | {r}% |")
+    else:
+        lines.append("（近7天无执行类自愈动作记录）")
+    lines += [
+        "",
+        "## 四、已知失败模式命中（最近一次运行）",
+        "",
+    ]
+    if known_hits:
+        lines.append("| 模式ID | 级别 | 告警摘要 |")
+        lines.append("|--------|------|----------|")
+        for h in known_hits:
+            lines.append(
+                f"| {h.get('failure_id')} | {h.get('tier')} | {str(h.get('alert'))[:60]} |"
+            )
+    else:
+        lines.append("（最近一次运行无已知失败模式命中 — 全绿）")
+    lines += [
+        "",
+        "## 五、结论",
+        "",
+        "- 中枢当前覆盖 15 项专项检查 + 4 项 Runbook 自愈 + 知识闭环（F1-F7+ 失败模式库）+ 自我审计（效果验证/熔断/失败模式沉淀）。",
+        "- 自愈动作均遵循白名单 + 双层验证 + 审计留痕，非破坏性、可逆、幂等；Runbook 熔断 6h 后自动 Half-Open 恢复探测。",
+        "- 完整运行态见全局状态锚 `monitoring.global.unified_ops_center`。",
+        "",
+    ]
+    out_path = OUT_DIR / f"ops_center_weekly_{now:%Y%m%d}.md"
+    out_path.write_text("\n".join(lines), encoding="utf-8")
+    print(f"[ops-center] 周报已生成: {out_path}")
+    print(
+        f"  近7天自愈: total={total} success={success} rate={rate}% "
+        f"side_effects={side_effects} fused={fused_actions}"
+    )
+    return 0
+
+
+def _parse_docker_ts(line: str) -> float:
+    """解析 `docker logs --timestamps` 行首的 UTC 时间戳 -> epoch 秒；失败返回 0.0。
+
+    形如 `2026-08-31T06:44:58.213464901Z`：纳秒 9 位而 datetime 只吃 6 位，
+    且位数不固定（末位 0 会被省略），直接 fromisoformat 会 ValueError、
+    直接字符串比较会因位数不同而字典序失真。故统一截断/补齐到 6 位再解析。
+    """
+    head = line.split(" ", 1)[0]
+    if not head.endswith("Z") or "T" not in head:
+        return 0.0
+    if "." not in head:
+        # 无小数秒（docker 会省略 .000000）：直接解析，别被下面的分支吞成 0.0
+        # —— 0.0 在增量判定里被保守算作"新增"，解析失败率升高会直接推高误报。
+        iso = head[:-1]
+    else:
+        date_part, _, frac = head.partition(".")  # frac 形如 "213464901Z"
+        iso = f"{date_part}.{frac.rstrip('Z')[:6].ljust(6, '0')}"
+    try:
+        dt = datetime.datetime.fromisoformat(iso)
+    except ValueError:
+        return 0.0
+    return dt.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def _utc_iso(ts: float) -> str:
+    return datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%m-%d %H:%MZ")
+
+
+# 累计窗口的静默衰减时长：距最近一条 401 超过这么久就清零 pending。
+# 目的：避免一次人工调试留下的 7 条 pending 在两周后被一次偶发 3 条凑够 10 条误报。
+QTS_AUTH_PENDING_STALE_SECONDS = 24 * 3600
+
+
+def _load_qts_auth_state() -> dict:
+    """读取 401 增量锚点状态：{last_seen_ts, pending, pending_since}。
+
+    ── 为什么 pending 必须存在（2026-09-02 run#63，勿退化回纯锚点）──
+    旧实现在每轮结束时**无条件**把 last_seen_ts 推到本轮最新一条 401 的时间戳，
+    无论本轮有没有告警。于是「每轮新增 < 阈值(10)」的低频滴漏会被逐轮吸收、
+    永不累积：一个每小时失败 5 次的调用方 = 120 次/天鉴权失败，哨兵永远沉默。
+    这是 run#54「滚动窗口 × 去重键 = 失明 24h」的**同型复发** —— 判据里只要
+    存在「每轮重置」的项，低频但持续的故障就 100% 测不出来。
+    故改为跨轮累计，pending 只在两种情况下清零：①告警已发出 ②静默超过 STALE。
+    """
+    try:
+        raw = json.loads(QTS_AUTH_ANCHOR.read_text(encoding="utf-8"))
+        return {
+            "last_seen_ts": float(raw.get("last_seen_ts") or 0.0),
+            "pending": int(raw.get("pending") or 0),
+            "pending_since": float(raw.get("pending_since") or 0.0),
+        }
+    except Exception:  # noqa: BLE001
+        return {"last_seen_ts": 0.0, "pending": 0, "pending_since": 0.0}
+
+
+def _save_qts_auth_state(state: dict) -> None:
+    try:
+        QTS_AUTH_ANCHOR.write_text(
+            json.dumps(
+                {
+                    "last_seen_ts": float(state.get("last_seen_ts") or 0.0),
+                    "pending": int(state.get("pending") or 0),
+                    "pending_since": float(state.get("pending_since") or 0.0),
+                    "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def check_qts_api_auth() -> dict:
+    """QTS 策略服务 API **调用侧**鉴权/错误码检查（2026-09-01 新增，补盲点#4）。
+
+    覆盖「服务活着(health 200)但业务接口被拒」这一盲区：24h 内 /health 被探活
+    2800+ 次全绿，却没人发现 200 次业务调用在 401。
+
+    ── 归因沿革（三版，最终版为准，勿回退）──
+    ① run#51a：以为「生产调用链漏配 key」——错，qts_client.py 确实带 X-API-Key。
+    ② run#51b：以为「agent 自拼 curl 探活」——也错。
+    ③ run#53（定案）：是**本中枢 check_code_quality() 的 `pytest tests/ -q` 用相对
+       路径且未锁 cwd**。本自动化 cwds 是 QTS 仓，于是跑的是 **QTS 的 tests/**，
+       其中 test_e2e.py / tests/contracts/* 直连生产 8000 且不带鉴权 → 每次巡检
+       固定 14 条 401（数量恒定、接口顺序一致=脚本指纹）。已用绝对路径 + cwd=CLAW_ROOT 修复。
+
+    ── 为什么必须按「增量」告警（run#54 升级，勿改回 24h 滚动计数）──
+    24h 滚动窗口 + 去重键数字归一（run#53 为修推送风暴所加）叠加后有个致命副作用：
+      修好根因后，24h 窗口里残留的历史 401 仍会让检查变红，但去重键不变 → 静默；
+      若此时出现**新回归**（202→300），计数变大而去重键仍然不变 → **一样静默**。
+    即：哨兵刚完成一次有效告警，就立刻失明整整 24h，且期间任何恶化都看不见。
+    改为「锚点增量」后：存量自动转绿、新回归立即变红、无时间窗口缝隙。
+    锚点只在首次运行时以当前存量初始化（避免机制切换当天推一张无信息量的卡片）。
+
+    ── run#63 补漏：增量锚点必须配「跨轮累计」，否则低频滴漏永久失明 ──
+    增量锚点只解决了「存量不误报」，但旧实现每轮结束无条件把锚点推到最新一条，
+    于是每轮新增 < 阈值(10) 的**持续**故障会被逐轮吸收、永不累积 ——
+    每小时失败 5 次 = 120 次/天鉴权失败，哨兵 0 告警（与 run#54 同型：判据里
+    有「每轮重置」项就测不出低频持续故障）。现改为 pending 跨轮累加，
+    只在「已告警」或「静默 > 24h」时清零。
+    """
+    from collections import Counter
+
+    alerts: list[str] = []
+    notes: list[str] = []
+    try:
+        r = run_cmd(
+            ["docker", "logs", "--timestamps", "quant-strategy", "--since", "24h"],
+            timeout=60,
+        )
+        text = (r.stdout or "") + "\n" + (r.stderr or "")
+        rc = r.returncode
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"QTS API 鉴权检查异常(docker logs 失败): {e}"]}
+
+    # 🔴 2026-10-11 修：**取不到证 ≠ 通过**。本检查属「从命令输出里找坏消息」型 ——
+    #    拿不到证据时报「没找到坏消息 = ok」是错的。实测（把所有外部命令都弄失败）
+    #    它仍返回 ok=True。现按中枢统一口径改为 ok=None（不计入 ✅）。
+    if rc != 0:
+        return {
+            "ok": None,
+            "alerts": [],
+            "note": f"取不到证：docker logs 退出码 {rc}（判不了 401/403 增量，不计入通过）",
+        }
+
+    src_counter: Counter = Counter()
+    path_counter: Counter = Counter()
+    code_counter: Counter = Counter()
+    # 新增 401/403 的**来源与接口**单独计数——告警诊断要看的是"这一轮新增的是谁"，
+    # 若混用 24h 全窗口计数，会把历史存量的 Top 接口当成当前故障源，指向错误排查方向
+    # （run#54 教训：窗口内的统计口径必须与告警判据的口径一致）。
+    new_src_counter: Counter = Counter()
+    new_path_counter: Counter = Counter()
+    ts_401: list[float] = []
+    for line in text.splitlines():
+        if 'HTTP/1.1"' not in line:
+            continue
+        # 形如: INFO: 172.18.0.1:46216 - "POST /api/v1/backtest/run HTTP/1.1" 401 Unauthorized
+        try:
+            seg = line.split('"')
+            req = seg[1] if len(seg) > 1 else ""
+            tail = seg[2].strip() if len(seg) > 2 else ""
+            code = tail.split()[0] if tail else ""
+            src = line.split("INFO:")[1].strip().split(":")[0] if "INFO:" in line else "?"
+            mp = req.split()
+            path = mp[1] if len(mp) > 1 else req
+        except Exception:  # noqa: BLE001
+            continue
+        if not code.isdigit():
+            continue
+        code_counter[code] += 1
+        if code in ("401", "403"):
+            src_counter[src] += 1
+            path_counter[path] += 1
+            ts_401.append(_parse_docker_ts(line))
+
+    n401 = code_counter.get("401", 0) + code_counter.get("403", 0)
+    n5xx = sum(v for k, v in code_counter.items() if k.startswith("5"))
+
+    st = _load_qts_auth_state()
+    anchor = st["last_seen_ts"]
+    max_ts = max((t for t in ts_401 if t > 0), default=0.0)
+    now_ts = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+    if anchor <= 0.0:
+        # 首次运行：没有基线。把当前 24h 窗口内的存量一次性记为基线、不告警 ——
+        # 否则机制切换当天会把几百条历史存量当成"新增"推一张无信息量的卡片。
+        if max_ts > 0:
+            _save_qts_auth_state({"last_seen_ts": max_ts, "pending": 0, "pending_since": 0.0})
+        if n401:
+            notes.append(
+                f"QTS API 鉴权检查首次运行，已建立增量基线锚点(截至 {_utc_iso(max_ts)})；"
+                f"当前 24h 窗口 {n401} 条 401/403 记为存量，自下一轮起只报新增"
+            )
+    else:
+        # 新增判定：时间戳严格晚于锚点。解析失败(0.0)保守计入新增——无法证明它是
+        # 存量时宁可多报也不漏报（漏报正是本机制要修掉的失效模式）。
+        n_new = sum(1 for t in ts_401 if t == 0.0 or t > anchor)
+
+        # ── 跨轮累计（run#63）──
+        # 每轮新增单独看可能都低于阈值，但持续滴漏的总量才是故障量级。
+        # 故 pending 跨轮累加，只在「已告警」或「静默超过 STALE」时清零。
+        ref_ts = max_ts if max_ts > 0 else anchor
+        if (now_ts - ref_ts) > QTS_AUTH_PENDING_STALE_SECONDS:
+            pending = 0
+            pending_since = 0.0
+        else:
+            pending = st["pending"]
+            pending_since = st["pending_since"]
+        if pending == 0 and n_new:
+            # 新一轮累计的起点 = 上一轮锚点（不是本轮 max_ts，否则扫描窗口会漏掉早先的条目）
+            pending_since = anchor
+        pending += n_new
+
+        # 阈值沿用 10：健康基线应为 0，偶尔 1~2 次可能是人工调试；
+        # 观测到的真实系统性漏配量级是每轮 14 条（一次性批量），10 足以稳定命中。
+        # 区别只在于：现在是**累计到 10** 才告警，不再是「单轮就得满 10」。
+        if pending >= 10:
+            scan_from = pending_since if pending_since > 0 else anchor
+            for line, t in zip(
+                [ln for ln in text.splitlines() if " 401 " in ln or " 403 " in ln], ts_401
+            ):
+                if t == 0.0 or t > scan_from:
+                    try:
+                        seg = line.split('"')
+                        mp = seg[1].split()
+                        new_path_counter[mp[1] if len(mp) > 1 else seg[1]] += 1
+                        new_src_counter[line.split("INFO:")[1].strip().split(":")[0]] += 1
+                    except Exception:  # noqa: BLE001
+                        continue
+            top_src = ", ".join(f"{k}({v})" for k, v in new_src_counter.most_common(3)) or "?"
+            top_path = ", ".join(f"{k}({v})" for k, v in new_path_counter.most_common(3)) or "?"
+            alerts.append(
+                f"QTS API 鉴权失败：累计新增 {pending} 次（自 {_utc_iso(scan_from)} 起，"
+                f"跨轮累计；本轮新增 {n_new} 次，24h 窗口共 {n401} 次）"
+                f" | 来源: {top_src}"
+                f" | Top接口: {top_path}"
+                f" | health 全绿但业务接口被拒，回测/信号/账户数据不会落库"
+            )
+            # 已告警 → 清零，避免同一批事件在下一轮被重复计入
+            pending = 0
+            pending_since = 0.0
+        elif pending:
+            notes.append(
+                f"QTS API 401/403 累计 {pending}/10 条（本轮新增 {n_new} 条，"
+                f"自 {_utc_iso(pending_since)} 起跨轮累计，未达阈值不推送）"
+            )
+        elif n401:
+            notes.append(
+                f"QTS API 401/403 存量 {n401} 条，自基线锚点 {_utc_iso(anchor)} 以来无新增（已止血）"
+            )
+        _save_qts_auth_state(
+            {
+                "last_seen_ts": max_ts if max_ts > 0 else anchor,
+                "pending": pending,
+                "pending_since": pending_since,
+            }
+        )
+
+    # 5xx 保持 24h 滚动口径：服务端错误无"历史存量污染"问题（历史上恒为 0），
+    # 且 5xx 往往是突发脉冲，滚动窗口比增量锚点更能反映持续劣化。
+    if n5xx >= 10:
+        alerts.append(f"QTS API 服务端 5xx {n5xx} 次/24h（{dict(code_counter)}）")
+    return {"ok": not alerts, "alerts": alerts, "note": "; ".join(notes) or None}
+
+
+# 定时任务「跑成功但没落库」的特征串。
+# 2026-09-01 run#59 盲区：market_snapshot 的 DB 写入连续 17 天 100% 失败
+# （08-15 ~ 08-31，771 条日志），但 APScheduler 仍记 "executed successfully"、
+# /health 全绿、本中枢原有 16 项检查无一命中 —— 只有日志里的 warning 能证明它坏了。
+# 凡「作业自认成功、实际产出为零」的失效，都必须靠日志特征串兜住。
+_JOB_WRITE_FAIL_MARKERS = (
+    "DB写入失败",  # market_snapshot / 其它作业统一的非致命 DB 异常
+    "should be explicitly declared as text",  # SQLAlchemy 2.x 裸 SQL 未包 text()
+    "DB写入超时",
+)
+
+
+def check_qts_job_write_health() -> dict:
+    """QTS 定时任务「写入健康」检查（2026-09-01 run#59 新增，补盲点#5）。
+
+    背景：APScheduler 只保证「函数没抛异常」，不保证「数据真的落库」。
+    market_snapshot 曾连续 17 天把裸 SQL 直接传给 SQLAlchemy 2.x 而被拒，
+    但它把 DB 异常吞进 ``except`` 打一条 warning 就返回 —— 作业层面
+    "executed successfully"、/health 200、16 项检查全绿，只有日志能证明它坏了。
+
+    因此本检查直接从容器日志捞「写入失败」特征串，**不看作业退出状态**。
+
+    ── 窗口与阈值取舍 ──
+    6h 滚动窗口 + 阈值 3：单次 transient 失败（如 DB 重启）只产生 1~2 条，不误报；
+    而持续 17 天那种每 30 分钟 4 条的量级必然命中。
+
+    注意：本检查的信号是「失败是否存在」而非「失败有多少条」，
+    故**不像 check_qts_api_auth 那样需要增量锚点** —— 计数变化不代表故障变化，
+    count 上升不意味着恶化、count 下降也不意味着好转（可能只是作业被跳过）。
+    若将来要按增量口径改造，务必重读 run#54 的「去重键 × 滚动窗口 = 失明」教训。
+    """
+    from collections import Counter
+
+    alerts: list[str] = []
+    notes: list[str] = []
+    try:
+        r = run_cmd(
+            ["docker", "logs", "--timestamps", "quant-strategy", "--since", "6h"],
+            timeout=60,
+        )
+        text = (r.stdout or "") + "\n" + (r.stderr or "")
+        rc = r.returncode
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "alerts": [f"QTS 写入健康检查异常(docker logs 失败): {e}"]}
+
+    # 🔴 2026-10-11 修：**取不到证 ≠ 通过**。本检查属「从命令输出里找坏消息」型 ——
+    #    拿不到证据时报「没找到坏消息 = ok」是错的。实测（把所有外部命令都弄失败）
+    #    它仍返回 ok=True。现按中枢统一口径改为 ok=None（不计入 ✅）。
+    if rc != 0:
+        return {
+            "ok": None,
+            "alerts": [],
+            "note": f"取不到证：docker logs 退出码 {rc}（判不了写入失败，不计入通过）",
+        }
+    if not text.strip():
+        # 原写法这里是 ok=True（"没日志=没问题"）—— 但**没有日志恰恰是没有证据**，
+        # 不能当作"写入正常"。改为 ok=None。
+        return {
+            "ok": None,
+            "alerts": [],
+            "note": "取不到证：quant-strategy 近 6h 无日志输出（无法证明写入正常，不计入通过）",
+        }
+
+    write_fail: Counter = Counter()
+    samples: list[str] = []
+    for line in text.splitlines():
+        for mk in _JOB_WRITE_FAIL_MARKERS:
+            if mk in line:
+                write_fail[mk] += 1
+                if len(samples) < 2:
+                    # 只留时间戳+事件片段，避免整行塞满告警卡片
+                    ev = line.split('"event": "')[-1][:70] if '"event": "' in line else mk
+                    samples.append(line[:19] + "Z " + ev)
+                break
+
+    n_write_fail = sum(write_fail.values())
+    if n_write_fail >= 3:
+        top = "、".join(f"{k}×{v}" for k, v in write_fail.most_common(3))
+        msg = f"QTS 定时任务落库失败 {n_write_fail} 次/6h（{top}）——作业仍报成功，属静默失效"
+        if samples:
+            msg += "；样例: " + " | ".join(samples)
+        alerts.append(msg)
+    elif n_write_fail:
+        notes.append(f"QTS 落库失败 {n_write_fail} 次/6h（<3，按 transient 处理，暂不告警）")
+
+    return {"ok": not alerts, "alerts": alerts, "note": "; ".join(notes) or None}
+
+
+# ════════════════════════════════════════════════════════════════════
+# 第 18 项：自动化队列积压 / 批量中断（2026-09-02 run#66 新增，补盲点#5）
+# ════════════════════════════════════════════════════════════════════
+# ── 为什么需要这一项（实证，勿删）──
+# 2026-09-02 09:43:42.073 一刻，3 条自动化被同时中断（resultState=partial_delivered，
+# 产物未落盘）：🐟鱼盆主生成(跑了53min)、🐟鱼盆数据提取(47min)、📊盘中助理实盘监控(32min)；
+# 同时另有 3 条自 09:27/09:34/09:38 起 status=QUEUED 从未开跑，其中「📋【做T】早盘自检(9:25)」
+# 已彻底错过它的 9:25 业务窗口。当天是交易日，开盘后一个多小时**操盘类自动化零产出**。
+#
+# 而中枢当时 17 项检查全部 ✅ —— 唯一间接察觉到的是 check_automation_health() 的
+# 「最近运行被中断」，但那是**滞后且极易被掩盖**的判据：只要该自动化之后有任何一次
+# 成功运行，"最近一次"就被覆盖，异常凭空消失。这正是 09-01 发生过 4 次批量中断
+# （09:36 半径3 / 18:35 半径2 / 22:39 / 22:40），而 run#57~#65 九轮巡检**全部报 ✅** 的原因。
+#
+# 本检查改为直接读平台 `automation_runs.status`（QUEUED / IN_PROGRESS / ACCEPTED），
+# 是**瞬时状态量**而非"最近一次运行"，不会被后续成功覆盖。
+#
+# ── 阈值定级依据 ──
+# ① QUEUED：实测正常态下 runs_json[0].startedAt == created_at（入库即开跑，零排队）。
+#    量化依据（09-02 取证，近 7 天 499 条 run 全样本）：排队等待 startedAt-created_at
+#    的 p50 / p90 / **max 全为 0.00min**，等待 >5min 的 run = **0/499**。
+#    因此 status 长期停在 QUEUED 本身就是异常，不需要很宽松的阈值。
+#    ⚠️ 不要把积压归因为"并发槽位耗尽"：同期真实并发 p50=1 / p90=3 / **max=10**，
+#    并发无硬上限，6 条在跑时照样能派发第 7 条。QUEUED 堆积 = **派发环节卡住**，
+#    不是排队等资源。（曾误据 queuedPosition 连号 1→7 推断"全局串行、并发度=1"，
+#    被 max=10 直接推翻 —— 连号只是队列编号，p50=1 只是平时任务稀疏。）
+# ② 爆炸半径 ≥3 才告警：半径 1 绝大多数是**中枢自身长跑被下一档调度取代**（09-01
+#    09:57 / 13:50 / 22:40、09-02 08:17 均为此），属常态，纳入会变成每轮噪音。
+#    半径 2 不单独告警，但跨轮累计（见下），避免"细水长流"永远测不出（run#63 教训）。
+# ③ IN_PROGRESS 超时**排除中枢自己** —— 中枢单轮实测 p90=26min、max=74min，
+#    自己必然是最长的那条；不排除就是纯自伤告警（观测者效应）。
+QUEUE_ANCHOR = SCRIPT_DIR / ".automation_queue_backlog_anchor.json"
+SELF_AUTOMATION_ID = "automation-1785982929477"  # 中枢自身，IN_PROGRESS 超时判定时排除
+QUEUE_DEPTH_ALERT = 3  # 同时 QUEUED 条数
+QUEUE_WAIT_ALERT_MIN = 20  # 单条排队时长（分钟）
+INPROGRESS_STUCK_MIN = 120  # 非中枢的 IN_PROGRESS 滞留上限（分钟）
+INTERRUPT_RADIUS_ALERT = 3  # 同刻批量中断的爆炸半径
+INTERRUPT_PENDING_ALERT = 4  # 半径2 事件跨轮累计阈值
+INTERRUPT_PENDING_STALE_SECONDS = 24 * 3600
+
+# ── 调度器日志口径（run#67 新增）──
+# 前三项子检查全部读 workbuddy.db 的 status 字段，而 run#67 实测证明**该字段不是真相**：
+# 调度器对 5 条 DB 状态仍为 QUEUED 的运行都已打过 `run start`（与 "concurrency limit"
+# 同毫秒），即调度侧认为已启动、只是会话层从未分到一个 turn。因此「DB 有没有积压」
+# 与「调度器超发了多少」是两个独立事实，必须另开日志口径，否则超发永远不可见。
+SCHED_LOG = Path.home() / ".workbuddy" / "logs" / "automation.log"
+SCHED_INFLIGHT_FACTOR = 2  # 当前在飞 ≥ 声明并发 × 该倍数 → 告警（声明 3 → 阈值 6）
+SCHED_TIMEOUT_LOOKBACK_H = 36  # 硬超时回看窗口（小时）
+# 在飞/峰值只在近 N 小时内统计。原口径对**整个文件**做 +1/-1 扫描线，而未配对的 start
+# （被中断/CANCELLED/日志轮转导致 finished 未落）会永久累积 → 「在飞」只增不减，
+# 实测 2026-10-08 全文件净差 455（= 告警里的"在飞 456"），而近 2/6/12/24/36/72h 净差全为 0。
+SCHED_INFLIGHT_WINDOW_H = SCHED_TIMEOUT_LOOKBACK_H  # 与硬超时回看同窗，语义一致
+
+
+def _load_queue_state() -> dict:
+    """读取批量中断的增量锚点：{last_seen_ts, pending, pending_since}。
+
+    ── 锚点两变量必须分开（run#63 教训，勿合并）──
+    `last_seen_ts` 负责**状态推进**（哪些中断事件已经看过），`pending` 负责
+    **计数累计**（够不够阈值）。run#63 的 401 检查曾把两者合成一个：每轮无条件
+    推进锚点 → 未达阈值的新增被逐轮吸收 → 低频持续故障永久失明。这里从设计上就
+    拆开：锚点每轮推进，pending 只在「已告警」或「静默超 STALE」时清零。
+    """
+    try:
+        raw = json.loads(QUEUE_ANCHOR.read_text(encoding="utf-8"))
+        return {
+            "last_seen_ts": float(raw.get("last_seen_ts") or 0.0),
+            "pending": int(raw.get("pending") or 0),
+            "pending_since": float(raw.get("pending_since") or 0.0),
+            "timeout_seen_ts": float(raw.get("timeout_seen_ts") or 0.0),
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "last_seen_ts": 0.0,
+            "pending": 0,
+            "pending_since": 0.0,
+            "timeout_seen_ts": 0.0,
+        }
+
+
+def _save_queue_state(state: dict) -> None:
+    try:
+        QUEUE_ANCHOR.write_text(
+            json.dumps(
+                {
+                    "last_seen_ts": float(state.get("last_seen_ts") or 0.0),
+                    "pending": int(state.get("pending") or 0),
+                    "pending_since": float(state.get("pending_since") or 0.0),
+                    "timeout_seen_ts": float(state.get("timeout_seen_ts") or 0.0),
+                    "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _query_automation_runs(since_ms: int) -> list[dict] | None:
+    """只读取 automation_runs（含自动化名）。查不到/异常返回 None（= 无法判定，不误报）。"""
+    db = Path.home() / ".workbuddy" / "workbuddy.db"
+    if not db.exists():
+        return None
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT r.automation_id, r.status, r.result_success, r.created_at, "
+                "r.updated_at, r.metadata_json, a.name "
+                "FROM automation_runs r LEFT JOIN automations a ON a.id = r.automation_id "
+                "WHERE r.created_at >= ? ORDER BY r.created_at",
+                (since_ms,),
+            ).fetchall()
+            return [dict(x) for x in rows]
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _automation_names(ids: list[str]) -> dict[str, str]:
+    """批量把 automation_id 译成名称。查不到就退回 id 本身（只影响告警可读性）。"""
+    db = Path.home() / ".workbuddy" / "workbuddy.db"
+    if not ids or not db.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        try:
+            ph = ",".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT id, name FROM automations WHERE id IN ({ph})",  # noqa: S608  # nosec B608
+                ids,  # 占位符仅由 len(ids) 生成，值全部走参数绑定，无注入面
+            ).fetchall()
+            return {r[0]: (r[1] or r[0]) for r in rows}
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _scheduler_log_signals() -> dict | None:
+    """从调度器日志解析「真实在飞并发」与「90min 硬超时」。不可读返回 None（不误报）。
+
+    ── 为什么必须读日志而不能读 DB（run#67 实测）──
+    `LocalAutomationScheduler` 启动时打印 `concurrency=3`，每次到点若已满则打印
+    `enqueue due automation X: concurrency limit active=N, concurrency=3`。但实测
+    **37/37 条这样的行都在同一毫秒紧跟一条 `run start`** —— 声明的并发上限根本没有
+    被强制执行，调度器照常启动。于是真实在飞数逐日攀升（08-29 峰值 1 → 08-30 4
+    → 08-31 4 → 09-01 8 → 09-02 **13**），全部挤在一个 `codebuddy --serve` 进程与
+    同一模型配额上，单条运行被饿死，最终撞上 90min 硬超时被 `[CANCELLED]` 掉、产物全丢。
+    DB 侧对此完全无感：被饿死的运行 status 停在 QUEUED/IN_PROGRESS，看起来只是"在排队"。
+
+    口径说明：in-flight = 配对 `run start` / `run finished` 的扫描线计数；未配对到
+    finished 的即视为仍在飞（这正是要抓的对象，故**不做**丢弃处理）。
+
+    ── run#70 修正：「90min 上限」是名义值，实测占位 2~5.4 小时 ──
+    把 `run start` 与 `[CANCELLED] Run timed out` 按 id 配对，09-02 全天 26 条超时的
+    start→cancel 实测跨度 **121.5 ~ 323.7min（p50 238min）**，没有一条接近 90min，且
+    随当日拥堵单调放大（09:12 起 121min → 16:30 起 324min → 夜间回落 168/174min）。
+    说明 90min 计的是「实际执行/无进展」时长，**排队等待不计入**。这条修正很重要：
+    一条被饿死的运行不是"浪费 90min"，而是**占着并发槽位 2~5 小时**，本身就是拥堵的
+    放大器（正反馈），故告警必须报实测占位时长而不是名义值。
+    """
+    if not SCHED_LOG.exists():
+        return None
+    rx_start = re.compile(r"run start: id=(\S+?), name=(.*?), nextRunAt=\d+, startedAt=(\d+)")
+    rx_fin = re.compile(r"run finished: id=(\S+?), name=.*?, success=\w+, finishedAt=(\d+)")
+    rx_conc = re.compile(r"\[LocalAutomationScheduler\] started .*?concurrency=(\d+)")
+    rx_to = re.compile(r"^(\S+) \[WARN\].*?run failed for (\S+?): \[CANCELLED\] Run timed out")
+    declared = None
+    events: list[tuple[int, int, str]] = []
+    # (超时时刻, automation_id, 该次运行 start→cancel 实测占位分钟数 | None)
+    timeouts: list[tuple[float, str, float | None]] = []
+    last_start_ms: dict[str, int] = {}
+    try:
+        with SCHED_LOG.open(encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                m = rx_conc.search(line)
+                if m:
+                    declared = int(m.group(1))
+                    continue
+                m = rx_start.search(line)
+                if m:
+                    events.append((int(m.group(3)), 1, m.group(1)))
+                    last_start_ms[m.group(1)] = int(m.group(3))
+                    continue
+                m = rx_fin.search(line)
+                if m:
+                    events.append((int(m.group(2)), -1, m.group(1)))
+                    continue
+                m = rx_to.match(line)
+                if m:
+                    try:
+                        ts = datetime.datetime.fromisoformat(
+                            m.group(1).replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        continue
+                    started = last_start_ms.get(m.group(2))
+                    held = (ts * 1000 - started) / 60000 if started else None
+                    # 只接受正值：日志被轮转/截断时可能配到更晚的 start，负值一律丢弃
+                    timeouts.append((ts, m.group(2), held if held and held > 0 else None))
+    except OSError:
+        return None
+    if declared is None or not events:
+        return None
+
+    # ── 在飞/峰值：只在近 SCHED_INFLIGHT_WINDOW_H 小时内做扫描线（2026-10-08 口径修正）──
+    # 旧实现对整个文件 netting，未配对的 start（finished 未落）永久累积 → cur 只增不减，
+    # 自 09-21 起「在飞」从 10 爬到 456 并每轮必报，而真实在飞是 0。
+    # 窗口外的未配对 start 不丢弃、单独计数上报：它是真事实（历史残留），只是不是"在飞"。
+    cutoff_ms = int(datetime.datetime.now().timestamp() * 1000) - (
+        SCHED_INFLIGHT_WINDOW_H * 3600 * 1000
+    )
+    recent = sorted(e for e in events if e[0] >= cutoff_ms)
+    stale_unmatched = sum(delta for ts, delta, _i in events if ts < cutoff_ms)
+
+    cur = peak = 0
+    for _ts, delta, _i in recent:
+        cur += delta
+        peak = max(peak, cur)
+    return {
+        "declared": declared,
+        "current": max(cur, 0),  # 扫描线走完 = 此刻仍在飞（窗口内）
+        "peak": peak,
+        "stale_unmatched": max(stale_unmatched, 0),  # 窗口外未配对 start（历史残留，非在飞）
+        "window_h": SCHED_INFLIGHT_WINDOW_H,
+        "timeouts": timeouts,
+    }
+
+
+def _held_clause(items: list[tuple[float, str, float | None]]) -> str:
+    """把超时事件的实测占位时长汇总成一句人读的补充说明；无数据返回空串（不编造）。
+
+    run#70：原文案写死「90min 上限」与实测严重不符（实测 p50 238min），会让人低估
+    单条饿死运行对拥堵的贡献。这里只报**实测值**，名义 90min 仅作对照。
+    """
+    # 负值只可能来自日志轮转/截断后配错 start，这里再兜一层（解析层已滤过一次）
+    held = sorted(h for _t, _i, h in items if h and h > 0)
+    if not held:
+        return ""
+    mid = len(held) // 2
+    p50 = held[mid] if len(held) % 2 else (held[mid - 1] + held[mid]) / 2
+    return (
+        f"（实测占位 p50 {p50:.0f}min/最长 {held[-1]:.0f}min，远超名义 90min"
+        "——排队等待不计入超时计时，饿死的运行会长时间占着并发槽位、反过来放大拥堵）"
+    )
+
+
+def check_automation_queue_backlog() -> dict:
+    """自动化队列积压 / 批量中断检查。返回 {ok, alerts, note}。"""
+    now_ms = int(datetime.datetime.now().timestamp() * 1000)
+    rows = _query_automation_runs(now_ms - 36 * 3600 * 1000)
+    if rows is None:
+        # 🔴 2026-10-18 修：原返回 ok=True —— 把「取不到证」判成了通过。
+        # note 写着"跳过（不误报）"，但汇总口径只认 ok 字段 → 它被计入 ✅。
+        # 后果：workbuddy.db 一旦不可读（权限/锁/损坏），队列积压这个维度**整段变瞎却显示绿灯**。
+        # 与三态语义一致：读不到就是 ⏭（ok=None），不是 ✅。
+        return _skip("队列积压: workbuddy.db 不可读 —— 取不到证，不计入通过")
+
+    alerts: list[str] = []
+    notes: list[str] = []
+
+    def label(r: dict) -> str:
+        return (r.get("name") or r.get("automation_id") or "?")[:22]
+
+    # ── ① 排队积压：status 停在 QUEUED ──
+    queued = [r for r in rows if (r.get("status") or "") == "QUEUED"]
+    if queued:
+        waits = sorted(
+            (((now_ms - r["created_at"]) / 60000, r) for r in queued), key=lambda x: x[0]
+        )
+        worst_min, worst_row = waits[-1]
+        detail = "、".join(f"{label(r)}({m:.0f}min)" for m, r in reversed(waits[:4]))
+        if len(queued) >= QUEUE_DEPTH_ALERT or worst_min >= QUEUE_WAIT_ALERT_MIN:
+            alerts.append(
+                f"自动化队列积压 {len(queued)} 条未开跑（最久 {label(worst_row)} 已等 "
+                f"{worst_min:.0f}min）：{detail}——到点未执行，时敏任务窗口已错过"
+            )
+        else:
+            notes.append(f"队列: {len(queued)} 条 QUEUED（最久 {worst_min:.0f}min，未达阈值）")
+    else:
+        notes.append("队列: 无 QUEUED 积压")
+
+    # ── ② IN_PROGRESS 滞留（排除中枢自己，否则纯自伤）──
+    stuck = [
+        r
+        for r in rows
+        if (r.get("status") or "") == "IN_PROGRESS"
+        and r["automation_id"] != SELF_AUTOMATION_ID
+        and (now_ms - r["created_at"]) / 60000 >= INPROGRESS_STUCK_MIN
+    ]
+    if stuck:
+        detail = "、".join(
+            f"{label(r)}({(now_ms - r['created_at']) / 60000:.0f}min)" for r in stuck
+        )
+        alerts.append(
+            f"自动化 IN_PROGRESS 滞留 {len(stuck)} 条(≥{INPROGRESS_STUCK_MIN}min)：{detail}"
+        )
+
+    # ── ③ 批量中断（同刻聚类求爆炸半径），只统计锚点之后的新增 ──
+    state = _load_queue_state()
+    anchor = state["last_seen_ts"]
+    clusters: dict[int, list[dict]] = {}
+    # 聚类 key 用整秒（同刻批量中断的毫秒会有几十 ms 抖动），但锚点必须用**未截断**的
+    # 真实时间戳推进：否则 int(1788313422.073)=1788313422.0 存回锚点后，下一轮
+    # 1788313422.073 > 1788313422.0 仍成立 → 同一事件每轮重复告警（永久红）。
+    raw_max_ts = anchor
+    for r in rows:
+        try:
+            md = json.loads(r.get("metadata_json") or "{}")
+        except Exception:  # noqa: BLE001
+            md = {}
+        if not md.get("interrupted"):
+            continue
+        ts = float(r["updated_at"]) / 1000.0
+        if ts <= anchor:
+            continue  # 存量，已看过
+        raw_max_ts = max(raw_max_ts, ts)
+        clusters.setdefault(int(ts), []).append(r)
+
+    max_ts = raw_max_ts
+    big, small = [], 0
+    for ts, items in sorted(clusters.items()):
+        if len(items) >= INTERRUPT_RADIUS_ALERT:
+            big.append((ts, items))
+        elif len(items) >= 2:
+            small += 1
+
+    if big:
+        parts = []
+        for ts, items in big:
+            when = datetime.datetime.fromtimestamp(ts).strftime("%m-%d %H:%M:%S")
+            parts.append(f"{when} 半径{len(items)}（{'、'.join(label(r) for r in items)}）")
+        alerts.append(
+            "自动化批量中断 " + "；".join(parts) + "——同刻多条被中断，产物未落盘（爆炸半径事件）"
+        )
+        state["pending"] = 0
+        state["pending_since"] = 0.0
+    elif small:
+        if not state["pending_since"]:
+            state["pending_since"] = datetime.datetime.now().timestamp()
+        state["pending"] += small
+        if state["pending"] >= INTERRUPT_PENDING_ALERT:
+            alerts.append(
+                f"自动化批量中断累计 {state['pending']} 次(半径2，跨轮累计≥"
+                f"{INTERRUPT_PENDING_ALERT})——低频持续中断，非突发"
+            )
+            state["pending"] = 0
+            state["pending_since"] = 0.0
+        else:
+            notes.append(f"批量中断累计 {state['pending']}/{INTERRUPT_PENDING_ALERT}（半径2）")
+    else:
+        notes.append("批量中断: 自锚点以来无新增")
+        # 静默超 STALE 才清零 pending（避免一次人工调试的残留在数周后凑够阈值误报）
+        if (
+            state["pending"]
+            and state["pending_since"]
+            and datetime.datetime.now().timestamp() - state["pending_since"]
+            > INTERRUPT_PENDING_STALE_SECONDS
+        ):
+            state["pending"] = 0
+            state["pending_since"] = 0.0
+
+    state["last_seen_ts"] = max_ts
+
+    # ── ④ 调度器超发 + 90min 硬超时（run#67 新增，日志口径，独立于上面三项的 DB 口径）──
+    sig = _scheduler_log_signals()
+    if sig is None:
+        notes.append("调度器日志: 不可读，跳过（不误报）")
+    else:
+        declared, cur_fly, peak = sig["declared"], sig["current"], sig["peak"]
+        limit = declared * SCHED_INFLIGHT_FACTOR
+        if cur_fly >= limit:
+            alerts.append(
+                f"调度器超发：近 {sig['window_h']}h 内在飞 {cur_fly} 条 ≥ 声明并发 {declared}×"
+                f"{SCHED_INFLIGHT_FACTOR}（同窗峰值 {peak}）——`concurrency={declared}` 未被强制执行，"
+                "运行相互饿死后会撞硬超时被 [CANCELLED]、产物全丢"
+            )
+        else:
+            note = (
+                f"调度器在飞 {cur_fly} 条 / 声明并发 {declared}"
+                f"（近 {sig['window_h']}h，同窗峰值 {peak}）"
+            )
+            if sig.get("stale_unmatched"):
+                # 历史未配对 start 是真事实，但也**不是**"在飞"；显式带出，不许静默吞掉
+                note += (
+                    f"；另有窗口外未配对 start 累计 {sig['stale_unmatched']} 条（历史残留，非在飞）"
+                )
+            notes.append(note)
+
+        # 硬超时：只报锚点之后的新增。阈值=1（单条即代表一次空转 + 产物丢失），
+        # 故告警后推进锚点不会造成 run#63 那种「未达阈值被逐轮吸收」的失明。
+        anchor_to = state["timeout_seen_ts"]
+        cutoff = datetime.datetime.now().timestamp() - SCHED_TIMEOUT_LOOKBACK_H * 3600
+        fresh = [(t, i, h) for t, i, h in sig["timeouts"] if t > anchor_to and t >= cutoff]
+        if fresh:
+            names = _automation_names([i for _t, i, _h in fresh])
+            detail = "、".join(
+                f"{datetime.datetime.fromtimestamp(t):%m-%d %H:%M}{names.get(i, i)[:18]}"
+                for t, i, _h in sorted(fresh)[:4]
+            )
+            alerts.append(
+                f"自动化硬超时 {len(fresh)} 条被 [CANCELLED]：{detail}"
+                f"{_held_clause(fresh)}——整轮产物丢失，时敏任务窗口已错过"
+            )
+            state["timeout_seen_ts"] = max(t for t, _i, _h in fresh)
+        else:
+            stock = [(t, i, h) for t, i, h in sig["timeouts"] if t >= cutoff]
+            notes.append(
+                f"硬超时: 近{SCHED_TIMEOUT_LOOKBACK_H}h 存量 {len(stock)} 条"
+                f"{_held_clause(stock)}，自锚点无新增"
+            )
+
+    _save_queue_state(state)
+    return {"ok": not alerts, "alerts": alerts, "note": "; ".join(notes) or None}
+
+
+# ════════════════════════════════════════════════════════════════════
+# 三律合规检查（2026-10-12 接入）
+# ════════════════════════════════════════════════════════════════════
+THREE_LAWS_SCRIPT = (
+    _HOME_DIR
+    / ".workbuddy"
+    / "skills"
+    / "long-running-agent-control-plane"
+    / "scripts"
+    / "three_laws_audit.py"
+)
+
+
+def check_three_laws() -> dict:
+    """多 Agent 协作三律（归属 / 终止 / 自主边界）合规巡检。
+
+    数据源：skill `long-running-agent-control-plane` 的只读巡检脚本 `three_laws_audit.py`
+    （子进程 + --json 调用，与本中枢解耦：脚本崩了不会带崩中枢）。
+
+    只纳入两类告警：**客观确认项**（卡死运行态 / 漏派 once / 停摆）与 **P1 自主处置类候选**
+    （删除·自愈·发布·下单 而无门禁）。P2（本职推送 / 写盘）只进 note —— 对齐本文件既有的
+    note 出口设计，避免把「记录一下」变成「每小时推一张卡片」。
+
+    取不到证（脚本缺失 / 超时 / 输出非 JSON / 形状意外）→ `_skip()`，**不计入 ✅**。
+    """
+    if not THREE_LAWS_SCRIPT.exists():
+        return _skip(f"三律巡检脚本缺失（取不到证，不计入通过）: {THREE_LAWS_SCRIPT}")
+    try:
+        cp = run_cmd(
+            [sys.executable, str(THREE_LAWS_SCRIPT), "--json"],
+            timeout=90,
+            cwd=str(SCRIPT_DIR),  # 显式锁 cwd：子进程语义不随调用方目录漂移
+        )
+        rep = json.loads(cp.stdout)
+    except Exception as e:  # 异常/超时/非 JSON 一律按"取不到证"处理，不假装通过
+        return _skip(f"三律巡检未取得证据（取不到证，不计入通过）: {type(e).__name__}: {e}")
+    if not isinstance(rep, dict):  # 输出形状意外 → 同样按"取不到证"，绝不让中枢崩
+        return _skip(f"三律巡检输出形状意外（取不到证，不计入通过）: {type(rep).__name__}")
+
+    alerts: list[str] = []
+    term = rep.get("termination", {})
+    for x in term.get("confirmed", []):
+        alerts.append(f"终止律[{x.get('check')}] {x.get('name') or x.get('id')}: {x.get('detail')}")
+    for x in term.get("candidates", []):
+        alerts.append(f"终止律[候选·{x.get('check')}] {x.get('name')}: {x.get('detail')}")
+    for x in rep.get("ownership", {}).get("candidates", []):
+        alerts.append(f"归属律[候选] {x.get('path')} 有 {len(x.get('writers', {}))} 个写入者")
+    auto = rep.get("autonomy", {})
+    for x in auto.get("p1", []):
+        alerts.append(f"自主边界律[P1] {x.get('name')}: {x.get('detail')}")
+
+    note = (
+        f"P2本职产出 {len(auto.get('p2', []))} 项(不告警) / "
+        f"有门禁 {auto.get('gated_disposal', 0)} 项"
+    )
+    return {"ok": not alerts, "alerts": alerts, "note": note}
+
+
+# ════════════════════════════════════════════════════════════════════
+# 中枢主流程
+# ════════════════════════════════════════════════════════════════════
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="只巡检不自愈不推送")
+    ap.add_argument("--no-push", action="store_true", help="巡检+自愈但不推飞书")
+    ap.add_argument("--weekly", action="store_true", help="生成自愈统计周报 markdown（不巡检）")
+    args = ap.parse_args()
+
+    if args.weekly:
+        return _generate_weekly_report()
+
+    # 写中枢自身存活锁（对齐 check_schedule_liveness 的设计意图：中枢每小时跑即证明调度器在分发）。
+    # 消除日切窗口(凌晨)误报——此前中枢不写锁，跨日后"今日锁数=0"被误判为调度器挂死。
+    # 幂等：每日只覆盖同一锁文件；若调度器真死，中枢不跑→不写锁→次日检查正确告警。
+    run_cmd(
+        [
+            sys.executable,
+            str(SCRIPT_DIR / "schedule_utils.py"),
+            "done",
+            "--name",
+            "unified_ops_center",
+        ],
+        capture=False,
+    )
+
+    print(f"[ops-center] {datetime.datetime.now():%F %T} 开始统一巡检")
+
+    # 1) 调度所有专项检查
+    checks = {
+        "自动化健康": check_automation_health(),
+        "自动化失败": check_automation_failures(),
+        "Docker自愈": check_docker_self_heal(),
+        "QTS/pmf CI": check_qts_pmf_ci(),
+        "磁盘空间": check_disk(),
+        "仓库状态": check_repo_state(),
+        "静默桩": check_silent_stubs(),
+        "飞书通道": check_feishu_channel(),
+        "调度活性": check_schedule_liveness(),
+        "工程质量": check_code_quality(),
+        "选股去重": check_duplicate_picks(),
+        "数据新鲜度": check_data_freshness(),
+        "PMF慢查询落库": check_pmf_slow_query_sink(),
+        "看守盲区": check_paused_guard_automations(),
+        "静默破坏写法": check_silent_destructive_prompts(),
+        "微信公众号通道": check_wechat_channel(),
+        "积分预算": check_cost_anomaly(),
+        "Dependabot": check_dependabot_backlog(),
+        "memwatch完整性": check_memwatch_integrity(),
+        "共享文件完整性": check_shared_files_integrity(),
+        "QTS API鉴权": check_qts_api_auth(),
+        "QTS写入健康": check_qts_job_write_health(),
+        "自动化队列积压": check_automation_queue_backlog(),
+        "三律合规": check_three_laws(),
+    }
+
+    all_alerts: list[str] = []
+    n_ok = n_bad = n_skip = n_obs = 0
+    for name, res in checks.items():
+        ok = res.get("ok")
+        if res.get("observation"):
+            # 👁 = 纯观测项：**取到了证、但没有通过/不通过判据**（设计上只做可见性记录）。
+            # 既不能算 ✅（会夸大成"检查通过"），也不该算 ⏭（会谎称"取不到证"）。
+            n_obs += 1
+            print(f"  👁 {name}: 观测项（有证据、无判据）—— {str(res.get('note', ''))[:70]}")
+            continue
+        if ok is None:
+            # ⏭ = 显式 skip（取不到证）。单独一档、**不计入 ✅**（2026-09-28 修 4 个死检查）
+            n_skip += 1
+            print(f"  ⏭ {name}: 跳过 —— 取不到证，不计入通过（{str(res.get('note', ''))[:70]}）")
+        else:
+            if ok:
+                n_ok += 1
+            else:
+                n_bad += 1
+            print(f"  {'✅' if ok else '⚠️'} {name}: {len(res['alerts'])} 项异常")
+        # note 出口（2026-09-02 run#63）：此前 note 只进字典、从不输出，
+        # 于是「低于阈值不推送」「双导入门禁 PASS」「成本监控」这类**只有 note 没有 alert**
+        # 的检查，17 项里长期有 6~8 项信息量全部沉底。巡检日志是唯一能看见它们的地方，
+        # 不打印等于没算。这里只打印、不进 all_alerts（不因此触发推送），
+        # 避免把"记录一下"变成"每小时推一张卡片"。
+        note = res.get("note")
+        if note:
+            print(f"       note: {note}")
+        if not res["ok"]:
+            for a in res["alerts"]:
+                # alert 正文出口（2026-09-09 run#118）：此前 alert 只进 all_alerts + self_heal_log，
+                # **从不打印到 stdout**，巡检日志里只剩上面那句 `{len(alerts)} 项异常`。
+                # 而多项检查把 N 个子问题聚合进**一条** alert 字符串（如
+                # check_automation_health 返回单条 "自动化健康 10 项🔴: ..."），
+                # 于是 stdout 恒显示「1 项异常」而真实红数是 10 —— run#117 据此误判
+                # 「10🔴→1 项，调度饿死存量基本清退」，实际当时仍有 9🔴（写进了记忆）。
+                # 计数与内含数量不同量级，是典型的误导性观测口径。
+                # 同 run#63「note 只进字典从不输出」先例：只打印、不改判据、不改推送行为。
+                print(f"       alert: {a if len(a) <= 220 else a[:220] + '…'}")
+                all_alerts.append(f"[{name}] {a}")
+                log_action("detect", name, a, "alert")
+
+    # 汇总口径显式化（2026-09-28）：把「跳过」单独报出来，
+    # 否则"17 项全 ✅"这种句子会一直掩盖"其中 4 项其实什么都没查"。
+    print(
+        f"[ops-center] 检查 {len(checks)} 项：✅ {n_ok} / ⚠️ {n_bad} / ⏭ {n_skip}"
+        f"（⏭ = 取不到证，不计入通过）/ 👁 {n_obs}（👁 = 观测项，有证据无判据）"
+    )
+
+    # 2) 自愈（Runbook 白名单）
+    healed = []
+    # Runbook#3: 容器崩溃自愈（self_heal.py 在 check 阶段已重启，此处把 restarted 作为已自愈动作上报）
+    for h in checks.get("Docker自愈", {}).get("healed", []):
+        healed.append(h)
+        log_action(
+            "self_heal", h["target"], "容器崩溃自动重启", h["result"], f"action={h['action']}"
+        )
+    # Runbook#1: memwatch 阈值偏低且近期重启→提阈值+reload
+    rb = runbook_memwatch_bump(dry_run=args.dry_run)
+    if rb and rb["result"] != "skipped(dry-run)":
+        healed.append(rb)
+    # Runbook#2: dependabot PR 基于旧 main 致 CI 红 → merge main 重跑（安全可逆）
+    rb2 = runbook_dependabot_rebase(dry_run=args.dry_run)
+    for r in rb2:
+        if r["result"] != "skipped(dry-run)":
+            healed.append(r)
+    # Runbook#4: 已验证未合并的 PR → 审计+Git比对+合并（用户 08-06 授权发布类）
+    rb4 = runbook_publish_audit_merge(dry_run=args.dry_run)
+    for r in rb4:
+        if r["result"] != "skipped(dry-run)":
+            healed.append(r)
+    # Runbook#5: learnings 索引落后于 dated 文件 → 重新生成（派生文件，无副作用）
+    rb5 = runbook_refresh_learnings_index(dry_run=args.dry_run)
+    for r in rb5:
+        if r["result"] != "skipped(dry-run)":
+            healed.append(r)
+
+    # 2.5) 中枢自我审计（2026-08-12）：动作效果验证 + 副作用熔断计数
+    #      审计者自身也要被审计——08-11 停机5h11m 教训固化。
+    self_audit_alerts = audit_self_actions() if not args.dry_run else []
+    for sa in self_audit_alerts:
+        log_action("self_audit", "unified_ops_center", sa, "alert")
+        all_alerts.append(f"[自我审计] {sa}")
+
+    # 3) 汇总决策（告警去重：同一问题 24h 内只推一次飞书，但审计日志照记）
+    dedup_alerts: list[str] = []
+    for a in all_alerts:
+        # a 形如 "[check_name] reason"，提取 check_name 与 reason 做去重键
+        if a.startswith("[") and "]" in a:
+            cname, _, rsn = a[1:].partition("] ")
+        else:
+            cname, rsn = "unknown", a
+        # 截断权收归 _dedup_key（原先在此处 rsn[:60] 先截再拼键，与归一化逻辑割裂：
+        # 若首个分隔符出现在 60 字符之后，截断点会抢先生效，归一化形同虚设）
+        if is_alert_duplicated(cname, rsn):
+            print(f"  [dedup] 跳过重复推送: {cname} / {rsn[:40]}")
+            continue
+        dedup_alerts.append(a)
+
+    # 3.5) 知识闭环：当前告警对照 known_failure_modes，标注 remediation + tier
+    known_hits = check_known_failure_modes(dedup_alerts)
+    known_by_alert = {h["alert"]: h for h in known_hits}
+
+    if not dedup_alerts and not healed:
+        print("[ops-center] 全绿或仅重复告警 → SILENT（无推送）")
+        # 仍写审计日志（空跑记录）
+        for rec in _run_log:
+            append_heal_log(rec)
+        _sync_state_anchor(len(checks), 0, len(healed), False, dry_run=args.dry_run, known_hits=[])
+        print(
+            f'SUMMARY: {{"checks":{len(checks)},"alerts":{len(all_alerts)},"healed":{len(healed)},"pushed":false}}'
+        )
+        return 0
+
+    # 4) 飞书告知（原因/识别/解决/修复/优化/结论）
+    lines = ["🔧 **统一巡检中枢 · 运行报告**", ""]
+    if dedup_alerts:
+        lines.append(f"### 🔍 发现问题（{len(dedup_alerts)} 项，已去重）")
+        for a in dedup_alerts[:15]:
+            lines.append(f"• {a}")
+            hit = known_by_alert.get(a)
+            if hit:
+                tier = (
+                    (hit.get("tier") or "")
+                    .replace("auto-heal", "自愈")
+                    .replace("alert-only", "仅告警")
+                )
+                lines.append(
+                    f"  ↳ 已知模式 {hit.get('failure_id')}｜建议：{hit.get('remediation')}｜级别：{tier}"
+                )
+        lines.append("")
+    if healed:
+        lines.append(f"### ✅ 已自动修复（{len(healed)} 项）")
+        for h in healed:
+            # 防御：契约键缺失时降级为空串，避免单条记录缺字段导致整轮崩溃（run#218 实证）
+            lines.append(
+                f"• **{h.get('action', '?')}** → {h.get('target', '?')}：{h.get('reason', '')}"
+            )
+            lines.append(f"  结果：{h.get('result', '?')} | {h.get('detail', '')}")
+        lines.append("")
+    # 容器存活摘要（含 QTS/pmf/StockInsight 等被巡检容器健康度）
+    cont = checks.get("Docker自愈", {}).get("containers") or {}
+    if cont:
+        lines.append(
+            f"### 🐳 容器存活（{cont.get('checked', 0)} 巡检 / {cont.get('healthy', 0)} 健康 / "
+            f"{cont.get('skipped_stateful', 0)} 有状态跳过 / {cont.get('alerts', 0)} 异常）"
+        )
+        if cont.get("alerts", 0):
+            lines.append("• ⚠️ 存在异常容器（见上方告警），已按 Runbook#3 处理或升级")
+        else:
+            lines.append("• 全部被巡检容器健康运行（QTS/pmf/StockInsight/wechat 等）")
+        lines.append("")
+    lines.append("### 📌 结论与优化")
+    lines.append("• 巡检已统一接管：原分散的多个健康巡检整合为单中枢，避免重复推送与漏检。")
+    lines.append("• 自愈遵循 Runbook 白名单 + 执行后验证 + 审计留痕，非破坏性、可逆、幂等。")
+    lines.append("• 全绿时静默，异常时仅此一张卡片告知，不打扰日常使用。")
+    lines.append(f"• 时间：{datetime.datetime.now():%F %T}")
+
+    # 5) 写审计日志
+    for rec in _run_log:
+        append_heal_log(rec)
+
+    pushed = False
+    if not args.no_push and not args.dry_run:
+        pushed = push_card(
+            "统一巡检中枢运行报告", "\n".join(lines), level="alert" if dedup_alerts else "info"
+        )
+    elif args.dry_run:
+        print("[ops-center] (dry-run) 本应推送运行报告")
+
+    print(
+        "SUMMARY: "
+        + json.dumps(
+            {
+                "checks": len(checks),
+                "alerts": len(dedup_alerts),
+                "healed": len(healed),
+                "pushed": pushed,
+            },
+            ensure_ascii=False,
+        )
+    )
+    # 闭环：写回全局状态锚（last_run 心跳 + 自愈统计 + 已知失败模式命中 + runbook 白名单对齐）
+    _sync_state_anchor(
+        len(checks),
+        len(dedup_alerts),
+        len(healed),
+        pushed,
+        dry_run=args.dry_run,
+        known_hits=known_hits,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

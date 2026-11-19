@@ -1,0 +1,144 @@
+#!/bin/bash
+# lark-cli-sync-run.sh —— lark-cli 一致性巡检运行器（Q-02 收口，2026-11-14）
+#
+# 为什么要这个文件：
+#   原 plist 的命令本体是 `/Volumes/ZHITAI/.../check_lark_cli_sync.sh ... || ...
+#   push_card.py`，即「巡检」与「漂移告警」两件事都落在外置卷上。外置卷一旦不可用，
+#   两者一起静默失败 —— 而这正是最需要告警的时刻。Q-02「告警链路仍依赖外置卷」即指此。
+#
+# 本运行器全程只读内盘：
+#   巡检脚本  ~/.local/bin/check_lark_cli_sync.sh（自包含只读副本）
+#   发送工具  ~/.local/lib/lark-cli/bin/lark-cli（内盘副本）
+#   状态文件  ~/.local/state/lark-cli-sync.state
+#   日志      ~/Library/Logs/lark-cli-sync.log
+#
+# 三种判定（与 check 脚本退出码一一对应）：
+#   rc=0 一致        → 仅当上次非一致时发「已恢复」一条，其余静默
+#   rc=1 漂移        → 仅当上次非漂移时发一条（含差异摘要），不逐日刷群
+#   rc=2 前置不满足  → 区分「外置卷未挂载」与「源包缺失」，分别告警
+#
+# 去重语义：按「状态」去重，不按时间。状态不变不发；状态变化必发 —— 含恢复通知。
+# 只读+播报：不复制、不修改 lark-cli 包，不动业务数据。
+
+set -u
+
+CHECK="$HOME/.local/bin/check_lark_cli_sync.sh"
+LARK="$HOME/.local/lib/lark-cli/bin/lark-cli"
+STATE="${LARK_SYNC_STATE:-$HOME/.local/state/lark-cli-sync.state}"   # 可覆盖，便于隔离测试
+LOG="${LARK_SYNC_LOG:-$HOME/Library/Logs/lark-cli-sync.log}"          # 可覆盖，便于隔离测试
+CHAT="oc_9ee5303497f5e0e71666b610d6bdc346"
+VOLUME="${LARK_SYNC_VOLUME:-/Volumes/ZHITAI}"   # 可用环境变量覆盖，便于自测 volume_down 分支
+DRY=0
+[ "${1:-}" = "--dry-run" ] && DRY=1
+
+mkdir -p "$(dirname "$STATE")" "$(dirname "$LOG")"
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+
+send() {
+  local text="$1"
+  if [ "$DRY" -eq 1 ]; then
+    echo "[dry-run] 本应发送: $text" >&2
+    return 0
+  fi
+  if [ ! -x "$LARK" ]; then
+    log "[ERR] 内盘 lark-cli 缺失或不可执行: $LARK —— 告警无法发出"
+    return 1
+  fi
+  local out
+  out=$("$LARK" im +messages-send --as bot --chat-id "$CHAT" --markdown "$text" 2>&1)
+  local rc=$?
+  if [ $rc -eq 0 ]; then
+    log "[OK] 告警已发送"
+    return 0
+  fi
+  log "[ERR] 告警发送失败 rc=$rc: $out"
+  return 1
+}
+
+if [ ! -f "$CHECK" ]; then
+  log "[ERR] 巡检脚本缺失: $CHECK"
+  exit 2
+fi
+
+OUT=$(bash "$CHECK" 2>&1)
+RC=$?
+echo "----- $(date '+%F %T') rc=$RC -----" >> "$LOG"
+echo "$OUT" >> "$LOG"
+
+case $RC in
+  0) CUR=ok ;;
+  1) CUR=drift ;;
+  2)
+    # rc=2 有多种前置条件，按脚本的 SKIP 原文区分，避免把「副本缺失」误报成「外置卷挂了」
+    if echo "$OUT" | grep -q "源包目录不存在"; then
+      if [ ! -d "$VOLUME" ]; then CUR=volume_down; else CUR=src_missing; fi
+    elif echo "$OUT" | grep -q "副本包目录不存在"; then
+      CUR=dst_missing
+    else
+      CUR=precondition
+    fi
+    ;;
+  *) CUR="check_error_$RC" ;;
+esac
+
+PREV=$(cat "$STATE" 2>/dev/null || echo none)
+log "判定=$CUR 上次=$PREV"
+
+# 部署副本漂移提示（只记日志，不告警）：本文件是 Claw/scripts/lark-cli-sync-run.sh 的部署副本。
+# 仓内更新后若忘了重新部署，内盘仍跑旧逻辑 —— 与 dual-copy-audit 同一类风险。
+CANON="$HOME/WorkBuddy/Claw/scripts/lark-cli-sync-run.sh"
+if [ -f "$CANON" ] && ! cmp -s "$CANON" "$0"; then
+  log "[WARN] 部署副本与仓内源不一致，请重新复制: cp $CANON $0"
+fi
+
+if [ "$CUR" = "$PREV" ]; then
+  log "状态未变，静默"
+  exit 0
+fi
+
+case $CUR in
+  ok)
+    if [ "$PREV" != "none" ]; then
+      send "✅ **lark-cli 一致性已恢复**
+上一状态：\`$PREV\`
+上一次：$(echo "$OUT" | grep -E '^(OK|MISMATCH|SKIP)' | head -4)"
+    fi
+    ;;
+  drift)
+    send "⚠️ **lark-cli 本机副本与源包不一致**
+$(echo "$OUT" | grep -E '^(MISMATCH|结果|      建议)' | head -6)
+
+按 ~/.local/lib/lark-cli/bin/lark-cli 顶部说明重新同步，再跑 \`bash $CHECK\` 确认 rc=0。
+详细日志：~/Library/Logs/lark-cli-sync.log"
+    ;;
+  volume_down)
+    send "🔴 **外置卷不可用，巡检链路已降级**
+$VOLUME 未挂载 → lark-cli 一致性无法判定。
+
+本告警由内盘直发（不依赖外置卷），说明告警链路本身仍可用；但依赖外置卷的定时任务与产物读写会同时失效，请优先恢复挂载。"
+    ;;
+  src_missing)
+    send "🟡 **lark-cli 源包缺失**
+$VOLUME 已挂载，但 WorkBuddy 托管源包不存在（可能升级后路径变化）。
+一致性无法判定，本机副本 \`$LARK\` 仍在工作。
+$(echo "$OUT" | grep -E '^SKIP' | head -2)"
+    ;;
+  dst_missing)
+    send "🟡 **lark-cli 内盘副本缺失**
+本机副本 \`$HOME/.local/lib/lark-cli\` 不存在 → 推送会退化到外置卷上的源包，
+外置卷抖动时告警将静默失败。
+$(echo "$OUT" | grep -E '^SKIP' | head -2)"
+    ;;
+  *)
+    send "🟡 **lark-cli 巡检异常** rc=$RC
+$(echo "$OUT" | tail -5)"
+    ;;
+esac
+
+if [ "$DRY" -eq 1 ]; then
+  echo "[dry-run] 本应写入状态: ${CUR}（上次 ${PREV}，不实际写入）" >&2
+else
+  echo "$CUR" > "$STATE"
+fi
+exit 0

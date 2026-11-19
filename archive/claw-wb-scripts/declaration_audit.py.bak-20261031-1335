@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""declaration_audit.py — 「文本里写死的数字」对真值体检（2026-10-20 建）
+
+## 为什么需要它
+
+2026-10-20 两次实测，同一类病各犯一次：
+
+1. `memory_add_rule.py` 写规则后不更新文件头注 → 头注仍写「88 条 / 7,074B / 683B」，
+   而实际已是「89 条 / 7,182B / 575B」。文件没坏、写入没报错，只是那份**地图开始骗人**。
+2. 用户级 MEMORY 项目段写「105 自动化」→ 实测未删除 82（78 活跃），
+   105 对不上任何一个口径（82 未删 / 78 活跃 / 201 含软删）。
+
+共同点：**数字写在文档里，取数逻辑活在人脑里**。没人重算 → 腐烂且无声。
+
+## 这台机器的做法
+
+把每条"声明"登记成一行：`(id, 位置, 提取正则, 真值取数函数)`。
+取数函数**必须**能给出明确口径；给不出就 `SKIP`（**不许算通过**）——
+这是本仓 `_skip()` 的同一条铁律：取不到证 ≠ 通过。
+
+## 用法
+
+    python3 declaration_audit.py            # 人读
+    python3 declaration_audit.py --json     # 机读
+    python3 declaration_audit.py --only D4  # 只跑某条
+
+## 退出码
+
+    0 = 全部一致（SKIP 不算不一致，但会单列）
+    1 = 至少一条声明与真值不符
+    2 = 无法判定（找不到文件 / 解析失败）
+"""
+
+from __future__ import annotations
+
+import argparse
+import functools
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+WB_DB = HOME / ".workbuddy" / "workbuddy.db"
+CHECKER = HOME / ".workbuddy" / "scripts" / "check_memory_visibility.py"
+LEARNINGS = HOME / "WorkBuddy" / "Claw" / ".learnings"
+CLAW_WB = HOME / "WorkBuddy" / "Claw" / ".workbuddy"
+ARCHITECTURE_MD = CLAW_WB / "ARCHITECTURE.md"
+REGISTRY_JSON = CLAW_WB / "inspection_hub" / "registry.json"
+HUB_SKILL_MD = HOME / ".workbuddy" / "skills" / "unified-inspection-hub" / "SKILL.md"
+
+
+def _memory_path() -> Path | None:
+    """定位用户级 MEMORY.md（不写死 uuid）。"""
+    cands = sorted(HOME.glob(".workbuddy/user-*/MEMORY.md"))
+    if not cands:
+        return None
+    # 取最近修改的那份（同一机器理论上只有一份用户级）
+    return max(cands, key=lambda p: p.stat().st_mtime)
+
+
+@functools.lru_cache(maxsize=1)
+def _load_checker():
+    """加载 check_memory_visibility 作为版式解析器。
+
+    2026-10-21（C3）：D1/D2/D3 各自调用一次 = 同一模块 exec 三次（~10-20ms/次）。
+    缓存前提：本脚本是**短命 CLI**，单次运行内 CHECKER 文件内容不会变；
+    无参缓存（maxsize=1）因此不存在"拿到旧模块"的窗口。若将来改成常驻进程
+    （文件可能被热替换），必须撤掉这个缓存或改成按文件内容哈希做 key。
+    """
+    if not CHECKER.exists():
+        return None
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("_cmv_audit", str(CHECKER))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _db_scalar(sql: str):
+    if not WB_DB.exists():
+        raise RuntimeError(f"库不存在: {WB_DB}")
+    con = sqlite3.connect(f"file:{WB_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        return con.execute(sql).fetchone()[0]
+    finally:
+        con.close()
+
+
+# ────────────────────────── 真值取数函数 ──────────────────────────
+# 约定：返回 (真值, 口径说明)；抛异常 = 取不到证；返回 None = 该声明本轮不判。
+
+
+def truth_memory_rules(_text: str):
+    mod = _load_checker()
+    if mod is None:
+        raise RuntimeError("找不到 check_memory_visibility.py")
+    p = _memory_path()
+    _, info = mod._layout(p.read_text(encoding="utf-8"), 7757)
+    return int(info["rules"]), "check_memory_visibility._layout(规则层内 '- ' 行数)"
+
+
+def truth_memory_rule_off(_text: str):
+    mod = _load_checker()
+    p = _memory_path()
+    _, info = mod._layout(p.read_text(encoding="utf-8"), 7757)
+    return int(info["rule_off"]), "rule_off = 末条规则行的独占结束偏移(文件内偏移,非净字节)"
+
+
+def truth_memory_headroom(_text: str):
+    mod = _load_checker()
+    p = _memory_path()
+    _, info = mod._layout(p.read_text(encoding="utf-8"), 7757)
+    return 7757 - int(info["rule_off"]), "上限 7757B - rule_off"
+
+
+def truth_memory_evidence(_text: str):
+    p = _memory_path()
+    # ⚠️ 必须锚定行首 `**── 证据 N ──`：证据库开头有一行**用法说明**写着
+    #   `> 用法：grep -n "── 证据 37 ──" …`，用 `"── 证据 " in ln` 会把它算成一条证据
+    #   （本脚本首跑即踩：口径错得出「声明 89 / 真值 90」，差点报出一条假腐烂）。
+    pat = re.compile(r"^\*\*── 证据 \d+ ──\*\*")
+    n = sum(1 for ln in p.read_text(encoding="utf-8").split("\n") if pat.match(ln))
+    return n, "行首匹配 '**── 证据 N ──**' 的行数（排除用法说明行）"
+
+
+def truth_automation_count(_text: str):
+    n = _db_scalar("select count(*) from automations where deleted_at is null")
+    return int(n), "workbuddy.db automations where deleted_at is null"
+
+
+def truth_automation_active(_text: str):
+    n = _db_scalar("select count(*) from automations where deleted_at is null and status='ACTIVE'")
+    return int(n), "同表 + status='ACTIVE'"
+
+
+def truth_learnings_count(_text: str):
+    if not LEARNINGS.exists():
+        raise RuntimeError(f"找不到 {LEARNINGS}")
+    n = sum(1 for p in LEARNINGS.glob("*.md") if re.match(r"\d{4}-\d{2}-\d{2}-", p.name))
+    return n, "文件名匹配 YYYY-MM-DD- 的 .md 数（ERRORS/FEATURE_REQUESTS/LEARNINGS 不算条目）"
+
+
+# ── 已移除的声明：Docker 容器数（2026-10-20 判断，勿再加回）──
+# 原声明：MEMORY 项目段「QTS(Docker 13容器量化)」。
+# 实测三个口径各不相同：QTS compose 项目(quanttradingsystem) **9** / 全站 **17** /
+# 仅运行中 **16** —— 声明值 13 对不上任何一个，已腐烂。
+# 处置不是「改成 9 然后加判据」，而是**把数字从文案里删掉**（现写「QTS(Docker量化栈)」）：
+#   · 容器数随每次部署变动，属**易变值**；写进每日注入的文件 = 保证以后还会腐烂；
+#   · 若真立成判据，则每次正当的增删容器都会打红 → 又一个「无法处置的红灯」。
+# 判据只该盯**稳定且可处置**的事实；易变值不入声明，也不入告警面。
+# 说明：要查容器数请现算 —— `docker ps -a --format '{{.Label "com.docker.compose.project"}}' | sort | uniq -c`
+
+
+def truth_skills_symlink_count(_text: str):
+    """Claw/.workbuddy/skills 下的符号链接数（ARCHITECTURE.md L2 层声明）。
+
+    口径（2026-10-20 实测确认）：只数 `os.path.islink` 为真的条目；
+    目录内另有 pre_exec_discipline/ 与 templates/ 两个**真实目录**，不计入。
+    计数用 os.scandir，不用 shell `ls | wc -l`（本仓铁律：shell 计数会多算）。
+    """
+    d = CLAW_WB / "skills"
+    if not d.exists():
+        raise RuntimeError(f"找不到 {d}")
+    n = sum(1 for e in os.scandir(d) if e.is_symlink())
+    return n, "os.scandir(Claw/.workbuddy/skills) 中 islink 为真的条目数"
+
+
+def truth_registry_version(_text: str):
+    """registry.json 的 version 字段（字符串真值，与 SKILL.md frontmatter 比对）。"""
+    if not REGISTRY_JSON.exists():
+        raise RuntimeError(f"找不到 {REGISTRY_JSON}")
+    ver = json.loads(REGISTRY_JSON.read_text(encoding="utf-8")).get("version")
+    if not ver:
+        raise RuntimeError("registry.json 无 version 字段")
+    return str(ver), "inspection_hub/registry.json 顶层 version 字段"
+
+
+def truth_weekly_repo_count(_text: str):
+    """周报 prompt 里「对以下 **N 个**仓库」的 N，对实际列出的仓库行数。"""
+    con = sqlite3.connect(f"file:{WB_DB}?mode=ro", uri=True, timeout=5)
+    try:
+        row = con.execute(
+            "select prompt from automations where id='automation-1785825576843' and deleted_at is null"
+        ).fetchone()
+    finally:
+        con.close()
+    if not row or not row[0]:
+        raise RuntimeError("取不到周报 prompt")
+    pr = row[0]
+    m = re.search(r"对以下 \*\*(\d+) 个\*\*仓库", pr)
+    if not m:
+        raise RuntimeError("prompt 里找不到「对以下 **N 个**仓库」")
+    start = m.end()
+    listed = 0
+    for ln in pr[start:].split("\n"):
+        if re.match(r"^\d+\.\s+\S", ln.strip()):
+            listed += 1
+        elif ln.strip() and listed:
+            break
+    return listed, f"prompt 中 '对以下 **N 个**仓库' 之后的编号行数（声明 N={m.group(1)}）"
+
+
+# ────────────────────────── 声明登记表 ──────────────────────────
+# (id, 人读位置, 提取正则, 真值函数, 声明是第几个捕获组)
+DECLS = [
+    (
+        "D1",
+        "用户级 MEMORY 头注「规则层（下方 N 条…）」",
+        r"^\*\*规则层\*\*（下方 (\d+) 条，每行一条，注入可见）",
+        truth_memory_rules,
+        1,
+    ),
+    (
+        "D2",
+        "用户级 MEMORY 头注「止于 X B」",
+        r"止于 \*\*([\d,]+)B\*\*",
+        truth_memory_rule_off,
+        1,
+    ),
+    (
+        "D3",
+        "用户级 MEMORY 头注「余量 ≈Y B」",
+        r"余量 ≈(\d+)B",
+        truth_memory_headroom,
+        1,
+    ),
+    (
+        "D4",
+        "用户级 MEMORY 证据库小标题「共 N 条」",
+        r"^> 共 (\d+) 条，默认不可见，按需检索。",
+        truth_memory_evidence,
+        1,
+    ),
+    # ⚠️ D5/D6 是**下界判据**（第 6 位 "ge"），不是等值对账 —— 理由：
+    #   自动化条数是本项目最高频的易变值（新建/删除/停用天天发生），而本脚本自己的
+    #   原则就是「判据只该盯稳定且可处置的事实；易变值不入声明」。实测代价：2026-10-20
+    #   一天内它就腐烂两次（83/79→85/81→86/82），每次都要人工改文案；这种红是噪音，
+    #   而噪音守卫比没有守卫更糟（告警疲劳会让人连真信号一起忽略）。
+    #   改成下界后语义变成承诺："这套系统至少维持这么多自动化"——
+    #   建新的不报警（正常演进），**跌破才报**（批量删除/误停用才是要处置的事件）。
+    (
+        "D5",
+        "用户级 MEMORY 项目段「N+自动化」（下界）",
+        r"Claw\(A股投顾核心,(\d+)\+自动化",
+        truth_automation_count,
+        1,
+        "ge",
+    ),
+    (
+        "D6",
+        "用户级 MEMORY 项目段「/M+活跃」（下界）",
+        r"Claw\(A股投顾核心,\d+\+自动化/(\d+)\+活跃\)",
+        truth_automation_active,
+        1,
+        "ge",
+    ),
+    (
+        "D7",
+        ".learnings/INDEX.md「条目数：N」",
+        r"条目数：\*\*(\d+)\*\*",
+        truth_learnings_count,
+        1,
+    ),
+    # D8「Docker N 容器」已于 2026-10-20 移除：易变值不入声明（理由见上方注释块）
+    (
+        "D9",
+        "周报 prompt「对以下 **N 个**仓库」",
+        r"对以下 \*\*(\d+) 个\*\*仓库",
+        truth_weekly_repo_count,
+        1,
+    ),
+    # ── 2026-10-20 扩面（用户决策）：docs + registry ──
+    # D10 登记当日即抓到真实腐烂：ARCHITECTURE.md 写 38，实测 42 → 已修文案。
+    # 口径为「符号链接条目数」，增删 skill 属正当变更，打红后修文案即可（可处置）。
+    (
+        "D10",
+        "ARCHITECTURE.md 目录树「Knowledge Layer (N个symlink)」",
+        r"Knowledge Layer \((\d+)个symlink\)",
+        truth_skills_symlink_count,
+        1,
+    ),
+    (
+        "D11",
+        "ARCHITECTURE.md L2 段「项目级 symlink (N)」",
+        r"项目级 symlink\*\* \((\d+)\)",
+        truth_skills_symlink_count,
+        1,
+    ),
+    # D12 是**字符串声明**（semver）：同一事实双处声明（SKILL.md frontmatter 与
+    # registry.json version），改一处不改另一处 = 从那一刻起有一处在说谎。
+    #
+    # ⚠️ 正则必须锚定 frontmatter（2026-10-21 C1）：只写 `^version:` 时，一旦文件
+    # 丢了 frontmatter（或被误删），正则会命中**正文**里恰好出现的 `version: X`，
+    # 拿一个跟 registry 毫无关系的值去对账 —— 守卫就会"绿着说谎"（实测：正文里
+    # 写 `version: 9.9.9` 会被误当成声明值）。故要求文件以 `---` 开头且 version
+    # 位于其中；锚定不上就报 MISSING（不是静默通过，符合取不到证≠通过的铁律）。
+    (
+        "D12",
+        "unified-inspection-hub SKILL.md frontmatter「version: X」",
+        r"\A---\s*\n(?:[^\n]*\n)*?version:\s*(\S+)",
+        truth_registry_version,
+        1,
+    ),
+]
+
+
+def _norm_int(s: str) -> int:
+    return int(str(s).replace(",", ""))
+
+
+def run(only: str | None = None) -> list[dict]:
+    mem = _memory_path()
+    results: list[dict] = []
+    if mem is None:
+        return [
+            {
+                "id": "ALL",
+                "where": "用户级 MEMORY.md",
+                "verdict": "ERROR",
+                "detail": "找不到 ~/.workbuddy/user-*/MEMORY.md",
+            }
+        ]
+    mem_text = mem.read_text(encoding="utf-8")
+    weekly_prompt_src = None
+    arch_text_cache: str | None = None
+    hub_skill_text_cache: str | None = None
+    for item in DECLS:
+        did, where, pat, fn, grp = item[:5]
+        # 可选的第 6 位 = 比较模式。默认 "eq"（声明 == 真值）；
+        # "ge" = 下界判据（真值 ≥ 声明即通过），用于易变但只在**向下**掉时才需处置的量。
+        cmp_mode = item[5] if len(item) > 5 else "eq"
+        if only and did != only:
+            continue
+        # 决定在哪个文本里找声明
+        if did == "D7":
+            f = LEARNINGS / "INDEX.md"
+            text = f.read_text(encoding="utf-8") if f.exists() else ""
+        elif did == "D9":
+            if weekly_prompt_src is None:
+                con = sqlite3.connect(f"file:{WB_DB}?mode=ro", uri=True, timeout=5)
+                try:
+                    row = con.execute(
+                        "select prompt from automations where id='automation-1785825576843'"
+                    ).fetchone()
+                finally:
+                    con.close()
+                weekly_prompt_src = (row or [""])[0] or ""
+            text = weekly_prompt_src
+        elif did in ("D10", "D11"):
+            if arch_text_cache is None:
+                arch_text_cache = (
+                    ARCHITECTURE_MD.read_text(encoding="utf-8") if ARCHITECTURE_MD.exists() else ""
+                )
+            text = arch_text_cache
+        elif did == "D12":
+            if hub_skill_text_cache is None:
+                hub_skill_text_cache = (
+                    HUB_SKILL_MD.read_text(encoding="utf-8") if HUB_SKILL_MD.exists() else ""
+                )
+            text = hub_skill_text_cache
+        else:
+            text = mem_text
+
+        m = re.search(pat, text, re.MULTILINE)
+        if not m:
+            results.append(
+                {"id": did, "where": where, "verdict": "MISSING", "detail": "声明本身找不到"}
+            )
+            continue
+        try:
+            tv, caliber = fn(text)
+        except Exception as e:  # noqa: BLE001
+            results.append(
+                {"id": did, "where": where, "verdict": "SKIP", "detail": f"取不到证: {e}"}
+            )
+            continue
+        if tv is None:
+            results.append({"id": did, "where": where, "verdict": "SKIP", "detail": caliber})
+            continue
+        raw_declared = m.group(grp) if grp else None
+        if raw_declared is None:
+            results.append(
+                {
+                    "id": did,
+                    "where": where,
+                    "verdict": "SKIP",
+                    "detail": f"声明值不可解析；真值={tv}（{caliber}）",
+                }
+            )
+            continue
+        # 2026-10-21（C5）：原写法在 if/else 两个分支里各赋值一次 declared
+        # （类型注解只挂在其中一支），读起来像两个不同变量；合并为单表达式。
+        is_str = isinstance(tv, str)
+        declared: str | int = raw_declared.strip() if is_str else _norm_int(raw_declared)
+        if is_str:
+            ok = declared == tv
+        elif cmp_mode == "ge":
+            # 下界判据：声明写的是「至少还有这么多」，真值≥声明即通过；
+            # 跌破才报——那才是需要处置的事件（批量删除 / 误停用）。
+            ok = int(tv) >= declared
+        else:
+            ok = int(tv) == declared
+        results.append(
+            {
+                "id": did,
+                "where": where,
+                "verdict": "OK" if ok else "MISMATCH",
+                "declared": declared,
+                "truth": tv,
+                "caliber": caliber,
+                "cmp": cmp_mode,
+            }
+        )
+    return results
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--only", default=None)
+    args = ap.parse_args()
+
+    res = run(args.only)
+    if args.json:
+        print(
+            json.dumps(
+                {"ts": datetime.now().isoformat(timespec="seconds"), "results": res},
+                ensure_ascii=False,
+                indent=1,
+            )
+        )
+    else:
+        icon = {"OK": "✅", "MISMATCH": "🔴", "SKIP": "⏭", "MISSING": "❓", "ERROR": "💥"}
+        print(f"[decl-audit] {datetime.now():%F %T}")
+        for r in res:
+            tail = ""
+            if r["verdict"] == "OK":
+                tail = f"声明={r['declared']} 真值={r['truth']}"
+                if r.get("cmp") == "ge":
+                    tail += "（下界判据：真值≥声明即通过）"
+            elif r["verdict"] == "MISMATCH":
+                tail = f"声明={r['declared']} 真值={r['truth']} ← 口径: {r['caliber']}"
+                if r.get("cmp") == "ge":
+                    tail += "（下界被判穿：真值已低于承诺下界）"
+            else:
+                tail = r.get("detail", "")
+            print(f"  {icon.get(r['verdict'], '?')} {r['id']} {r['where']}: {tail}")
+        n_bad = sum(1 for r in res if r["verdict"] in ("MISMATCH", "MISSING", "ERROR"))
+        n_skip = sum(1 for r in res if r["verdict"] == "SKIP")
+        n_ok = sum(1 for r in res if r["verdict"] == "OK")
+        print(f"[decl-audit] 合计 {len(res)}：✅{n_ok} / 🔴{n_bad} / ⏭{n_skip}（SKIP 不计通过）")
+
+    if any(r["verdict"] == "ERROR" for r in res):
+        return 2
+    if any(r["verdict"] in ("MISMATCH", "MISSING") for r in res):
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

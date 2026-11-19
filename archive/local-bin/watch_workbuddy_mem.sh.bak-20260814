@@ -1,0 +1,475 @@
+#!/bin/zsh
+# ============================================================
+# watch_workbuddy_mem.sh — WorkBuddy 内存自愈守护 (Mac Mini M4 16G)
+#
+# 双通道触发(连续 SUSTAIN 次采样均满足才动作, 防误杀):
+#   A) WorkBuddy 进程树自身总内存 > RSS_RESTART_MB   (默认 8500MB, 主通道: 治泄漏; 2026-08-06 由6000上调到10000, 08-11 降到8500, 08-12 修复二误改回10000已恢复)
+#   B) 整机可用内存 < SYS_CRIT_AVAILABLE_MB           (默认 512MB, 用户原始诉求: 治标)
+#      或系统内存压力等级 >= 4(critical)
+#      → B 通道同时要求 WB 树内存 > RSS_FLOOR_MB(默认 800MB, 避免重启"无辜"的空闲应用)
+#   C) 2026-08-11 修复二: B/C 通道下 WB 树 > WB_AGGRESSIVE_MB(默认4000) 时 SUSTAIN 动态降为 1,
+#      单次命中即重启, 抓"爆→缓→爆"震荡(08-11 05:23-08:03 反复候选1/2→解除, 自动化全挂2.5h教训)
+#
+# 安全护栏:
+#   - SUSTAIN 连续确认 / COOLDOWN_SEC 冷却 / 30 分钟内最多 MAX_RESTARTS_30MIN 次
+#   - 精确 PID 定位, 优雅退出优先 (AppleScript quit → 轮询等待 → TERM → KILL 兜底),
+#     重启后回读验证新主进程 + 对话完整性自检
+#   - 绝不使用 pkill -f "WorkBuddy" 模糊匹配 (会误杀 sidecar 对话载体)
+#   - --dry-run 只测量打印, 不执行任何 kill
+#
+# 2026-08-05 优化 (修复"重启后 UI 对话内容消失"):
+#   - 原实现 TERM 主进程后固定 sleep 8 即 KILL 全部残留, renderer/daemon 来不及
+#     flush 对话状态(IndexedDB/WAL/会话恢复信息), 重启后 UI 对话空白/未恢复。
+#   - 现改为: AppleScript quit 走 app 正常关闭流程, 轮询等待全部进程自然退出
+#     (QUIT_WAIT_SEC=30s), 超时才 TERM(TERM_WAIT_SEC=10s), 仍超时才 KILL。
+#   - 重启成功后新增 verify_conversations 自检 (sessions.json 会话数), 异常即推飞书告警。
+#   - 环境变量: QUIT_WAIT_SEC / TERM_WAIT_SEC 可调。
+#
+# 2026-08-11 修复 (两次被系统 OOM 强杀, memwatch 抢不过系统):
+#   - 背景: 08-09 18:13 / 08-11 02:33 WB树冲到 10.2GB 超旧阈值 10000MB, 但 10 秒后
+#     "候选解除"——实际是 macOS Jetsam 已把 WB 强杀, 进程树骤降被误判为压力解除,
+#     无告警无记录, WB 停机 ~5h 无人知晓。
+#   - ① WATCH_INTERVAL 10s→5s: 连续确认更快, 抢在系统 OOM 前完成优雅重启
+#   - ② RSS_RESTART_MB 10000→8500: 16G 机器 WB 树到 10G 时系统早被挤爆, 8500 给系统留缓冲
+#   - ③ 新增"系统强杀识别": 主循环检测 WB 进程树从有到无(且非本脚本重启流程)时,
+#     记录日志 + 系统通知 + 飞书告警, 不再静默错过; IN_RESTART 标志区分自重启。
+#   - ④ do_restart 后重同步 prev_wb_count 基线, 避免重启失败被误判为强杀。
+#   - ⑤ 2026-08-12: 强杀识别升级为"告警+自动拉起", 修复 08-11 23:45 停机 5h11m 教训。
+#
+# 2026-08-11 修复二 (内存"爆→缓→爆"震荡绕过 sustain=2, 优雅重启从未触发):
+#   - 实锤: 08-11 05:23-08:03 系统压力等级持续 critical(13次), 但 WB 树在 4-5GB 波动,
+#     单次采样命中后第 2 次采样缓解 → 反复"候选 1/2 → 解除", 重启从未触发, 自动化全挂 ~2.5h。
+#   - 新增 WB_AGGRESSIVE_MB(默认4000): B/C 系统压力通道下, WB 树超过该值时 SUSTAIN 动态降为 1,
+#     单次命中即重启(系统 critical + WB>4GB 已是崩溃边缘强信号, 误杀风险低);
+#     A 通道(WB>8500 泄漏)与 B/C 低 WB 场景维持 SUSTAIN=2, 防瞬时压力尖峰误杀。
+#
+# 2026-08-12 修复四 (单一配置源, 防双自动化互相覆盖):
+#   - 08-11 23:45 巡检中枢 memwatch_bump 直接 sed 本脚本改阈值, 与 do_restart 并发致停机5h11m。
+#   - 此后所有参数统一由 ~/.local/etc/workbuddy_memwatch.conf 提供(唯一配置源),
+#     本脚本=只读逻辑; 巡检中枢 bump 也只改 conf(原子写+备份), 不再 sed 本文件。
+#   - 加载顺序: conf > 环境变量 > 默认值。
+#
+# 用法: watch_workbuddy_mem.sh [--dry-run] [--oneshot]
+# 参数配置: ~/.local/etc/workbuddy_memwatch.conf (不要直接改本脚本参数段)
+# 环境变量仍可在 launchd plist 中覆盖: WATCH_INTERVAL/SUSTAIN/RSS_RESTART_MB/
+#     SYS_CRIT_AVAILABLE_MB/RSS_FLOOR_MB/COOLDOWN_SEC/MAX_RESTARTS_30MIN/LOG_FILE
+# ============================================================
+
+# ---- 单一配置源: 先加载 conf (存在则覆盖默认值), 之后才是默认值兜底 ----
+MEMWATCH_CONF="${MEMWATCH_CONF:-$HOME/.local/etc/workbuddy_memwatch.conf}"
+if [ -f "$MEMWATCH_CONF" ]; then
+  # shellcheck disable=SC1090
+  source "$MEMWATCH_CONF"
+  log_conf=1
+else
+  log_conf=0
+fi
+
+: "${WATCH_INTERVAL:=5}"     # 2026-08-11: 10s→5s, 抢在系统 OOM(Jetsam) 之前完成连续确认
+: "${SUSTAIN:=2}"
+: "${RSS_RESTART_MB:=8500}"  # 2026-08-12 修正: 修复二部署时误改回10000, 已恢复8500(16G机器WB树到10G时系统早已被挤爆)
+: "${SYS_CRIT_AVAILABLE_MB:=512}"
+: "${RSS_FLOOR_MB:=800}"
+: "${WB_AGGRESSIVE_MB:=4000}"  # 2026-08-11: B/C系统压力通道下, WB树>此值(MB)时 SUSTAIN 动态降为1, 抓内存震荡
+: "${COOLDOWN_SEC:=300}"
+: "${MAX_RESTARTS_30MIN:=2}"
+: "${QUIT_WAIT_SEC:=90}"    # 2026-08-13: 30→90. AppleScript quit 后等待主进程退出的秒数(主进程退出=正常关闭流程走完)
+: "${EXTRA_FLUSH_SEC:=15}"  # 2026-08-13 新增: 主进程退出后再给 renderer flush 对话状态(IndexedDB/WAL)的窗口秒数
+: "${TERM_WAIT_SEC:=10}"    # TERM 兜底后等待秒数
+: "${LOG_FILE:=$HOME/Library/Logs/workbuddy_memwatch.log}"
+
+DRY_RUN=0; ONESHOT=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY_RUN=1 ;;
+    --oneshot) ONESHOT=1 ;;
+  esac
+done
+
+PAGE_SIZE=$(sysctl -n hw.pagesize)
+
+log(){ echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"; }
+
+trim_log(){
+  local size
+  size=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+  if (( size > 5242880 )); then
+    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+# ---- 互斥锁 (mkdir 锁; 修复残留处理: 先删 pid 文件再删目录, 防 trap 未执行导致的卡死) ----
+LOCK_DIR="/tmp/workbuddy_memwatch.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  # 锁目录已存在: 若属主进程仍存活则视为已有实例
+  if [ -f "$LOCK_DIR/pid" ] && kill -0 "$(cat "$LOCK_DIR/pid" 2>/dev/null)" 2>/dev/null; then
+    echo "[$(date '+%F %T')] 已有实例在运行, 退出" >> "$LOG_FILE"
+    exit 0
+  fi
+  # 陈旧锁 (属主已死): 先删 pid 文件(rmdir 只删空目录), 再删目录, 重新获取
+  rm -f "$LOCK_DIR/pid"
+  rmdir "$LOCK_DIR" 2>/dev/null
+  mkdir "$LOCK_DIR" 2>/dev/null || { echo "[$(date '+%F %T')] 无法获取锁" >> "$LOG_FILE"; exit 1; }
+fi
+echo $$ > "$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+# ---- 采集函数 ----
+# WorkBuddy 进程树: 命令行含 WorkBuddy.app 的进程, 输出 "pid rss_kb"
+wb_procs(){
+  ps -axo pid=,rss=,command= | awk '/WorkBuddy\.app/ && !/watch_workbuddy_mem/ {print $1, $2}'
+}
+# 可清理进程 = WB 树中排除 sidecar/--serve 对话载体 (2026-08-13 20:44 事故修复)
+# sidecar-entry.js 才是会话恢复的载体进程, 杀它 = 重启后 UI 无法恢复历史对话。
+# daemon-app-server-entry 是【调度器】非对话载体: 主进程被 TERM 强杀后它不跟随退出,
+# 会以 PPID=1 孤儿存活并占用 IPC 端口, 致新实例 handshake 超时、自动化 10h 全挂
+# (08-13 事故根因, 孤儿 17259/99824 于 21:36 手动清理)。故 daemon 必须纳入可清理名单。
+wb_killable_procs(){
+  ps -axo pid=,rss=,command= | awk '/WorkBuddy\.app/ && !/watch_workbuddy_mem/ && !/sidecar-entry/ && !/--serve/ {print $1, $2}'
+}
+# 进程树总内存 MB
+wb_total_mb(){
+  local t=0 r
+  while read -r _p r; do
+    r=${r:-0}
+    t=$(( t + r ))
+  done < <(wb_procs)
+  echo $(( t / 1024 ))
+}
+# 整机可用内存 MB (free+inactive+speculative+purgeable, 苹果可回收口径)
+sys_available_mb(){
+  local vm f i s p
+  vm=$(vm_stat)
+  f=$(echo "$vm" | awk '/Pages free/       {print $3}' | tr -d '.')
+  i=$(echo "$vm" | awk '/Pages inactive/   {print $3}' | tr -d '.')
+  s=$(echo "$vm" | awk '/Pages speculative/{print $3}' | tr -d '.')
+  p=$(echo "$vm" | awk '/Pages purgeable/  {print $3}' | tr -d '.')
+  echo $(( (f + i + s + p) * PAGE_SIZE / 1048576 ))
+}
+# 系统内存压力等级: 1=normal 2=warn 4=critical
+sys_pressure_level(){ sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 0; }
+# WorkBuddy 主进程 PID
+# 匹配: 程序路径 .../Contents/MacOS/Electron 后跟空格或行尾;
+# 排除子进程特征(--serve/--prewarm/daemon-app-server-entry/sidecar-entry/--require)
+# 修复 P1-2: 主进程若带 --xxx 启动参数也能命中, 不再要求 Electron$ 精确结尾
+wb_main_pids(){
+  ps -axo pid=,command= | awk '/WorkBuddy\.app\/Contents\/MacOS\/Electron([[:space:]]|$)/ && !/(--serve|--prewarm|daemon-app-server-entry|sidecar-entry|--require)/ {print $1}'
+}
+
+# ---- 通知 (P2-1: 重启前通知用户; 失败不阻塞主流程) ----
+notify_restart(){
+  local reason="$1" title raw_body esc_body card
+  title="🔴 WorkBuddy 内存自愈重启"
+  raw_body="原因: ${reason} | WB=${WB_MB}MB 整机=${SYS_MB}MB 压力=${LVL}"
+  esc_body=$(printf '%s' "$raw_body" | sed 's/\\/\\\\/g; s/"/\\"/g')
+  # 1) 系统通知中心
+  osascript -e "display notification \"${esc_body}\" with title \"${title}\"" 2>/dev/null
+  # 2) 飞书卡片推送 (异步后台发送, 不阻塞重启动作; 内部已绝对路径定位 lark-cli; 失败静默)
+  card="$HOME/WorkBuddy/Claw/.workbuddy/scripts/push_card.py"
+  if [ -x "$card" ]; then
+    ("$card" --title "$title" --level alert \
+      --section "⚡ 触发原因" "$reason" \
+      --section "📊 实测指标" "WB树=${WB_MB}MB | 整机可用=${SYS_MB}MB | 压力等级=${LVL}" \
+      --chat-id "oc_9ee5303497f5e0e71666b610d6bdc346" >/dev/null 2>&1 &)
+  fi
+}
+
+# ---- 优雅退出 (2026-08-05 优化: 修复重启后 UI 对话内容消失) ----
+# 原实现: TERM 主进程后固定 sleep 8 → KILL 全部残留。
+# 问题: renderer/daemon 来不及 flush 对话状态(IndexedDB/WAL/会话恢复信息),
+#       重启后 UI 呈现空白/未恢复历史对话(实测数据仍在, 但 UI 恢复不完整)。
+# 新实现: AppleScript quit(走 app 正常关闭流程) → 等待主进程退出
+#         → 主进程退出后 renderer/daemon 会自动跟随退出并 flush 状态
+#         → 超时才 TERM(仅可清理进程) → 仍超时才 KILL。最大限度保留完整收尾时间。
+# 2026-08-13 修复三: 不再等"全部进程退出"——MCP server/python 后端等守护子进程
+#   不会随主进程退出, 等它们=永远超时=降级 TERM 强杀 renderer/sidecar 致 UI 空白。
+#   改为: 主进程退出即视为优雅退出成功, 剩余子进程交给 2) cleanup_residual 温和处理。
+graceful_quit(){
+  local result waited n mainleft
+  result=$(osascript -e 'tell application "WorkBuddy" to quit' 2>&1)
+  if (( $? != 0 )); then
+    log "    osascript quit 不可用($result), 降级 TERM"
+    return 1
+  fi
+  waited=0
+  while (( waited < QUIT_WAIT_SEC )); do
+    mainleft=$(wb_main_pids | wc -l | tr -d ' ')
+    if (( mainleft == 0 )); then
+      log "    AppleScript quit 生效, 主进程在 ${waited}s 内退出"
+      # 主进程退出后 renderer/daemon 跟随退出并 flush, 给 EXTRA_FLUSH_SEC 收尾窗口
+      sleep "$EXTRA_FLUSH_SEC"
+      return 0
+    fi
+    sleep 2
+    waited=$((waited+2))
+  done
+  log "    AppleScript quit 等待 ${QUIT_WAIT_SEC}s 后主进程仍在, 降级 TERM"
+  return 1
+}
+# 轮询等待 WorkBuddy 可清理进程清空, 返回 0=已清空 1=超时 (sidecar/--serve 载体不在此列)
+wait_all_exit(){
+  local limit="$1" waited n
+  waited=0
+  while (( waited < limit )); do
+    n=$(wb_killable_procs | wc -l | tr -d ' ')
+    (( n == 0 )) && { log "    可清理进程已清空 (等待 ${waited}s)"; return 0; }
+    sleep 2
+    waited=$((waited+2))
+  done
+  return 1
+}
+# 残留清理: 先 TERM, 再 KILL(与旧逻辑一致, 但仅在优雅退出超时后才执行)
+# 2026-08-13: 只清理"可清理进程", sidecar/daemon/--serve 对话载体绝不 KILL
+cleanup_residual(){
+  local remaining
+  remaining=($(wb_killable_procs | awk '{print $1}'))
+  if (( ${#remaining[@]} > 0 )); then
+    log "    清理残留进程(TERM, 已排除sidecar): ${remaining[*]}"
+    kill "${remaining[@]}" 2>/dev/null
+    wait_all_exit "$TERM_WAIT_SEC" && return 0
+    remaining=($(wb_killable_procs | awk '{print $1}'))
+    if (( ${#remaining[@]} > 0 )); then
+      log "    TERM 超时, KILL -9 (排除sidecar): ${remaining[*]}"
+      kill -9 "${remaining[@]}" 2>/dev/null
+      sleep 2
+    fi
+  fi
+}
+# 重启前备份会话索引 (2026-08-12 修复五: 08-12 14:45 重启清空 sessions.json 致 UI 历史对话消失)
+backup_sessions(){
+  local sf bak n
+  sf="$HOME/.workbuddy/app/sessions.json"
+  bak="$HOME/.workbuddy/app/sessions.json.bak"
+  if [ -f "$sf" ] && [ -s "$sf" ]; then
+    n=$(grep -c '"conversationId"' "$sf" 2>/dev/null || true)
+    n=${n:-0}
+    if (( n > 0 )); then
+      cp "$sf" "$bak" 2>/dev/null && log "    已备份会话索引: ${n} 个会话 → sessions.json.bak"
+    else
+      log "    sessions.json 当前为空(${n}), 跳过备份"
+    fi
+  else
+    log "    sessions.json 不存在或为空, 跳过备份"
+  fi
+}
+# 重启后对话完整性自检 (验证回读: 观察≠transition, 2026-08-05)
+# 2026-08-12 修复五增强: 检测到空时自动从 sessions.json.bak 恢复, 防 UI 历史对话消失
+# 2026-08-13 增强: 增加 jsonl 内容文件对比——sessions.json 空但 jsonl 完好 = 索引丢失,
+#   可从 jsonl 重建/引导 UI 重新扫描, 不再只依赖单一索引文件
+verify_conversations(){
+  local sf bak n card bn restored jsonl_count
+  sf="$HOME/.workbuddy/app/sessions.json"
+  bak="$HOME/.workbuddy/app/sessions.json.bak"
+  card="$HOME/WorkBuddy/Claw/.workbuddy/scripts/push_card.py"
+  n=$(grep -c '"conversationId"' "$sf" 2>/dev/null || true)
+  n=${n:-0}
+  jsonl_count=$(find "$HOME/.workbuddy/projects" -name "*.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+  jsonl_count=${jsonl_count:-0}
+  restored=0
+  if (( n < 1 )); then
+    log "!! 重启后会话元数据为空(${n}), jsonl 内容文件=${jsonl_count}"
+    if [ -f "$bak" ] && [ -s "$bak" ]; then
+      bn=$(grep -c '"conversationId"' "$bak" 2>/dev/null || true)
+      bn=${bn:-0}
+      if (( bn > 0 )); then
+        cp "$bak" "$sf" 2>/dev/null
+        n=$(grep -c '"conversationId"' "$sf" 2>/dev/null || true)
+        n=${n:-0}
+        restored=1
+        log "!! 已从备份恢复会话索引: ${bn} 个会话"
+      fi
+    fi
+    log "!! 恢复结果: 会话数=${n} (restored=${restored}), 推送告警"
+    if [ -x "$card" ]; then
+      if (( restored == 1 )); then
+        ("$card" --title "⚠️ 重启后会话索引已自动恢复" --level warn \
+          --section "检测结果" "sessions.json 已从备份恢复 ${n} 个会话" \
+          --section "处置建议" "若 UI 仍未显示历史对话, 请重启应用让 UI 重新扫描" \
+          --chat-id "oc_9ee5303497f5e0e71666b610d6bdc346" >/dev/null 2>&1 &)
+      elif (( jsonl_count > 0 )); then
+        # 索引丢但内容完好: 数据没丢, 引导 UI 重新扫描 jsonl 重建索引
+        ("$card" --title "⚠️ 重启后会话索引为空但内容完好" --level warn \
+          --section "检测结果" "sessions.json 会话数=0, 但 projects 下 ${jsonl_count} 个 jsonl 内容文件完好" \
+          --section "处置建议" "历史数据未丢失, 重启应用或重新打开会话让 UI 重建索引" \
+          --chat-id "oc_9ee5303497f5e0e71666b610d6bdc346" >/dev/null 2>&1 &)
+      else
+        ("$card" --title "⚠️ 重启后对话恢复异常" --level warn \
+          --section "检测结果" "sessions.json 会话数=${n}(期望≥1), 无可用备份, jsonl=${jsonl_count}" \
+          --section "处置建议" "历史会话文件在 ~/.workbuddy/projects/**/*.jsonl, 请检查磁盘完整性" \
+          --chat-id "oc_9ee5303497f5e0e71666b610d6bdc346" >/dev/null 2>&1 &)
+      fi
+    fi
+  else
+    log "    重启后会话元数据正常: ${n} 个会话 (jsonl=${jsonl_count})"
+  fi
+}
+
+# ---- 重启动作 ----
+do_restart(){
+  local reason="$1" now mainpids remaining newpids
+  now=$(date +%s)
+
+  # 冷却 (仅统计真实执行的重启; 修复: LAST_RESTART 此前从未赋值, 冷却形同虚设)
+  if (( now - LAST_RESTART < COOLDOWN_SEC )); then
+    log "== 冷却期内(距上次重启 $((now-LAST_RESTART))s < ${COOLDOWN_SEC}s), 跳过"
+    return
+  fi
+  # 30 分钟窗口内真实重启次数上限 (失败/干跑不再计入, 修复 P1-1)
+  local cutoff=$(( now - 1800 )) n=0
+  for ts in "${RESTART_HISTORY[@]}"; do
+    (( ts > cutoff )) && ((n++))
+  done
+  if (( n >= MAX_RESTARTS_30MIN )); then
+    log "== 30 分钟内已重启 ${n} 次, 进入 30min 冷静期"
+    sleep 1800
+    return
+  fi
+
+  log "==> 触发重启($reason): WB树=${WB_MB}MB 整机可用=${SYS_MB}MB 压力等级=${LVL} dry_run=${DRY_RUN}"
+  if (( DRY_RUN )); then
+    log "    [dry-run] 以上为将执行的重启动作, 未做任何操作"
+    return
+  fi
+
+  # 通知 (P2-1) + 3s 反应时间
+  notify_restart "$reason"
+  sleep 3
+
+  # 0) 重启前备份会话索引 (2026-08-12 修复五: 防强杀清空 sessions.json 致 UI 历史对话消失)
+  backup_sessions
+
+  # 1) 优雅退出链 (2026-08-05): AppleScript quit → 轮询 → TERM → 轮询 → KILL 兜底
+  #    Electron 正常关闭流程会让 renderer 完整 flush 对话状态, 重启后 UI 才能恢复历史对话
+  mainpids=($(wb_main_pids))
+  if (( ${#mainpids[@]} == 0 )); then
+    log "!! 未匹配到主进程, 跳过优雅退出, 直接残留清理"
+  else
+    log "    优雅退出主进程: ${mainpids[*]} (AppleScript quit, 等待≤${QUIT_WAIT_SEC}s)"
+    if ! graceful_quit; then
+      log "    降级: kill -TERM ${mainpids[*]}"
+      kill -TERM "${mainpids[@]}" 2>/dev/null
+      wait_all_exit "$TERM_WAIT_SEC" || cleanup_residual
+    fi
+  fi
+
+  # 2) 兜底清理残留 (仅当优雅退出链路未清干净时执行)
+  cleanup_residual
+  sleep 2
+
+  # 3) 验证已退出 (验证回读: 观察≠完成; 2026-08-13: 只要求可清理进程清空,
+  #    sidecar/--serve 对话载体允许保留——重启后新实例会重新接管, 杀掉反而丢 UI 历史)
+  remaining=($(wb_killable_procs | awk '{print $1}'))
+  if (( ${#remaining[@]} > 0 )); then
+    log "!! 仍有残留进程 ${remaining[*]} 无法退出, 放弃重启"
+    RESTART_HISTORY+=("$now")   # 失败熔断: 残留清不掉→无限重试+通知轰炸的回归(08-04终审发现)
+    LAST_RESTART=$now
+    return 1
+  fi
+
+  # 4) 重启(路径优先, P2-2) + 回读验证新主进程; 成功后才计入历史(修复 P1-1)
+  open "$HOME/Desktop/WorkBuddy.app" 2>/dev/null || open -a WorkBuddy 2>/dev/null
+  sleep 12
+  newpids=($(wb_main_pids))
+  if (( ${#newpids[@]} == 0 )); then
+    log "!! 重启未检测到新主进程, 再试一次"
+    open "$HOME/Desktop/WorkBuddy.app" 2>/dev/null
+    sleep 12
+    newpids=($(wb_main_pids))
+  fi
+  if (( ${#newpids[@]} > 0 )); then
+    log "==> 重启成功, 新主进程 PID: ${newpids[*]}"
+    RESTART_HISTORY+=("$now")
+    LAST_RESTART=$now
+    sleep 15   # 等会话列表加载
+    verify_conversations
+    sleep 45   # 启动保护期
+  else
+    log "!! 重启失败: open 后仍未检测到新主进程 (不计数, 可重试)"
+  fi
+}
+
+# ---- 主循环 ----
+LAST_RESTART=0
+RESTART_HISTORY=()
+streak=0
+IN_RESTART=0          # 2026-08-11: 本脚本重启流程进行中标志(避免把自重启误判为系统强杀)
+prev_wb_count=0       # 2026-08-11: 上一轮 WB 进程树数量(系统强杀识别)
+log "监控启动: interval=${WATCH_INTERVAL}s sustain=${SUSTAIN} rss_thr=${RSS_RESTART_MB}MB sys_crit=${SYS_CRIT_AVAILABLE_MB}MB floor=${RSS_FLOOR_MB}MB cooldown=${COOLDOWN_SEC}s max30m=${MAX_RESTARTS_30MIN} dry_run=${DRY_RUN} $(zsh --version | head -1)"
+
+# 初始化基线: 记录脚本启动时 WB 是否已存在
+prev_wb_count=$(wb_procs | wc -l | tr -d ' ')
+
+while true; do
+  WB_MB=$(wb_total_mb)
+  SYS_MB=$(sys_available_mb)
+  LVL=$(sys_pressure_level)
+  wb_count=$(wb_procs | wc -l | tr -d ' ')
+
+  # ---- 系统强杀识别 (2026-08-11): WB 进程树消失且非本脚本重启流程 → 记录+告警 ----
+  # 背景: 08-09/08-11 两次 WB 被 macOS OOM 强杀, 进程树骤降被误判为"候选解除",
+  #       无记录无告警, WB 停机 5 小时无人知晓。现补该识别通道。
+  # 2026-08-12 增强: 检测到消失后**自动拉起**(open), 不再只告警——
+  #       08-11 23:45 do_restart 清理残留后被外部重载打断, open 未执行, WB 停机 5h11m 无人知。
+  if (( IN_RESTART == 0 && prev_wb_count > 0 && wb_count == 0 )); then
+    log "!! 检测到 WorkBuddy 进程树消失(疑似系统 OOM 强杀, 非本脚本重启): 上一轮 ${prev_wb_count} 进程 → 本轮 0 进程"
+    osascript -e "display notification \"WorkBuddy 进程消失, 正在自动拉起\" with title \"⚠️ WorkBuddy 异常退出\"" 2>/dev/null
+    card="$HOME/WorkBuddy/Claw/.workbuddy/scripts/push_card.py"
+    if [ -x "$card" ]; then
+      ("$card" --title "⚠️ WorkBuddy 被系统强杀" --level warn \
+        --section "检测结果" "WB进程树从 ${prev_wb_count} 个进程变为 0, 非 memwatch 主动重启" \
+        --section "当时环境" "整机可用=${SYS_MB}MB 压力等级=${LVL} WB树=${WB_MB}MB" \
+        --section "处置建议" "已自动尝试拉起 WorkBuddy" \
+        --chat-id "oc_9ee5303497f5e0e71666b610d6bdc346" >/dev/null 2>&1 &)
+    fi
+    # 自动拉起 (2026-08-12): 避免停机数小时
+    open "$HOME/Desktop/WorkBuddy.app" 2>/dev/null || open -a WorkBuddy 2>/dev/null
+    sleep 12
+    newpids=($(wb_main_pids))
+    if (( ${#newpids[@]} > 0 )); then
+      log "==> 自动拉起成功, 新主进程 PID: ${newpids[*]}"
+      sleep 15
+      verify_conversations
+    else
+      log "!! 自动拉起未检测到新主进程, 下一轮再试"
+    fi
+  fi
+  prev_wb_count=$wb_count
+
+  trigger=0; reason=""; NEED=$SUSTAIN
+  if (( WB_MB > RSS_RESTART_MB )); then
+    trigger=1; reason="WB树 ${WB_MB}MB > ${RSS_RESTART_MB}MB"
+  elif (( SYS_MB < SYS_CRIT_AVAILABLE_MB && WB_MB > RSS_FLOOR_MB )); then
+    trigger=1; reason="整机可用 ${SYS_MB}MB < ${SYS_CRIT_AVAILABLE_MB}MB 且 WB=${WB_MB}MB"
+    # 2026-08-11: 系统压力+B通道, WB 已较大 → 单次确认即重启, 抓"爆→缓→爆"震荡
+    (( WB_MB > WB_AGGRESSIVE_MB )) && NEED=1
+  elif (( LVL >= 4 && WB_MB > RSS_FLOOR_MB )); then
+    trigger=1; reason="压力等级 ${LVL}(critical) 且 WB=${WB_MB}MB"
+    # 2026-08-11: 系统压力+C通道(critical), WB 已较大 → 单次确认即重启
+    (( WB_MB > WB_AGGRESSIVE_MB )) && NEED=1
+  fi
+
+  if (( trigger )); then
+    ((streak++))
+    if (( NEED < SUSTAIN )); then
+      log "候选 ${streak}/${NEED}(动态): ${reason}"
+    else
+      log "候选 ${streak}/${NEED}: ${reason}"
+    fi
+    if (( streak >= NEED )); then
+      streak=0
+      IN_RESTART=1
+      do_restart "$reason"
+      IN_RESTART=0
+      # 2026-08-11: 重启流程后重同步基线, 避免重启失败时被误判为"系统强杀"
+      prev_wb_count=$(wb_procs | wc -l | tr -d ' ')
+    fi
+  else
+    (( streak > 0 )) && log "候选解除"
+    streak=0
+  fi
+
+  (( ONESHOT )) && break
+  sleep "$WATCH_INTERVAL"
+  trim_log
+done
+exit 0

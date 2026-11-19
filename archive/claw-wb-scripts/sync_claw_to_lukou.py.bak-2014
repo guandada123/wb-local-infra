@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""
+sync_claw_to_lukou.py — Claw 本地数据 → 资料库「路口理财工作台·北辰版」数据表同步
+
+数据流:
+  Claw data/user/portfolio.json       → 持仓表(账户=实盘) upsert + 设置表 cash
+  Claw data/simulation/portfolio.json → 持仓表(账户=模拟) upsert
+  汇率(腾讯 whHKDCNY/whUSDCNY)         → 设置表 fxHKD/fxUSD
+  Claw decision_log 月度文件 + 旧日志   → 决策记录表 只增不删
+
+管辖语义: 同步脚本写入/经手的持仓行,「备注」字段带 claw-sync 水印;
+删除仅针对 (账户匹配 ∧ 备注含 claw-sync ∧ 代码不在本轮源集合) 的行 — 用户手工行永不删。
+决策记录只 add, 永不 update/delete; 去重键存于备注 claw-sync:dec:<key>。
+
+用法:
+  python3 sync_claw_to_lukou.py --dry-run            # 只打印计划, 不写
+  python3 sync_claw_to_lukou.py                      # 生产同步(幂等)
+  python3 sync_claw_to_lukou.py --repair-decisions [--dry-run]   # 回填历史决策行字段
+"""
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import urllib.request
+from datetime import datetime, timezone
+
+# ---- 常量(单一真源) ----
+LIB = "/Users/guan/Desktop/WorkBuddy.app/Contents/Resources/app.asar.unpacked/resources/plugins/workbuddy-builtin/skills/library"
+CLAW = "/Users/guan/WorkBuddy/Claw/.workbuddy"
+HOLDINGS_DB = "dbS5oQegmThVCuni0U5nTi"
+SETTINGS_DB = "EmBISou7rNKk6bs3N2vi4b"
+DECISIONS_DB = "KpX4gx7aBqaP5a84zY07Lw"
+STATE_FILE = os.path.join(CLAW, ".workbuddy_sync_state.json")
+LOG_FILE = os.path.join(CLAW, "logs", "sync_claw_lukou.log")
+WATERMARK = "claw-sync"
+DRY_RUN = "--dry-run" in sys.argv
+REPAIR = "--repair-decisions" in sys.argv
+
+OP_MAP = {"BUY": "买入", "SELL": "卖出", "OBSERVATION": "关注", "REJECT": "关注", "REVIEW": "关注"}
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}"
+    print(line)
+    with open(LOG_FILE, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def run_lib(script, *args):
+    """串行调用资料库 skill 脚本, 返回 stdout 字符串(空输出按失败处理)。"""
+    r = subprocess.run([sys.executable, os.path.join(LIB, "database", script), *args],
+                       capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    if not out:
+        raise RuntimeError(f"{script} 空输出 (stderr: {(r.stderr or '').strip()[:200]})")
+    return out
+
+
+def jrun(script, *args):
+    return json.loads(run_lib(script, *args))
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+def norm_code(code):
+    """6 位代码 → 页面带市场前缀格式; 已带前缀原样返回。"""
+    s = str(code).strip()
+    if len(s) > 6 and s[:2].lower() in ("sh", "sz", "bj", "hk", "us"):
+        return s.lower()
+    if len(s) == 6 and s.isdigit():
+        if s[0] in "569":
+            return "sh" + s
+        if s[0] in "48":
+            return "bj" + s
+        return "sz" + s
+    return s
+
+
+# ---------- 类型层: schema 驱动的 PropertyValue ----------
+
+_FT = {}
+
+
+class SyncError(Exception):
+    pass
+
+
+def ftypes(dbid):
+    """{字段名: (type, [选项文本])}，来自后端真实 schema，缓存。"""
+    if dbid not in _FT:
+        s = jrun("get_database_schema.py", "--database-id", dbid)
+        _FT[dbid] = {
+            p["name"]: (p["type"], [o.get("text") for o in ((p.get("config") or {}).get("options") or [])])
+            for p in s["properties"]
+        }
+    return _FT[dbid]
+
+
+def to_date(v):
+    s = str(v).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s
+    dt = datetime.fromisoformat(s.replace(" ", "T"))
+    if dt.tzinfo:
+        dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pv(dbid, field, v):
+    """按字段真实类型生成 PropertyValue；类型不符/选项不存在 → 抛错（不再静默丢字段）。"""
+    types = ftypes(dbid)
+    if field not in types:
+        raise SyncError(f"字段 {field!r} 不在 {dbid} schema 中")
+    t, opts = types[field]
+    if t in ("select", "multi_select"):
+        s = "" if v is None else str(v)
+        if opts and s and s not in opts:
+            raise SyncError(f"{field}={s!r} 不在选项 {opts}")
+        return {t: s}
+    if t == "date":
+        return {"date": to_date(v)}
+    if t in ("number", "currency"):
+        return {t: v if isinstance(v, int) else float(v)}
+    if t == "checkbox":
+        return {"checkbox": bool(v)}
+    if t == "url":
+        return {"url": {"text": str(v)[:24], "link": str(v)}}
+    return {"text": "" if v is None else str(v)}
+
+
+def props(dbid, rec):
+    """唯一写入口: 先全量类型校验再出 payload；空 select/date 跳过。"""
+    out = {}
+    types = ftypes(dbid)
+    for f, v in rec.items():
+        t = types.get(f, ("text", []))[0]
+        if v is None:
+            continue
+        if isinstance(v, str) and v == "" and t in ("select", "multi_select", "date"):
+            continue
+        out[f] = pv(dbid, f, v)
+    return out
+
+
+# ---------- 内容级 readback ----------
+
+def _unwrap(property_value):
+    for k, v in property_value.items():
+        return v
+    return None
+
+
+def eq(field, got, want):
+    if got is None or got == "":
+        return False
+    if field in ("时间", "更新时间", "日期"):
+        return str(got)[:10] == str(want)[:10]
+    if field in ("数量", "成本价", "价格", "评分", "cash", "fxHKD", "fxUSD"):
+        try:
+            return abs(float(got) - float(want)) <= 1e-6
+        except (TypeError, ValueError):
+            return False
+    return str(got) == str(want)
+
+
+def verify(dbid, writes):
+    """writes: [{record_id, properties}] → 全表查询一次 + 逐条比对, 返回 bad 列表。"""
+    rows = load_table(dbid)
+    idx = {r.get("record_id"): r for r in rows}
+    bad = []
+    for w in writes:
+        rid = w["record_id"]
+        got = idx.get(rid)
+        if not got:
+            bad.append({"id": rid, "why": "not-found"})
+            continue
+        miss = {}
+        for f, pvalue in w["properties"].items():
+            want = _unwrap(pvalue)
+            if not eq(f, got.get(f), want):
+                miss[f] = {"want": want, "got": got.get(f)}
+        if miss:
+            bad.append({"id": rid, "why": "mismatch", "detail": miss})
+    return bad
+
+
+# ---------- 源读取 ----------
+
+def read_holdings_sources():
+    """返回 ({code: {代码,名称,数量,成本价,账户}}, 实盘现金)。"""
+    out = {}
+    cash = None
+    user_p = os.path.join(CLAW, "data", "user", "portfolio.json")
+    sim_p = os.path.join(CLAW, "data", "simulation", "portfolio.json")
+    if os.path.exists(user_p):
+        d = load_json(user_p)
+        for h in d.get("holdings", []):
+            out[norm_code(h["code"])] = {
+                "代码": norm_code(h["code"]), "名称": h.get("name", ""),
+                "数量": int(h.get("shares", 0)), "成本价": float(h.get("avg_cost", 0)),
+                "账户": "实盘",
+            }
+        cash = (d.get("summary") or {}).get("cash_available")
+    if os.path.exists(sim_p):
+        d = load_json(sim_p)
+        for code, p in (d.get("positions") or {}).items():
+            nc = norm_code(code)
+            out[nc] = {
+                "代码": nc, "名称": p.get("name", ""),
+                "数量": int(p.get("shares", 0)), "成本价": float(p.get("avg_cost", 0)),
+                "账户": "模拟",
+            }
+    return out, cash
+
+
+def read_decision_sources():
+    """合并月度 decision_log/*.json + 旧 decision_log.json, 按键去重。"""
+    merged = {}
+    paths = sorted(glob.glob(os.path.join(CLAW, "data", "simulation", "decision_log", "*.json"))) + \
+        [os.path.join(CLAW, "data", "simulation", "decision_log.json")]
+    for path in paths:
+        if not os.path.exists(path):
+            continue
+        try:
+            arr = load_json(path)
+        except Exception as e:
+            log(f"WARN 决策源解析失败 {os.path.basename(path)}: {e}")
+            continue
+        if not isinstance(arr, list):
+            continue
+        for d in arr:
+            if not isinstance(d, dict):
+                continue
+            key = d.get("decision_id") or f"{d.get('timestamp') or d.get('date')}|{d.get('code')}"
+            if not key or key in merged:
+                continue
+            merged[key] = d
+    return merged
+
+
+def decision_fields(d):
+    """源记录 → 目标表字段(时间/操作/来源/评分)。无效记录返 None。"""
+    op = OP_MAP.get(str(d.get("trade_type", "")).upper())
+    if not op:
+        return None
+    day = d.get("date") or str(d.get("timestamp") or "")[:10]
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(day or "")):
+        return None
+    try:
+        score = round(float(d.get("signal_score") or 0) * 100)  # 0–0.65 → 0–100 分制
+    except (TypeError, ValueError):
+        score = 0
+    return {"时间": day, "操作": op, "来源": "Claw", "评分": score}
+
+
+def fetch_fx():
+    rates = {}
+    for pair in ("whHKDCNY", "whUSDCNY"):
+        try:
+            raw = urllib.request.urlopen(f"https://qt.gtimg.cn/q={pair}", timeout=8).read()
+            rates[pair] = float(raw.decode("gbk", "ignore").split("~")[3])
+        except Exception as e:
+            log(f"WARN 汇率拉取失败 {pair}: {e}")
+            return None
+    return {"fxHKD": rates["whHKDCNY"], "fxUSD": rates["whUSDCNY"]}
+
+
+def load_table(dbid):
+    recs = jrun("query_database_record.py", "--database-id", dbid, "--page-size", "100")
+    rows, cursor = list(recs.get("results", [])), recs.get("next_cursor")
+    for _ in range(20):
+        if not recs.get("has_more") or not cursor:
+            break
+        recs = jrun("query_database_record.py", "--database-id", dbid, "--start-cursor", cursor, "--page-size", "100")
+        rows.extend(recs.get("results", []))
+        cursor = recs.get("next_cursor")
+    return rows
+
+
+def save_state(state):
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=1)
+
+
+def load_state():
+    return load_json(STATE_FILE) if os.path.exists(STATE_FILE) else {"deleted": []}
+
+
+# ---------- 模式: 回填历史决策 ----------
+
+DEC_KEY_RE = re.compile(WATERMARK + r":dec:(\S+)")
+
+
+def repair_decisions():
+    log(f"=== 决策回填开始 ({'DRY-RUN' if DRY_RUN else 'PROD'}) ===")
+    src = {}
+    for key, d in read_decision_sources().items():
+        f = decision_fields(d)
+        if f:
+            src[key] = f
+    rows = load_table(DECISIONS_DB)
+    todo, pending, matched = [], [], 0
+    for r in rows:
+        m = DEC_KEY_RE.search(str(r.get("备注") or ""))
+        if not m:
+            continue
+        matched += 1
+        key, rid = m.group(1), r.get("record_id")
+        want = src.get(key)
+        if not want:
+            pending.append({"key": key, "id": rid, "why": "source-missing"})
+            continue
+        if all(eq(f, r.get(f), v) for f, v in want.items()):
+            continue
+        todo.append({"record_id": rid, "properties": props(DECISIONS_DB, want)})
+    log(f"水印行 {matched} | 源可映射 {len(src)} | 待更新 {len(todo)} | 源缺失 {len(pending)}")
+    if DRY_RUN:
+        print(json.dumps({"mode": "repair-dry-run", "matched": matched, "todo": len(todo),
+                          "pending": pending[:5], "sample": todo[:2]}, ensure_ascii=False, indent=1))
+        return 0
+    if not todo:
+        log("=== 决策回填: 无需更新(幂等) ===")
+        return 0 if not pending else 2
+    written = []
+    for i in range(0, len(todo), 100):
+        chunk = todo[i:i + 100]
+        jrun("batch_update_database_records.py", "--database-id", DECISIONS_DB,
+             "--records", json.dumps(chunk, ensure_ascii=False))
+        written.extend(chunk)
+        log(f"UPDATE 决策 {len(written)}/{len(todo)}")
+    bad = verify(DECISIONS_DB, written)
+    state = load_state()
+    state["pending_decisions"] = pending + [{"id": b["id"], "why": b["why"]} for b in bad]
+    state["last_repair"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_state(state)
+    log(f"=== 决策回填结束 {'OK' if not bad else 'WITH_ERRORS'} (写 {len(written)} / 校验失败 {len(bad)}) ===")
+    if bad:
+        print(json.dumps({"mode": "repair-verify", "failed": bad[:5]}, ensure_ascii=False, indent=1))
+    return 0 if not bad else 2
+
+
+# ---------- 模式: 常规同步 ----------
+
+def main():
+    if REPAIR:
+        return repair_decisions()
+    started = time.time()
+    mode = "DRY-RUN" if DRY_RUN else "PROD"
+    log(f"=== 同步开始 ({mode}) ===")
+    plan = {"holdings_add": [], "holdings_update": [], "holdings_delete": [],
+            "settings_update": False, "decisions_add": 0}
+
+    src, live_cash = read_holdings_sources()
+    log(f"源持仓: {len(src)} 条 (实盘 {sum(1 for v in src.values() if v['账户']=='实盘')} / 模拟 {sum(1 for v in src.values() if v['账户']=='模拟')})")
+
+    rows = load_table(HOLDINGS_DB)
+    cur = {}
+    for r in rows:
+        code = r.get("代码") or ""
+        if code:
+            cur[(code, r.get("账户") or "")] = r
+    log(f"持仓表现状: {len(cur)} 条")
+
+    src_keys = {(v["代码"], v["账户"]) for v in src.values()}
+    for key, v in src.items():
+        c = cur.get((v["代码"], v["账户"]))
+        if c is None:
+            rec = dict(v)
+            rec["备注"] = WATERMARK
+            plan["holdings_add"].append(rec)
+        else:
+            changed = {}
+            for f in ("名称", "数量", "成本价"):
+                old, new = c.get(f), v[f]
+                if isinstance(new, float):
+                    old = round(float(old), 6) if old is not None else None
+                    new = round(new, 6)
+                if old != new:
+                    changed[f] = v[f]
+            if changed:
+                changed["_record_id"] = c.get("record_id")
+                plan["holdings_update"].append(changed)
+
+    state = load_state()
+    deleted_before = set(tuple(x) if isinstance(x, list) else x for x in state.get("deleted", []))
+    for key, r in cur.items():
+        memo = str(r.get("备注") or "")
+        if key[1] in ("实盘", "模拟") and WATERMARK in memo and key not in src_keys and key not in deleted_before:
+            plan["holdings_delete"].append({"record_id": r.get("record_id"), "key": f"{key[0]}|{key[1]}"})
+
+    fx = fetch_fx()
+    fx_src = "tencent" if fx else "keep-current"
+    if fx is None:
+        log("WARN 汇率不可用, 保留设置表现值")
+    srows = load_table(SETTINGS_DB)
+    srow = next((r for r in srows if r.get("row_key") == "main"), srows[0] if srows else None)
+    settings_patch = {}
+    if srow is not None:
+        if live_cash is not None and abs(float(srow.get("cash") or 0) - float(live_cash)) > 0.005:
+            settings_patch["cash"] = round(float(live_cash), 2)
+        if fx:
+            for f in ("fxHKD", "fxUSD"):
+                if abs(float(srow.get(f) or 0) - fx[f]) > 1e-6:
+                    settings_patch[f] = fx[f]
+        if settings_patch:
+            settings_patch["更新时间"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+            plan["settings_update"] = True
+    log(f"汇率: {fx} | 现金: {live_cash} | 设置表变更字段: {list(settings_patch)}")
+
+    dsrc = read_decision_sources()
+    drows = load_table(DECISIONS_DB)
+    existing = {str(r.get("备注") or "") for r in drows}
+    dadd = []
+    for key, d in dsrc.items():
+        memo_key = f"{WATERMARK}:dec:{key}"
+        if any(memo_key in m for m in existing):
+            continue
+        f = decision_fields(d)
+        if not f:
+            continue
+        rec = {
+            "时间": f["时间"], "代码": norm_code(d.get("code") or ""), "名称": d.get("name") or "",
+            "操作": f["操作"], "数量": int(d.get("shares") or 0), "价格": float(d.get("price") or 0),
+            "评分": f["评分"], "来源": f["来源"], "结果": d.get("status") or "",
+            "备注": f"{memo_key} {d.get('reason') or d.get('review_note') or ''}".strip(),
+        }
+        dadd.append(rec)
+    plan["decisions_add"] = dadd
+    log(f"决策源: {len(dsrc)} 条, 待写入: {len(dadd)} 条")
+
+    if DRY_RUN:
+        print(json.dumps({
+            "mode": "dry-run", "fx": fx, "cash": live_cash,
+            "holdings_add": plan["holdings_add"], "holdings_update": plan["holdings_update"],
+            "holdings_delete": plan["holdings_delete"], "settings_patch": settings_patch,
+            "decisions_add_count": len(dadd), "decisions_sample": dadd[:2],
+        }, ensure_ascii=False, indent=1))
+        log(f"=== DRY-RUN 结束 (无写入), 耗时 {time.time()-started:.1f}s ===")
+        return 0
+
+    # 同步前快照（写库前保险；失败则中止，可用 --allow-no-backup 跳过）
+    if any([plan["holdings_add"], plan["holdings_update"], plan["holdings_delete"], plan["settings_update"], dadd]):
+        if "--allow-no-backup" in sys.argv:
+            log("WARN 跳过同步前快照 (--allow-no-backup)")
+        else:
+            rc = subprocess.run([sys.executable, os.path.join(CLAW, "scripts", "lukou_backup.py"),
+                                 "--tables", f"{HOLDINGS_DB},{SETTINGS_DB},{DECISIONS_DB}",
+                                 "--tag", "presync"], capture_output=True, text=True)
+            if rc.returncode != 0:
+                log(f"ERROR 同步前快照失败 rc={rc.returncode}, 中止写库: {(rc.stdout or rc.stderr or '')[:200]}")
+                return 3
+            log("同步前快照完成 (presync)")
+
+    writes = []  # 统一收集用于内容级 verify
+    for rec in plan["holdings_add"]:
+        p = props(HOLDINGS_DB, rec)
+        r = jrun("batch_add_database_records.py", "--database-id", HOLDINGS_DB,
+                 "--records", json.dumps([p], ensure_ascii=False))
+        rid = (r.get("results") or [{}])[0].get("id")
+        writes.append({"record_id": rid, "properties": p})
+        log(f"ADD 持仓 {rec['代码']}({rec['账户']}) → {rid}")
+    for rec in plan["holdings_update"]:
+        rid = rec.pop("_record_id")
+        p = props(HOLDINGS_DB, rec)
+        jrun("batch_update_database_records.py", "--database-id", HOLDINGS_DB,
+             "--records", json.dumps([{"record_id": rid, "properties": p}], ensure_ascii=False))
+        writes.append({"record_id": rid, "properties": p})
+        log(f"UPDATE 持仓 {rid} {list(rec)}")
+    for item in plan["holdings_delete"]:
+        jrun("batch_delete_database_records.py", "--database-id", HOLDINGS_DB,
+             "--record-ids", json.dumps([item["record_id"]]))
+        state.setdefault("deleted", []).append(item["key"].split("|", 1))
+        log(f"DELETE 持仓 {item['key']} (水印行, 不在源集合)")
+    set_writes = []
+    if plan["settings_update"] and srow.get("record_id"):
+        p = props(SETTINGS_DB, settings_patch)
+        jrun("batch_update_database_records.py", "--database-id", SETTINGS_DB,
+             "--records", json.dumps([{"record_id": srow.get("record_id"), "properties": p}], ensure_ascii=False))
+        # 更新时间只校验非空, 其余逐值比对
+        chk = {k: v for k, v in p.items() if k != "更新时间"}
+        set_writes.append({"record_id": srow.get("record_id"), "properties": chk})
+        log(f"UPDATE 设置 {list(settings_patch)}")
+    dec_writes = []
+    if dadd:
+        for i in range(0, len(dadd), 100):  # batch_add 单次上限 100
+            chunk = dadd[i:i + 100]
+            payload = [props(DECISIONS_DB, rec) for rec in chunk]
+            r = jrun("batch_add_database_records.py", "--database-id", DECISIONS_DB,
+                     "--records", json.dumps(payload, ensure_ascii=False))
+            for item, p in zip(r.get("results", []), payload):
+                if item.get("success") and item.get("id"):
+                    dec_writes.append({"record_id": item["id"], "properties": p})
+        log(f"ADD 决策 {len(dec_writes)}/{len(dadd)}")
+
+    bad = verify(HOLDINGS_DB, writes) + verify(SETTINGS_DB, set_writes) + verify(DECISIONS_DB, dec_writes)
+    state["last_run"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    state["deleted"] = sorted([list(x) if isinstance(x, (list, tuple)) else x for x in state.get("deleted", [])])
+    save_state(state)
+    ok = not bad
+    log(f"=== 同步结束 {'OK' if ok else 'WITH_ERRORS'} (add={len(plan['holdings_add'])} upd={len(plan['holdings_update'])} "
+        f"del={len(plan['holdings_delete'])} dec={len(dec_writes)} fx={fx_src} 校验失败={len(bad)}), "
+        f"耗时 {time.time()-started:.1f}s ===")
+    if bad:
+        print(json.dumps({"mode": "verify", "failed": bad[:5]}, ensure_ascii=False, indent=1))
+    return 0 if ok else 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

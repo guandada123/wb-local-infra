@@ -1,0 +1,78 @@
+#!/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3
+"""飞书事件桥接：把 lark-cli 落下的事件文件转成中台白名单回复。
+
+链路: 群里结构化 @ → com.user.feishu-event-consumer 落文件 → 本脚本（每 20s）→ 中台应用回群。
+幂等: 处理完的事件文件移到 processed/ 留审计，绝不重复回复。
+边界: 只认 5 条白名单；未命中且来自真人的消息回一句固定指引，不交给模型自由发挥。
+"""
+import importlib.util
+import json
+import shutil
+from pathlib import Path
+
+HOME = Path.home()
+EVENT_DIR = HOME / "files" / "feishu-events"
+PROCESSED = EVENT_DIR / "processed"
+LOG = HOME / ".agent-autoloop" / "logs" / "feishu-event-bridge.log"
+HUB_PATH = HOME / ".local" / "bin" / "autoloop-feishu-hub.py"
+
+spec = importlib.util.spec_from_file_location("hub", HUB_PATH)
+hub = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(hub)
+
+GUIDE = ("[中台] 已收到 @，但我只认这几条指令：群总结 / 周报 / 月报 / 季报 / 协同 / "
+         "状态 / 巡检 / 日报 / 待办 / 重推日报。"
+         "其他事项会由自动推进队列按 RUNBOOK 处理，不在此处即时回复。")
+
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        from datetime import datetime
+        f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    print(msg)
+
+
+def strip_mentions(text, event):
+    """去掉 content 里的 @名字 前缀，只留指令正文。"""
+    for m in event.get("mentions") or []:
+        name = m.get("name") or ""
+        if name:
+            text = text.replace("@" + name, " ")
+    return text.strip()
+
+
+def main():
+    PROCESSED.mkdir(parents=True, exist_ok=True)
+    files = sorted(EVENT_DIR.glob("*.json"))
+    if not files:
+        return
+    conf = hub.load_conf()
+    tk = hub.token(conf)
+    for f in files:
+        try:
+            ev = json.loads(f.read_text())
+            mid = ev.get("message_id") or f.stem
+            sender = ev.get("sender_type")
+            # 群里存在大量其他自动化的长卡片（日报/选股/风控），其正文常含指令词。
+            # 只有真人消息才可能是指令；bot 推送一律跳过，避免误派活。
+            if sender != "user":
+                log(f"[SKIP] 非真人消息(sender={sender}) | mid={mid[:18]}")
+                shutil.move(str(f), str(PROCESSED / f.name))
+                continue
+            text = strip_mentions(str(ev.get("content") or ""), ev)
+            name, reply = hub.handle(text, conf, tk)
+            if name and reply:
+                hub.send(conf, tk, reply)
+                log(f"[CMD] {name} <- {text[:40]} | mid={mid[:18]}")
+            else:
+                hub.send(conf, tk, GUIDE)
+                log(f"[GUIDE] 未命中白名单 | mid={mid[:18]} | {text[:40]}")
+        except Exception as e:
+            log(f"[ERR] {f.name}: {e}")
+            continue  # 处理失败不移动，下轮重试
+        shutil.move(str(f), str(PROCESSED / f.name))
+
+
+if __name__ == "__main__":
+    main()

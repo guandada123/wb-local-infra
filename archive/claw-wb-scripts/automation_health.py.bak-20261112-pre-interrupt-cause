@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+"""
+自动化健康检查脚本
+扫描所有自动化任务，检查运行状态、产出时间、异常情况
+输出: JSON 摘要 + 可选飞书告警
+
+用法:
+    python3 automation_health.py           # 终端输出 + 写 JSON
+    python3 automation_health.py --json    # JSON only
+    python3 automation_health.py --alert   # 异常时飞书告警
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import sys
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+DB_PATH = Path.home() / ".workbuddy" / "workbuddy.db"
+DATA_DIR = Path(__file__).parent.parent / "data"
+FEISHU_WEBHOOK = os.getenv("FEISHU_WEBHOOK", "")
+
+
+def get_automations() -> list:
+    """从 SQLite 读取所有活跃自动化"""
+    if not DB_PATH.exists():
+        print(f"DB not found: {DB_PATH}", file=sys.stderr)
+        return []
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    cur = conn.cursor()
+
+    # 获取所有自动化
+    cur.execute("""
+        SELECT a.id, a.name, a.status, a.schedule_type, a.rrule,
+               a.last_run_at, a.next_run_at, a.model_id, a.model_is_thinking
+        FROM automations a
+        WHERE a.deleted_at IS NULL
+        ORDER BY a.name
+    """)
+    automations = [dict(r) for r in cur.fetchall()]
+
+    for auto in automations:
+        # 最近运行记录
+        # 2026-09-02：补取 result_success / metadata_json。
+        # 判「运行被中断」必须靠 metadata 里的 interrupted / resultState ——
+        # 平台把被中断的 run 仍记为 status=ACCEPTED，只看 status 永远抓不到。
+        cur.execute(
+            """
+            SELECT thread_id, status, created_at, result_success, failure_code, metadata_json
+            FROM automation_runs
+            WHERE automation_id = ?
+            ORDER BY created_at DESC LIMIT 5
+        """,
+            (auto["id"],),
+        )
+        auto["recent_runs"] = [dict(r) for r in cur.fetchall()]
+
+        # 运行时状态
+        cur.execute(
+            """
+            SELECT last_error, running, running_started_at
+            FROM automation_runtime_state
+            WHERE automation_id = ?
+        """,
+            (auto["id"],),
+        )
+        state = cur.fetchone()
+        if state:
+            auto["last_error"] = state["last_error"]
+            auto["running"] = bool(state["running"])
+
+    conn.close()
+    return automations
+
+
+def categorize(automations: list) -> dict:
+    """按业务分类"""
+    cats = {
+        "投顾操盘": [],
+        "炒股助理": [],
+        "美股监控": [],
+        "系统维护": [],
+        "桥接监控": [],
+        "其他": [],
+    }
+
+    for a in automations:
+        name = a.get("name", "")
+        if any(k in name for k in ["投顾", "模拟", "选股"]):
+            cats["投顾操盘"].append(a)
+        elif any(
+            k in name for k in ["助理", "盘前", "收盘", "持仓", "财报", "早报", "公众号", "投资"]
+        ):
+            cats["炒股助理"].append(a)
+        elif "美股" in name:
+            cats["美股监控"].append(a)
+        elif any(k in name for k in ["健康", "清理", "索引", "审计", "记忆"]):
+            cats["系统维护"].append(a)
+        elif any(k in name.lower() for k in ["marvis", "bridge", "桥接"]):
+            cats["桥接监控"].append(a)
+        else:
+            cats["其他"].append(a)
+
+    return cats
+
+
+def _parse_unix(ts) -> datetime | None:
+    """解析 Unix 时间戳（毫秒）"""
+    if not ts:
+        return None
+    try:
+        return datetime.fromtimestamp(int(ts) / 1000)
+    except Exception:  # noqa: BLE001  # 兜底异常，安全忽略（不影响主流程）
+        return None
+
+
+CONV_LOG_ROOT = Path.home() / ".workbuddy" / "logs"
+_QUEUE_RE = re.compile(r'"queuePosition":\s*(\d+)')
+# 会话 ID 白名单（2026-10-29）：conv_id 直接进 glob 模式，若来源不可信（未来换了上游/人工
+# 改库）含 `*` 或 `/` 就会越界匹配别人的日志。UUID 形态收紧，不匹配则拒绝取证。
+_CONV_ID_RE = re.compile(r"^[0-9a-fA-F-]{8,64}$")
+# 单文件最多回溯的字节数（2026-10-29）：实测当日会话日志单份最大 3MB、全天 36MB，
+# 批量中断半径 10 条时会放大到几十 MB 的读盘。判据靠的排队/释放痕迹集中在尾部，
+# 只回溯尾部足够 —— 有界读把最坏情况锁死在 512KB × N。
+_LOG_TAIL_BYTES = 512 * 1024
+
+
+def _tail_from_stream(fh, limit: int = _LOG_TAIL_BYTES) -> bytes:
+    """流式读取，只留最后 limit 字节（内存上界 = 2×limit）。"""
+    buf = b""
+    while True:
+        chunk = fh.read(65536)
+        if not chunk:
+            return buf
+        buf = (buf + chunk)[-limit:]
+
+
+def _iter_conv_log_text(conv_id: str, sdk_dir: Path):
+    """按会话 ID 迭代日志文本，每份只取**尾部** 512KB。
+
+    两条数据源，缺一不可（2026-10-29 补第二条）：
+      · 当日活目录 `sdk/conversations/<id>*.log` —— 当天巡检走这条；
+      · 日切后平台把该目录整体压成 `sdk/conversations.zip`（实测 2026-10-29 00:01，
+        10-28 的 222 份日志全部进包、**原目录消失**）—— 次日早上巡检只能走这条。
+    只认活目录会让「昨天的中断」在次日永远查不到根因，而中断恰恰是隔夜才被巡检读到的：
+    本轮实测两条 🔴 就是 10-28 15:20/15:50 的中断，10-29 早上取证全部为空。
+    """
+    live = sdk_dir / "conversations"
+    try:
+        files = sorted(live.glob(f"{conv_id}*.log")) if live.is_dir() else []
+    except Exception:  # noqa: BLE001
+        files = []
+    for f in files:
+        try:
+            size = f.stat().st_size
+            with f.open("rb") as fh:
+                if size > _LOG_TAIL_BYTES:
+                    fh.seek(size - _LOG_TAIL_BYTES)
+                    raw = fh.read()
+                    # 有界读会切在行中间 → 丢掉第一条半行（半行不构成判据，宁可丢）
+                    raw = raw.split(b"\n", 1)[-1]
+                else:
+                    raw = fh.read()
+            yield raw.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            continue
+
+    zpath = sdk_dir / "conversations.zip"
+    if not zpath.is_file():
+        return
+    try:
+        import zipfile
+
+        with zipfile.ZipFile(zpath) as z:
+            for name in z.namelist():
+                if not (name.startswith(conv_id) and name.endswith(".log")):
+                    continue
+                try:
+                    with z.open(name) as fh:
+                        raw = _tail_from_stream(fh)
+                    yield raw.decode("utf-8", "replace")
+                except Exception:  # noqa: BLE001 —— 单个成员坏掉不阻断其它
+                    continue
+    except Exception:  # noqa: BLE001 —— 压缩包损坏/占用退化为「取不到证据」
+        return
+
+
+def _interrupt_cause(conv_id: str, created_ms) -> str:
+    """从中断 run 的**会话日志**里取根因证据（2026-10-28 新增）。
+
+    为什么必须补这一步：10-27/10-28 连续两天各有 3 条自动化被判
+    「运行被中断(partial_delivered，产物未落盘)」，三条时间点互不相邻
+    （03:30 / 15:20 / 15:50），平台侧给出的信息只有「产物未落盘」——
+    只报症状不报病因，用户无法处置，只能猜。实读会话日志后根因高度一致：
+
+        capacity-queue:state {"status":"waiting","queuePosition":1247 → 757}
+        ...（连续 90 分钟只有排队心跳，无任何 token 产出）
+        lifecycle:dispose  ← 会话在排队期间被释放 → 请求成孤儿
+        → 90 分钟平台硬超时：`[CANCELLED] Automation prompt interrupted: timeout`
+
+    即**上游模型容量排队**，不是任务代码出错。这两种病因的药方完全相反
+    （错峰/重试 vs 改代码），混为一谈会把用户送到错误方向。
+
+    取不到（无日志目录 / 无该会话 / 无关键字）一律返回 ""，
+    **绝不臆造结论** —— 无证据时宁可不解释。
+    """
+    if not conv_id or not _CONV_ID_RE.match(conv_id):
+        return ""
+    day = _parse_unix(created_ms)
+    if not day:
+        return ""
+    base = CONV_LOG_ROOT / day.strftime("%Y-%m-%d") / "sdk"
+    waits = 0
+    first_pos = last_pos = None
+    channel_dropped = False
+    disposed = False
+    for text in _iter_conv_log_text(conv_id, base):
+        for line in text.splitlines():
+            if "capacity-queue:state" in line and '"status":"waiting"' in line:
+                waits += 1
+                m = _QUEUE_RE.search(line)
+                if m:
+                    if first_pos is None:
+                        first_pos = int(m.group(1))
+                    last_pos = int(m.group(1))
+            if "CHANNEL_DISCONNECTED" in line:
+                channel_dropped = True
+            if "lifecycle:dispose" in line:
+                disposed = True
+    parts = []
+    if waits:
+        span = f"队列位置 {first_pos}→{last_pos}" if first_pos is not None else "队列等待"
+        parts.append(f"上游容量排队（{span}，{waits} 次排队心跳，始终未获槽位）")
+    if channel_dropped:
+        parts.append("会话通道断开(CHANNEL_DISCONNECTED)")
+    if disposed:
+        parts.append("排队中被 lifecycle:dispose 释放→请求成孤儿，只能等 90min 硬超时")
+    return "；".join(parts)
+
+
+def _interrupt_issue(result_state: str, meta: dict, run: dict) -> str:
+    """组装「运行被中断」的 issue 文案（2026-10-29 抽出，供测试直接调用）。
+
+    为什么单独抽成函数：中断告警的价值全在「根因证据」这一段，而它依赖本机会话日志，
+    此前只能靠真跑一次巡检才能验证 → 没人测。抽出来后可用 tmp 日志单测「有证据/无证据」。
+    """
+    msg = f"最近运行被中断({result_state or 'interrupted'}，产物未落盘)"
+    cause = _interrupt_cause(str(meta.get("conversationId") or ""), run.get("created_at"))
+    if cause:
+        msg += f"｜根因证据: {cause}"
+    return msg
+
+
+def _extract_byday(rrule: str) -> set:
+    """从 RRULE 中提取 BYDAY 工作日集合，如 'MO,TU,WE' -> {'MO','TU','WE'}"""
+    if not rrule:
+        return set()
+    m = re.search(r"BYDAY=([^;]+)", rrule)
+    if not m:
+        return set()
+    return {d.strip().upper() for d in m.group(1).split(",") if d.strip()}
+
+
+def _result_failure_issue(run: dict) -> str:
+    """result_success=0 时的 issue 文案：把 failure_code 翻译成可判读的根因。
+
+    2026-10-20 新增：automation-rate-limited 连续两天吞噬真实任务后，告警里只有
+    「result_success=0 / Automation prompt stopped before completion」两种含混表述，
+    根因（平台限流，非任务代码问题）要人去翻库才知道 —— D1/D2/D3 错峰观察期
+    需要机器可读的根因出口，否则「归零了没有」只能人工查库。
+    """
+    fc = str(run.get("failure_code") or "").strip()
+    if fc == "automation-rate-limited":
+        return "最近运行未成功(平台限流 rate-limited，非任务代码问题；错峰观察期盯此标记)"
+    if fc:
+        # 截断 64：failure_code 是平台写入的字段，长度不受本仓库控制；原样拼进飞书
+        # 卡片一旦拿到超长值就会把排版撑坏，而判读只需要前 64 字符（2026-10-21 C2）。
+        # 注意只截**展示**，上面与 automation-rate-limited 的等值判断仍用完整值。
+        return f"最近运行未成功(result_success=0, failure_code={fc[:64]})"
+    return "最近运行未成功(result_success=0)"
+
+
+PAUSED_ACK_PATH = Path(__file__).parent.parent / "inspection_hub" / "paused_guard_ack.json"
+_paused_ack_cache: dict | None = None
+
+
+def _paused_acks() -> dict:
+    """已登记的「有意暂停」自动化（paused_guard_ack.json）。
+
+    为什么需要（2026-10-24）：全仓 3 个 PAUSED 全部是**有意**暂停
+    —— 其中 2 个的职责已迁到 launchd（wb-liveness / wb-failures，纯 shell 零 LLM 成本），
+    1 个被更强的同名项完全覆盖。但健康报告只看自动化表，不知道迁移这回事，
+    于是每天都报 1 条「已暂停 + 109h 未运行」的**假警报**。
+    假警报的代价不是噪音，而是让"黄"变成背景色 —— 真出问题时没人再看。
+
+    口径：ack 文件 `_doc` 明写「登记了且 reason 非空 → 视为已确认暂停」。
+    未登记的 PAUSED 仍然报黄（未知暂停必须有人看一眼）。
+    """
+    global _paused_ack_cache
+    if _paused_ack_cache is None:
+        try:
+            raw = json.loads(PAUSED_ACK_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw = {}
+        _paused_ack_cache = {
+            k: v for k, v in raw.items() if not k.startswith("_") and isinstance(v, dict)
+        }
+    return _paused_ack_cache
+
+
+def check_health(auto: dict) -> dict:
+    """检查单个自动化健康状态"""
+    name = auto.get("name", "Unknown")
+    status = auto.get("status", "UNKNOWN")
+    runs = auto.get("recent_runs", [])
+    last_error = auto.get("last_error", "")
+    running = auto.get("running", False)
+
+    # 最近运行时间取「平台回写的 last_run_at」与「automation_runs 表最新派发记录」的较大值。
+    # 实测 2026-08-31：59 个 ACTIVE 自动化中 52 个的 last_run_at 滞后（滞后量恰为各自调度
+    # 周期的整数倍），且这些自动化最近一次运行的状态均为 ACCEPTED —— 平台只在 run 走到
+    # PENDING_REVIEW 等终态时才回写 last_run_at，托管自动执行（ACCEPTED）不回写，于是该字段
+    # 集体冻结在若干周期前。automation_runs 每次派发都会落记录，是权威运行时间，故以它为准。
+    # 若只用 last_run_at，静默失败判定的 gap 基线整体偏大，会把正常运行的任务误报为 🔴。
+    def _to_ms(v) -> int:
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    platform_last_ts = _to_ms(auto.get("last_run_at"))
+    newest_run_ts = _to_ms(runs[0].get("created_at")) if runs else 0
+    field_lag_h = (
+        (newest_run_ts - platform_last_ts) / 3600000 if newest_run_ts and platform_last_ts else 0.0
+    )
+    last_run_ts = max(platform_last_ts, newest_run_ts)
+
+    health = "🟢"
+    issues = []
+
+    # 状态检查
+    acked_paused = False
+    if status == "PAUSED":
+        ack = _paused_acks().get(str(auto.get("id") or ""))
+        if ack and str(ack.get("reason") or "").strip():
+            acked_paused = True
+            issues.append(f"已登记暂停：{str(ack.get('reason'))[:40]}…")
+        else:
+            health = "🟡"
+            issues.append("已暂停（未登记，需确认是否有意）")
+    elif status != "ACTIVE":
+        health = "🔴"
+        issues.append(f"状态异常: {status}")
+
+    # 运行记录检查
+    last_run_interrupted = False
+    if runs:
+        last_status = runs[0].get("status", "")
+        if last_status == "failed":
+            health = "🔴"
+            issues.append("最后一次运行失败")
+        elif last_status == "timeout":
+            health = "🟡"
+            issues.append("超时")
+
+        # ── 运行被中断检测（2026-09-02 新增，原为漏检盲区）──
+        # 背景：平台把「跑到一半被宿主中断」的 run 记为 status=ACCEPTED 而非 failed，
+        #   于是上面的 last_status 分支抓不到，只能落到下方模糊的「历史错误」，
+        #   与早已修复的历史残留同级，真故障被噪音淹没。
+        # 实证（2026-09-01/02）：5 个自动化最近一次 run 的 metadata 为
+        #   interrupted=True / resultState=partial_delivered / resultEvidence=none，
+        #   且共享同一 conversationId、finishedAt 时间戳完全相同 —— 宿主级批量中断，
+        #   任务白跑、产物未落盘。这是**真故障**，须按 🔴 显式报出。
+        # 判据取 metadata 而非 status：status 是平台终态口径，对此类中断不敏感。
+        md = runs[0].get("metadata_json") or ""
+        interrupted = False
+        result_state = ""
+        meta: dict = {}
+        try:
+            m = json.loads(md) if isinstance(md, (str, bytes)) else (md or {})
+            if isinstance(m, dict):
+                meta = m
+                interrupted = str(m.get("interrupted", "")).lower() == "true"
+                result_state = str(m.get("resultState", "") or "")
+        except Exception:  # noqa: BLE001
+            pass
+        if interrupted or result_state == "partial_delivered":
+            last_run_interrupted = True
+            health = "🔴"
+            issues.append(_interrupt_issue(result_state, meta, runs[0]))
+        elif runs[0].get("result_success") in (0, "0", False):
+            # 非中断但平台标记未成功
+            health = "🔴" if health == "🟢" else health
+            issues.append(_result_failure_issue(runs[0]))
+
+    # last_run_at 字段滞后：真实运行时间已用 runs 表校正，该字段不参与健康判定。
+    # 2026-09-02 初版曾「仅当滞后 > 7 天才提示」，但实测 last_run_at 在平台侧对所有
+    #   ACCEPTED 托管运行集体冻结（~24 天前），552–576h 滞后成为常态而非异常，
+    #   导致 60+ 个**正常运行**的自动化被塞入「滞后552h」噪音，与真故障同级展示、掩盖信号。
+    # 2026-09-21 修复：该滞后属平台字段同步特性（非任务故障），彻底移出 issues；
+    #   健康判定完全交给 runs 表校正后的真实运行时间，field_lag_h 仅留 JSON 供排查。
+
+    # 静默失败检测（根据调度频率调整阈值）
+    last_run = _parse_unix(last_run_ts)
+    if last_run:
+        hours_ago = (datetime.now() - last_run).total_seconds() / 3600
+        schedule = auto.get("schedule_type", "recurring")
+        rrule = auto.get("rrule", "") or ""
+
+        # 根据调度频率设定不同阈值（防月/周度任务误报 stale）
+        if "MONTHLY" in rrule or "每月" in name:
+            threshold = 744  # 31天（最大月窗口+1天缓冲）
+        elif "WEEKLY" in rrule or "每周" in name:
+            threshold = 192  # 8天（1周+1天缓冲）
+        elif "YEARLY" in rrule or "每年" in name:
+            threshold = 8760  # 365天（年度任务）
+        elif schedule == "once":
+            threshold = 99999  # 一次性任务不报
+        else:
+            threshold = 48  # 默认48h
+
+        # BYDAY 仅工作日(MO-FR)时，周末天然不调度，最长间隔含整个周末(~49h)
+        # 若不放大阈值会把周末间隔误判为 critical（如 FREQ=HOURLY;BYDAY=MO-FR）
+        byday = _extract_byday(rrule)
+        WEEKDAYS = {"MO", "TU", "WE", "TH", "FR"}
+        if byday and byday.issubset(WEEKDAYS):
+            threshold = max(threshold, 72)  # 放宽到 72h 覆盖周五→周一
+
+        # 若平台已算出未来的 next_run_at，说明调度正常（尊重 BYDAY/节假日），非静默失败
+        # 这是最权威的判定：跨周末/节假日间隔不误报；仅当 next_run_at 缺失/过期才走 gap 回退
+        next_run = _parse_unix(auto.get("next_run_at", 0))
+        if next_run and next_run > datetime.now():
+            stale = False  # 已正确排期，跳过静默失败判定
+        else:
+            stale = hours_ago > threshold or hours_ago > threshold * 0.6
+
+        # 2026-10-24：已登记的有意暂停，「N 小时未运行」是**预期状态**而非故障。
+        # 不跳过这一步的话，刚判定为"已登记暂停"的项会在同一次评估里被升级成 🔴
+        # （实测：💓 中枢存活看门狗 ack 后仍报「109h未运行」并变红）。
+        if stale and acked_paused:
+            issues.append(f"已暂停 {int(hours_ago)}h（预期，不计入异常）")
+        elif stale:
+            if hours_ago > threshold:
+                health = "🔴" if health == "🟢" else health
+            else:
+                health = "🟡" if health == "🟢" else health
+            issues.append(f"{int(hours_ago)}h未运行")
+
+    # 运行中
+    if running:
+        health = "🔵" if health == "🟢" else health
+        issues.append("运行中")
+
+    # 错误信息
+    # 2026-09-02：若最近一次运行已判定为「中断」，runtime.last_error 与之同源
+    # （内容就是该次中断信息），不再重复计一条「历史错误」，避免同一根因双计刷屏。
+    if last_error:
+        if last_run_interrupted and "interrupt" in last_error.lower():
+            pass  # 同源，已由「最近运行被中断」覆盖
+        else:
+            health = "🟡" if health == "🟢" else health
+            issues.append(f"历史错误: {last_error[:40]}")
+
+    # 计算24h运行次数
+    run_24h = 0
+    for r in runs:
+        rt = _parse_unix(r.get("created_at"))
+        if rt and (datetime.now() - rt).total_seconds() < 86400:
+            run_24h += 1
+
+    return {
+        "name": name,
+        "status": status,
+        "health": health,
+        "last_run": last_run.isoformat() if last_run else None,
+        "issues": issues,
+        "run_count_24h": run_24h,
+        "running": running,
+        # 诊断字段（2026-09-02）：滞后量移出告警文案但仍留痕，供排查字段同步问题
+        "field_lag_h": round(field_lag_h, 1),
+        "last_run_interrupted": last_run_interrupted,
+        "acked_paused": acked_paused,
+    }
+
+
+# ── 调度停摆检测（2026-11-06 新增，原为静默失效盲区）──────────────────────
+# 背景：平台把错过时点的任务以 runKind=missed 补跑，并在 missedScheduledAt
+#   记原定时刻；result_success 仍为 1 / resultState=delivered。只看成功位时，
+#   「停摆 20h15m 后 61 项集中补跑」会被报成 63/63 全绿，一条告警都没有。
+# 设计：停摆是**全局信号**，只在 summary 层聚合，不改任何单项 health 分级 ——
+#   逐项标黄/红会把 61 条塞进飞书卡片，制造告警风暴反而淹没真信号。
+MISSED_OUTAGE_MIN_COUNT = 10
+MISSED_OUTAGE_MIN_LATE_MIN = 30
+MISSED_LOOKBACK_HOURS = 24
+_INTRADAY_START_MIN = 8 * 60 + 30  # 08:30
+_INTRADAY_END_MIN = 15 * 60 + 30  # 15:30
+
+
+def _missed_run_info(run: dict) -> dict | None:
+    """解析一条 run 的补跑信息；非补跑 / 字段不全一律返回 None（不臆造）。"""
+    md = run.get("metadata_json") or ""
+    try:
+        meta = json.loads(md) if isinstance(md, (str, bytes)) else (md or {})
+    except Exception:  # noqa: BLE001  # 平台字段，坏 JSON 不该让巡检崩
+        return None
+    if not isinstance(meta, dict) or str(meta.get("runKind") or "") != "missed":
+        return None
+    try:
+        scheduled_ms = int(meta.get("missedScheduledAt") or 0)
+        started_ms = int(run.get("created_at") or 0)
+    except (TypeError, ValueError):  # 平台时间戳为脏值时无法算迟到 → 不判，不臆造
+        return None
+    if not scheduled_ms or not started_ms or started_ms <= scheduled_ms:
+        return None
+    scheduled = datetime.fromtimestamp(scheduled_ms / 1000)
+    clock_min = scheduled.hour * 60 + scheduled.minute
+    return {
+        "late_minutes": (started_ms - scheduled_ms) / 60000,
+        "intraday": _INTRADAY_START_MIN <= clock_min <= _INTRADAY_END_MIN,
+        "scheduled_at": scheduled.isoformat(timespec="minutes"),
+        "started_ms": started_ms,
+    }
+
+
+def collect_missed_summary(automations: list, now_ms: int | None = None) -> dict:
+    """聚合「最近一次运行是补跑」的任务，判定是否发生调度停摆。
+
+    只回看 MISSED_LOOKBACK_HOURS 小时：低频任务（周任务/23:50 任务）的最近一次
+    可能长期停留在某次补跑上，不设窗口会让停摆过去后每天继续误报。
+    now_ms 可注入，使测试不依赖真实时钟。
+    """
+    if now_ms is None:
+        now_ms = int(datetime.now().timestamp() * 1000)
+    cutoff = now_ms - MISSED_LOOKBACK_HOURS * 3600000
+    infos = []
+    for auto in automations:
+        runs = auto.get("recent_runs") or []
+        if not runs:
+            continue
+        info = _missed_run_info(runs[0])
+        if info and cutoff <= info["started_ms"] <= now_ms:
+            infos.append((auto.get("name", ""), info))
+    max_late = max((i["late_minutes"] for _, i in infos), default=0.0)
+    return {
+        "count": len(infos),
+        "intraday_count": sum(1 for _, i in infos if i["intraday"]),
+        "max_late_minutes": round(max_late, 1),
+        "is_outage": (
+            len(infos) >= MISSED_OUTAGE_MIN_COUNT and max_late >= MISSED_OUTAGE_MIN_LATE_MIN
+        ),
+        "sample_names": [n for n, _ in infos[:5]],
+    }
+
+
+def alert_needed(summary: dict) -> bool:
+    """是否发飞书告警：原有 w/c 口径 + 新增停摆口径。"""
+    mc = summary.get("missed_catchup") or {}
+    return bool(
+        summary.get("warning_count", 0) or summary.get("critical_count", 0) or mc.get("is_outage")
+    )
+
+
+def generate_report(summary: dict) -> str:
+    """生成汇总报告文本"""
+    lines = []
+    lines.append(f"⚙️ 自动化健康 | {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+
+    total = summary["total_count"]
+    h = summary["healthy_count"]
+    w = summary["warning_count"]
+    c = summary["critical_count"]
+
+    lines.append(f"总计 {total} | 🟢{h} 🟡{w} 🔴{c}")
+    lines.append("")
+
+    mc = summary.get("missed_catchup") or {}
+    if mc.get("is_outage"):
+        lines.append(
+            f"🔴 调度停摆：{mc['count']} 项最近一次为补跑"
+            f"（盘中 {mc.get('intraday_count', 0)} 项），"
+            f"最长迟到 {int(mc.get('max_late_minutes', 0))} 分钟"
+        )
+        lines.append("")
+
+    for cat, items in summary["by_category"].items():
+        if not items:
+            continue
+        cat_issues = [i for i in items if i["health"] in ("🟡", "🔴")]
+        lines.append(f"📂 {cat} ({len(items)}个, {len(cat_issues)}异常)")
+        for item in items:
+            if item["health"] in ("🟡", "🔴"):
+                lines.append(f"  {item['health']} {item['name']}: {', '.join(item['issues'])}")
+        lines.append("")
+
+    acked = [
+        it for items in summary["by_category"].values() for it in items if it.get("acked_paused")
+    ]
+    if acked:
+        lines.append(f"⏸ 已登记暂停（不计入异常）：{len(acked)} 个")
+        for it in acked:
+            lines.append(f"  · {it['name']}")
+        lines.append("")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━")
+    return "\n".join(lines)
+
+
+def send_feishu_alert(summary: dict) -> bool:
+    """发送飞书告警消息"""
+    if not FEISHU_WEBHOOK:
+        print("⚠️ FEISHU_WEBHOOK 未配置，跳过告警", file=sys.stderr)
+        return False
+
+    total = summary["total_count"]
+    h = summary["healthy_count"]
+    w = summary["warning_count"]
+    c = summary["critical_count"]
+    mc = summary.get("missed_catchup") or {}
+
+    # 仅异常时发送；2026-11-06 起「调度停摆」即使 w/c 全零也要告警
+    if not alert_needed(summary):
+        print("✅ 所有自动化健康，跳过告警")
+        return True
+
+    # 构造飞书富文本消息卡片
+    issue_lines = []
+    for cat, items in summary["by_category"].items():
+        bad = [i for i in items if i["health"] in ("🟡", "🔴")]
+        if not bad:
+            continue
+        for item in bad:
+            tag = "🔴" if item["health"] == "🔴" else "🟡"
+            issue_lines.append(f"{tag} **{item['name']}**\n　{', '.join(item['issues'])}")
+
+    issues_text = "\n".join(issue_lines[:15])  # 最多 15 条
+    if len(issue_lines) > 15:
+        issues_text += f"\n... 及其他 {len(issue_lines) - 15} 条异常"
+
+    outage_line = ""
+    if mc.get("is_outage"):
+        outage_line = (
+            f"\n🔴 **调度停摆** {mc['count']} 项补跑"
+            f"（盘中 {mc.get('intraday_count', 0)} 项，"
+            f"最长迟到 {int(mc.get('max_late_minutes', 0))} 分钟）"
+        )
+
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": "⚙️ Claw 自动化健康告警"},
+                "template": "red" if c > 0 or mc.get("is_outage") else "yellow",
+            },
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": (
+                        f"**扫描时间**: {summary.get('generated_at', 'N/A')}\n"
+                        f"**总计**: {total} | 🟢{h} 🟡{w} 🔴{c}"
+                        f"{outage_line}"
+                    ),
+                },
+                {"tag": "hr"},
+                {
+                    "tag": "markdown",
+                    "content": issues_text if issues_text else "无异常",
+                },
+                {
+                    "tag": "note",
+                    "elements": [
+                        {
+                            "tag": "plain_text",
+                            "content": "Claw automation_health.py 自动巡检",
+                        }
+                    ],
+                },
+            ],
+        },
+    }
+
+    try:
+        req = urllib.request.Request(
+            FEISHU_WEBHOOK,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+            if result.get("code") == 0:
+                print("✅ 飞书告警已发送")
+                return True
+            else:
+                print(f"❌ 飞书返回错误: {result}", file=sys.stderr)
+                return False
+    except Exception as e:
+        print(f"❌ 飞书请求失败: {e}", file=sys.stderr)
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Claw 自动化健康检查")
+    parser.add_argument("--json", action="store_true", help="仅输出 JSON")
+    parser.add_argument("--alert", action="store_true", help="异常时飞书告警")
+    args = parser.parse_args()
+
+    if not args.json:
+        print(f"[{datetime.now()}] 自动化健康扫描...")
+
+    automations = get_automations()
+    if not automations:
+        print("无法读取自动化数据", file=sys.stderr)
+        sys.exit(1)
+
+    by_cat = categorize(automations)
+    missed = collect_missed_summary(automations)
+
+    healthy = warning = critical = 0
+    cat_results = {}
+
+    for cat, items in by_cat.items():
+        checked = []
+        for auto in items:
+            h = check_health(auto)
+            checked.append(h)
+            if h["health"] == "🟢":
+                healthy += 1
+            elif h["health"] == "🟡":
+                warning += 1
+            elif h["health"] == "🔴":
+                critical += 1
+            else:
+                healthy += 1  # 🔵 running = OK
+        cat_results[cat] = checked
+
+    summary = {
+        "total_count": len(automations),
+        "healthy_count": healthy,
+        "warning_count": warning,
+        "critical_count": critical,
+        "by_category": cat_results,
+        "missed_catchup": missed,
+        "acked_paused_count": sum(
+            1 for items in cat_results.values() for it in items if it.get("acked_paused")
+        ),
+        "generated_at": datetime.now().isoformat(),
+    }
+
+    # 写入 JSON
+    output_path = DATA_DIR / "automation_health.json"
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2, default=str)
+
+    if args.json:
+        print(json.dumps(summary, ensure_ascii=False, indent=2, default=str))
+    else:
+        report = generate_report(summary)
+        print(report)
+        print(f"\n详细数据 → {output_path}")
+
+    # 飞书告警
+    if args.alert:
+        send_feishu_alert(summary)
+
+    return 0 if critical == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

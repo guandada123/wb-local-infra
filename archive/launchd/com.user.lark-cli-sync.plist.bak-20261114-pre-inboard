@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  lark-cli 本机副本 ↔ WorkBuddy 源包 一致性巡检（T-INS-ca44a690ec3f 的处置资产，2026-11-11）
+
+  为什么要有：飞书推送已改用本机副本 ~/.local/lib/lark-cli，但 WorkBuddy 升级 lark-cli 后
+  副本不会自动同步，会静默停在旧版本（卡片照发、行为退回旧版）。脚本
+  scripts/check_lark_cli_sync.sh 早就有，此前只有手工跑；本 plist 只负责「接定时」。
+
+  装法/回滚见 docs/autopilot-ins-ca44a690ec3f.md 第五节。
+  2026-11-11 22:1x 修：launchd 后台直接跑外置卷脚本会 EPERM（TCC），
+  改由内盘的授权 python 启动器 lark-cli-sync-launcher.py 派生 bash，子进程继承授权。
+  注意：脚本与仓库都在外置卷，SSD 掉线时本 job 会失败 —— 外置卷属已知遗留风险 L-1，
+  本 job 只负责「版本漂移」，不承担掉线告警。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.lark-cli-sync</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+        <string>/Users/guan/.local/bin/lark-cli-sync-launcher.py</string>
+        <string>/Volumes/ZHITAI/WorkBuddy/Claw/scripts/check_lark_cli_sync.sh &gt;&gt; /Users/guan/Library/Logs/lark-cli-sync.log 2&gt;&amp;1 || /Volumes/ZHITAI/WorkBuddy/Claw/.venv/bin/python /Volumes/ZHITAI/WorkBuddy/Claw/.workbuddy/scripts/push_card.py --title 'lark-cli 本机副本与源包不一致' --level warning --section '现状' '本机副本可能已落后于 WorkBuddy 源包：告警卡片仍在发，但行为可能退回旧版。检查输出见 ~/Library/Logs/lark-cli-sync.log' --section '怎么做' '按 ~/.local/lib/lark-cli/bin/lark-cli 顶部说明重新 ditto 同步，再跑 scripts/check_lark_cli_sync.sh 确认 rc=0' --dedupe-key 'lark-cli-sync-drift'</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>20</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/guan</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/lark-cli-sync.launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/lark-cli-sync.launchd.err</string>
+</dict>
+</plist>

@@ -1,0 +1,815 @@
+#!/usr/bin/env python3
+"""memory_add_rule.py — 记忆文件「规则层」写入口守卫
+
+## 为什么需要它
+
+2026-10-19 03:30 记忆维护自动化实测发现：
+    用户级 MEMORY.md 在 **10-18 16:10 被白天会话追加 3 条铁律（+676B）**，
+    当时可见余量只剩 82B ⇒ 规则层 7,675 → 8,351B，超出实测上限 7,791B 共 594B，
+    **最后约 2.5 条规则落在可见区外（模型从未读到）**。
+    全程零报错，追加到被发现相隔 11h20m。
+
+同一天 22:1x 又重演一次（规则层涨到 8,469B / 84 条，溢出 712B）。
+
+**这不是"文件太大"，是"写的时候没人检查"。**
+任何会话（人或 AI）直接往 MEMORY.md 末尾 append 一条，就可能把尾部几条挤到不可见区，
+而 append 本身成功、无报错 —— 典型的静默失效。
+
+所以：**新增规则请走这个脚本，不要直接编辑 MEMORY.md。**
+
+## 用法
+
+    # 追加一条规则（会检查余量，溢出则拒绝）
+    python3 memory_add_rule.py --file ~/.workbuddy/user-XXX/MEMORY.md --rule "- 新规则文本"
+
+    # 连证据一起补（可选）
+    python3 memory_add_rule.py --file ... --rule "- XXX" --evidence "**── 证据 85 ──** 正文..."
+
+    # 只检查，不写（推荐先跑一次）
+    python3 memory_add_rule.py --file ... --rule "- XXX" --dry-run
+
+    # 明确知道会溢出但仍要写（不推荐，需说明理由）
+    python3 memory_add_rule.py --file ... --rule "- XXX" --force
+
+## 退出码
+    0 = 已写入（或 dry-run 判定可写）
+    1 = 拒绝写入（会溢出，且未加 --force）
+    2 = 无法判定（文件结构解析失败 / 找不到规则层）—— **绝不当作通过**
+
+## 与 memory_headroom_check.py 的分工
+    · memory_headroom_check.py：**只读**体检，回答"现在余量多少"
+    · memory_add_rule.py：**写入口**，回答"现在还能不能再加一条"
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import importlib.util
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import time
+from datetime import datetime
+from pathlib import Path
+
+# 锁 / 原子写的**唯一实现**（2026-10-26 抽出，check_memory_visibility --fix 共用一份）。
+# resolve() 是必须的：本脚本常经 `~/.workbuddy/scripts/` 的符号链接被调用。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import memory_lock  # noqa: E402
+
+CHECKER = Path.home() / ".workbuddy" / "scripts" / "check_memory_visibility.py"
+
+# `--force` 的留痕文件（2026-10-23 审计 A4）。
+# 放用户数据目录而非仓库：它记录的是本机操作，不该进公开仓库。
+FORCE_LOG = Path.home() / ".workbuddy" / "memory_force_log.jsonl"
+
+# 贴边阈值：余量低于此值时，即使本次写入能通过也提醒"该精简了"。
+# 与 memory_headroom_check.py 的 🟡 阈值保持一致（同一件事只该有一个数）。
+HEADROOM_WARN_B = 500
+
+# 单条规则长度上限。2026-10-23 补：本脚本原先**没有**这道校验，而 workbuddy_data
+# 那份简版有 —— 于是「走哪个脚本加规则」决定了 90B 门槛生不生效：
+# 走简版会被拦，走本版畅通无阻。同一语义两处口径，正是两版头部数字互相打脸的同族问题。
+# 90B 的来历：60B ≈ 20 个汉字，写清「条件+动作+后果」通常要 22–30 字；
+# 实测 95 条里 62 条超 60B（65%），中位 67B 本身就在门槛之上。
+RULE_MAX = 90
+
+
+def _load_checker():
+    if not CHECKER.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("_cmv", str(CHECKER))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _limit_for(path: Path, mod) -> int | None:
+    """返回该文件登记的注入上限；**未登记返回 None**（绝不猜）。
+
+    2026-10-19 实测教训：初版在未登记时退化为 7757（用户级的值），
+    结果把项目级 MEMORY.md（真实上限 16474B、余量 +801B）判成「溢出 −7916B」，
+    差点误拒一次本来合法的写入。**判不了就说判不了，不要拿别的文件的口径顶替。**
+    """
+    limits = getattr(mod, "DEFAULT_LIMITS", {}) or {}
+    key = str(path)
+    if key in limits:
+        return int(limits[key])
+    # 也允许按 resolve 后的路径匹配（DEFAULT_LIMITS 可能存的是展开后的绝对路径）
+    try:
+        resolved = str(path.resolve())
+    except OSError:
+        resolved = key
+    if resolved in limits:
+        return int(limits[resolved])
+    return None
+
+
+def _is_user_injectable(path: Path) -> bool:
+    """是否**用户级注入文件**（注入按字符截断的那个）。
+
+    只对它套字符闸门：Claw 项目记忆（~16KB 上限）是另一套预算，
+    拿用户级的 3,900 字符去量它会把合法写入判成溢出（假红，同族于 _limit_for 的教训）。
+    """
+    return "user-" in str(path) and path.name == "MEMORY.md"
+
+
+def _char_budget(path: Path) -> dict | None:
+    """读字符上限（真实截断单位）。仅用户级注入文件有已知值，其余返回 None。
+
+    🔴 2026-10-31：字节不是截断单位。本脚本历来只算字节余量，于是
+    「字节还有 400B、字符已超 3,900」这种写能通过闸门，而写进去的尾部**模型读不到**
+    —— 与 10-18/10-19 两次事故同一个病，只是换了个量纲。
+    上限/黄线/红线**一律从 check_memory_budget 读**（单一真源），不在本文件复制。
+    """
+    if not _is_user_injectable(path):
+        return None
+    try:
+        cand = path.parent / "scripts" / "check_memory_budget.py"
+        if not cand.is_file():
+            found = sorted(Path.home().glob(".workbuddy/user-*/scripts/check_memory_budget.py"))
+            if len(found) != 1:  # 多个命中不猜（同 memory_headroom_check 的口径）
+                return None
+            cand = found[0]
+        spec = importlib.util.spec_from_file_location("_mar_char_budget", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        return {
+            "limit": int(mod.LIMIT_CHARS),
+            "warn": int(mod.CHAR_WARN),
+            "crit": int(mod.CHAR_CRIT),
+        }
+    except Exception:  # noqa: BLE001 — 读不到就说读不到，由调用方显式告警，不静默
+        return None
+
+
+_HEAD_RULE_RE = re.compile(r"^\*\*规则层\*\*（下方 \d+ 条，每行一条，注入可见）")
+_HEAD_FILE_RE = re.compile(
+    r"^\*\*本文件\*\*:注入上限 · 规则层 \d+ 条各一行\(行 \d+–\d+,止于 \*\*[\d,]+B\*\*,"
+    r"余量 ≈\d+B\)· 铁律证据库\(共 \d+ 条\)"
+)
+# 证据库自身的小标题也声明了一份条数（`> 共 88 条，默认不可见，按需检索。`）。
+# 2026-10-20 实测：只改「本文件」那行时，检查器报「声明腐烂：小标题声明 88，实测 89」——
+# 同一事实两处声明，只刷新一处 = 另一处从此刻开始说谎。故一并重算。
+_HEAD_EV_RE = re.compile(r"^> 共 \d+ 条，默认不可见，按需检索。$")
+
+# 证据块计数口径：**唯一真源**。2026-10-20 审计（B2）前，本文件里有两份计数
+#   - `_refresh_header`：`startswith("**── 证据 ")`，且为 0 时退一步用包含式匹配
+#   - `_evidence_block`：`startswith("**── 证据 ")`，无退路
+#   而外部对账方 `declaration_audit` D4 用的是行首正则 `^\*\*── 证据 \d+ ──\*\*`。
+#   三处口径不一致 = 同一份文件能被数出 91 和 92（实测：包含式把证据库开头的
+#   用法说明行 `> 用法：grep -n "── 证据 37 ──"` 也算成一条），头注与检查器
+#   各说各话，正是「规则 90 条 vs 证据 89 块」这类对账错位的根。
+#   故在此统一：只认行首且带数字编号的块头，与 D4 完全对齐；且**不做退路**——
+#   数出 0 就是真 0，宁可让头注写 0 把问题喊出来，也不要用一个"更像对"的数掩盖。
+_EV_BLOCK_RE = re.compile(r"^\*\*── 证据 \d+ ──\*\*")
+# 非数字标签的块头（`**── 证据 只读≠不可写（…）──**`）—— 它不算「已带编号」，
+# 必须重编号。2026-10-26 实测：周度升级写了两条这种块，count_evidence_blocks 看不见它们
+# （98 vs 100），头注「共 98 条」与实际 100 块分裂。
+_EV_ANY_RE = re.compile(r"^\*\*── 证据 (?P<label>[^─]+?)──\*\*")
+
+
+def count_evidence_blocks(text: str) -> int:
+    """统计文本里的证据块数（行首 `**── 证据 N ──**`，与 declaration_audit D4 同口径）。"""
+    return sum(1 for ln in text.split("\n") if _EV_BLOCK_RE.match(ln))
+
+
+def _next_evidence_no(text: str) -> int:
+    """下一个证据编号 = 现有**最大编号 + 1**（不能用块数 +1）。
+
+    2026-10-26 实测：用户级 MEMORY.md 有 98 块但编号到 100（缺 22、30），
+    `count+1=99` 会与已存在的「证据 99」**重号**；而证据是按编号检索的，
+    重号等于给检索方两条不同的证据（同族：`2026-10-22-misaligned-evidence-index-…`）。
+    """
+    nums = [int(n) for n in re.findall(r"^\*\*── 证据 (\d+) ──\*\*", text, re.M)]
+    return (max(nums) if nums else 0) + 1
+
+
+def _refresh_header(text: str, limit: int, mod) -> tuple[str, str]:
+    """写后重算文件头注的两行统计（条数 / 行范围 / 偏移 / 余量 / 证据数）。
+
+    ## 为什么必须重算
+
+    头注是**人读的地图**，而本脚本早先只写规则、不更新它 —— 于是每新增一条就留下
+    一组错的数字。2026-10-20 实测：写入后头注仍写「88 条 / 7,074B / 683B」，而实际
+    已是「89 条 / 7,182B / 575B」。这**正是本脚本要防的「静默漂移」的另一种形态**：
+    文件本身没坏、写入也没报错，只是那份地图从此刻起开始骗人。
+
+    ## 口径
+
+    一律**从 written 文本现算**（调检查器的 `_layout`），不拿 main 里写前算的值 ——
+    写前写后差一条规则，用写前的值刷新等于没刷。
+    「止于 X B」用 `rule_off`（末条规则行的独占结束偏移），不是规则层净字节：
+    两者相差标题行 + 空行，混用会重演 2026-10-15 那次「输出在说谎」。
+
+    ## 失败策略
+
+    不阻断写入（规则已经该落盘了），但**必须喊出来**（stderr + 返回值），
+    不许静默跳过 —— 静默跳过正是本文件反复踩过的坑。
+    """
+    _, info = mod._layout(text, limit)
+    if "rule_last" not in info or "rule_off" not in info:
+        return text, "⚠️ 头注未刷新：版式解析失败（rule_last/rule_off 缺失）"
+
+    n_rules = int(info.get("rules") or 0)
+    rule_last = int(info["rule_last"])
+    rule_off = int(info["rule_off"])
+    headroom = max(limit - rule_off, 0)
+    n_ev = count_evidence_blocks(text)
+
+    hit = 0
+    hit_ev = 0
+
+    def _apply(cur_text: str, cur_off: int, cur_headroom: int) -> tuple[str, int, int]:
+        """按给定 rule_off/headroom 改写三行头注，返回 (新文本, hit, hit_ev)。
+
+        对已改写的行再跑一次是幂等的（三个正则都能匹配自己写出的格式），
+        所以调用方可以安全地反复调用它做迭代。
+        """
+        ls = cur_text.split("\n")
+        h = 0
+        he = 0
+        for i, ln in enumerate(ls):
+            if _HEAD_RULE_RE.match(ln):
+                ls[i] = (
+                    f"**规则层**（下方 {n_rules} 条，每行一条，注入可见）｜**证据正文**：文末「铁律证据库」"
+                )
+                h += 1
+            elif _HEAD_FILE_RE.match(ln):
+                ls[i] = (
+                    f"**本文件**:注入上限 · 规则层 {n_rules} 条各一行(行 8–{rule_last},"
+                    f"止于 **{cur_off:,}B**,余量 ≈{cur_headroom}B)· 铁律证据库(共 {n_ev} 条)"
+                    f"· 索引化原文存档 · 截断点"
+                )
+                h += 1
+            elif _HEAD_EV_RE.match(ln):
+                ls[i] = f"> 共 {n_ev} 条，默认不可见，按需检索。"
+                he += 1
+        return "\n".join(ls), h, he
+
+    # ⚠️ 头注行的**自身长度**会变（"行 8–99" → "行 8–100" 多 1 字节；"余量 ≈356B" →
+    # "≈99B" 少 1 字节），而 rule_off 是在**旧文本**上算出来的 —— 一旦直接写下去，
+    # 头注记录的偏移就从落笔那一刻起偏了。2026-10-21 实测踩中：脚本自报"新规则止
+    # 7512B"却把 7511B 写进头注，检查器随即报 D2/D3 双腐烂（声明腐烂抓的是**别人**
+    # 写错的数，这里抓到的是自己）。故写完重算、偏移变了再写，直到收敛
+    # （变化量只来自数字位数，几轮内必稳定；4 轮上限防死循环）。
+    new_text = text
+    for _ in range(4):
+        new_text, hit, hit_ev = _apply(new_text, rule_off, headroom)
+        if hit < 2:
+            break
+        _, info2 = mod._layout(new_text, limit)
+        if "rule_off" not in info2:
+            break
+        new_off = int(info2["rule_off"])
+        if new_off == rule_off:
+            break
+        rule_off = new_off
+        headroom = max(limit - rule_off, 0)
+
+    if hit < 2:
+        return text, f"⚠️ 头注未刷新：只匹配到 {hit}/2 行（头注结构可能变了，请人工核对）"
+    return (
+        new_text,
+        f"头注已刷新：{n_rules} 条 / 行 8–{rule_last} / {rule_off:,}B / 余量 {headroom}B "
+        f"/ 证据 {n_ev} 条（证据库小标题命中 {hit_ev}/1）",
+    )
+
+
+def _prune_backups(path: Path, keep: int = 5) -> None:
+    """只保留最近 keep 个本脚本建的备份，其余删除。
+
+    **只清理 .bak-addrule- 前缀**（本脚本建的），不碰其他工具的备份
+    （如 .bak-indexing-）；也不碰人工命名的 .bak-<原因>-<日期>。
+    失败不阻断 —— 备份清理失败远没有写入失败严重。
+    """
+    baks = sorted(path.parent.glob(f"{path.name}.bak-addrule-*"))
+    if len(baks) <= keep:
+        return
+    for old in baks[:-keep]:
+        try:
+            old.unlink()
+        except OSError as e:  # noqa: BLE001
+            print(f"  ⚠️ 旧备份清理失败（不阻断）: {old.name}（{e}）", file=sys.stderr)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """原子写 —— 实现在 `memory_lock.atomic_write`（2026-10-26 与 --fix 共用一份）。
+
+    保留这个薄封装只为不动既有调用点与 34 条测试；临时文件命名、fsync、
+    os.replace 都在共享模块里，这里不再有第二份实现（同族：单一真源）。
+    """
+    memory_lock.atomic_write(path, text)
+
+
+@contextlib.contextmanager
+def _flock(path: Path, timeout: float = 10.0):
+    """对 `<目标>.lock` 加排他锁（2026-10-23 审计 A8）。
+
+    ## 为什么光有「再读一次比对」不够
+
+    写路径原本是：读快照 → 判断 → **再读一次比对** → 写盘。比对到写盘之间仍有间隙，
+    虽然只有微秒级，但两个会话同时执行本脚本时确实能撞进去（本项目实测存在
+    40 分钟内并发写入 +1467B 的场景）。「缩小窗口」不等于「消除窗口」，
+    而注释写的是"竞态防护"，措辞比实现强。
+
+    ## 边界（必须说清楚，否则又是假绿灯）
+
+    这是**协作锁**：只对同样走 `memory_add_rule` 的写入方有效。
+    绕过本脚本直接 append MEMORY.md 的进程（历史上多次发生）不受约束 ——
+    对它们仍然依赖内容比对的检测 + 原子替换保证「不产生半截文件」。
+    所以锁是增强，不是替代：**两道都要在**。
+
+    ## 为什么用独立 .lock 文件
+
+    对目标文件本身加锁再 os.replace 会换 inode，锁就跟着旧 inode 走了；
+    锁文件只作同步点，不参与替换。
+    """
+    lock_path = path.with_name(path.name + ".lock")
+    fh = lock_path.open("a+")
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{timeout:.1f}s 内拿不到写锁（{lock_path.name}）——"
+                        f"可能有另一个会话正在写同一份记忆。请重跑。"
+                    ) from None
+                time.sleep(0.02)
+        yield
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        finally:
+            fh.close()
+
+
+@contextlib.contextmanager
+def _flock_or_reject(path: Path):
+    """拿不到锁不抛栈，改成「yield False」让调用方返回 rc=2。
+
+    抢锁超时是**可预期的运行状态**（另一个会话正在写），不是程序缺陷。
+    用未捕获的 TimeoutError 收场会打出整段 traceback、退出码也变得不可区分 ——
+    而调用方（自动化/脚本）需要的是明确的「这次没写成，重跑即可」。
+    """
+    try:
+        with _flock(path):
+            yield True
+    except TimeoutError as e:
+        print(f"🔴 {e}", file=sys.stderr)
+        yield False
+
+
+def _reject_concurrent(phase: str) -> int:
+    """文件在「我读到之后」被别人改过 → 拒绝写入，返回 rc=2。
+
+    抽成函数是因为它有三处调用（刷新预检 / 刷新临界区 / 写入临界区），
+    原先三份同样的六行文案，改一处漏两处是迟早的事。
+    """
+    print(
+        f"🔴 {phase}检测到文件已被并发修改 —— 拒绝写入（避免覆盖丢失对方改动）。\n"
+        "   请重跑本命令（会基于新内容重新判定）。这次未写入任何内容。",
+        file=sys.stderr,
+    )
+    return 2
+
+
+def _backup(path: Path) -> Path:
+    """写前备份，名字带微秒 + 冲突计数。
+
+    原实现只到秒（`%Y%m%d-%H%M%S`）：同一秒内两次写会**覆盖上一份备份**，
+    而备份存在的唯一意义就是「上一次的样子」。（2026-10-23 审计 A10）
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    bak = path.with_name(f"{path.name}.bak-addrule-{stamp}")
+    n = 1
+    while bak.exists():
+        bak = path.with_name(f"{path.name}.bak-addrule-{stamp}-{n}")
+        n += 1
+    shutil.copy2(path, bak)
+    return bak
+
+
+def _log_force(path: Path, rule: str, after_headroom: int, reason: str) -> None:
+    """`--force` 的留痕（2026-10-23 审计 A4）。
+
+    注释一直写着「必须留下痕迹」，但实现只往 stderr 打一行 —— 那是**会消失的**痕迹。
+    强制写入意味着规则默认不可见，事后必须能回答「哪几条是 force 写进去的、为什么」。
+    落 JSONL，不占规则层字节，也不进注入区。
+    """
+    rec = {
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "file": str(path),
+        "rule_preview": rule[:60],
+        "rule_bytes": len(rule.encode()),
+        "after_headroom": after_headroom,
+        "reason": reason or "(未给 --reason)",
+        "cwd": os.getcwd(),
+    }
+    try:
+        FORCE_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with FORCE_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:  # noqa: BLE001
+        print(
+            f"  ⚠️ force 留痕失败（不阻断写入，但这次强制写入将无法追溯）: {e}",
+            file=sys.stderr,
+        )
+
+
+def _evidence_block(out: str, body: str) -> str:
+    """给证据正文补编号块头（调用方漏写时）。
+
+    2026-10-20：参数名 --evidence 暗示"给正文"，但原实现要求调用方自带
+    「**── 证据 N ──**」块头 —— 漏写就变成无编号游离段落，规则↔证据 1:1
+    校验（check_memory_visibility）立刻报警「规则 90 条 vs 证据 89 块」。
+    这里做兜底：无块头则按现有块数 +1 自动编号。
+    """
+    lines = body.split("\n")
+    if any(_EV_BLOCK_RE.match(ln) for ln in lines):
+        return body  # 已带合法编号 → 原样
+    n = _next_evidence_no(out)
+    for i, ln in enumerate(lines):
+        m = _EV_ANY_RE.match(ln)
+        if m:
+            label = m.group("label").strip().strip("（）()")
+            lines[i] = f"**── 证据 {n} ──**（{label}）{ln[m.end() :]}"
+            return "\n".join(lines)
+    return f"**── 证据 {n} ──** {body}"
+
+
+def _insert_evidence(text: str, evidence: str) -> str | None:
+    """把证据块插到**行首标题** `## 📎` 之后；找不到真标题返回 None。
+
+    两个必须守住的点：
+
+    ① 命中位置：原用 `text.find("## 📎")` 取**第一个**匹配，而正文里常有
+       「…取证细节 → 文末 `## 📎 铁律证据库`…」这样的**提及**，于是证据被插进
+       那句话中间，把一行撕裂成三段（实测：项目级 MEMORY 的 L11 被劈开，
+       文件凭空 +620B，规则层被推后 515B，余量从 747 掉到 127）。
+       故改为**行首锚定**（re.M + ^），只认真正作为标题出现的那一处。
+       ⚠️ 锚点必须吃掉**整行标题**（`.*$`）：真实标题是 `## 📎 铁律证据库（…）`，
+       只匹配到 emoji 就把标题文字挤到证据之后了（2026-10-26 补测试时实测）。
+    ② 不做 strip()：多行带缩进的证据会被破坏（2026-10-19 审计发现）。
+
+    2026-10-26：从 main() 内联下沉为纯函数，让「提及 vs 标题」可被单测钉住
+    （tests/test_memory_add_rule_evidence.py::test_insert_ignores_inline_mention）。
+    """
+    ev_m = re.search(r"^## 📎.*$", text, re.M)
+    if not ev_m:
+        return None
+    ins_at = ev_m.end()
+    body = evidence if evidence.startswith("\n") else "\n" + evidence
+    body = _evidence_block(text, body.strip("\n"))
+    return text[:ins_at] + "\n" + body + "\n" + text[ins_at:]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="记忆文件规则层写入口守卫")
+    ap.add_argument("--file", required=True, help="目标 MEMORY.md 路径")
+    ap.add_argument(
+        "--rule", default="", help="要追加的规则行（建议以 '- ' 开头）；--refresh 时可省略"
+    )
+    ap.add_argument(
+        "--refresh",
+        action="store_true",
+        help="只重算文件头注统计，不增删任何规则（头注已偏时用）",
+    )
+    ap.add_argument("--evidence", default="", help="可选：同时追加到证据块")
+    ap.add_argument("--limit", type=int, default=0, help="覆盖注入上限（默认取 DEFAULT_LIMITS）")
+    ap.add_argument("--dry-run", action="store_true", help="只检查不写")
+    ap.add_argument("--force", action="store_true", help="溢出也写（需说明理由）")
+    ap.add_argument(
+        "--reason",
+        default="",
+        help="配合 --force 说明理由；会写进留痕文件（不给也能写，但留痕记「未给理由」）",
+    )
+    ap.add_argument(
+        "--no-backup",
+        dest="backup",
+        action="store_false",
+        help="关闭写前备份（默认开；旧版 --backup 参数无效已废弃）",
+    )
+    args = ap.parse_args()
+
+    path = Path(os.path.expanduser(args.file))
+    if not path.exists():
+        print(f"🔴 文件不存在: {path}", file=sys.stderr)
+        return 2
+
+    mod = _load_checker()
+    if mod is None:
+        print(f"🔴 找不到检查器 {CHECKER} —— 无法判定余量，拒绝写入（rc=2）", file=sys.stderr)
+        return 2
+
+    if args.refresh and args.rule.strip():
+        print("🔴 --refresh 与 --rule 互斥：刷新不增删规则，二者请分开执行。", file=sys.stderr)
+        return 2
+    if not args.refresh and not args.rule.strip():
+        print(
+            "🔴 未给 --rule —— 拒绝写入；只想修正头注请用 --refresh（不增删规则）",
+            file=sys.stderr,
+        )
+        return 2
+
+    rule = args.rule if args.rule.startswith("- ") else "- " + args.rule.lstrip("- ").strip()
+    if not args.refresh and not rule.strip("- ").strip():
+        print("🔴 规则内容为空（只有 '- ' 前缀）—— 拒绝写入", file=sys.stderr)
+        return 2
+    rule_bytes = len((rule + "\n").encode())
+    # 单条长度门槛（与简版一致）。--force 可破例，语义与「溢出也写」统一：
+    # 都是明知越界仍要写，因此共用同一个开关，但必须留下痕迹。
+    if len(rule[2:].encode()) > RULE_MAX and not args.force:
+        print(
+            f"🔴 规则 {len(rule[2:].encode())}B > {RULE_MAX}B（索引句规矩）—— 拒绝写入；"
+            f"确需长规则加 --force",
+            file=sys.stderr,
+        )
+        return 2
+
+    text = path.read_text(encoding="utf-8")
+    limit = args.limit or _limit_for(path, mod)
+    if not limit:
+        # 2026-10-19 审计修：不再硬编码「用户级 7757 / 项目级 16474」——上限变更时提示会过时。
+        # 改为从 DEFAULT_LIMITS 反查列出全部登记项，让用户看到真实可选值。
+        registered = getattr(mod, "DEFAULT_LIMITS", {}) or {}
+        if registered:
+            listing = "\n".join(
+                f"   · {Path(k).name} → {v}B" for k, v in sorted(registered.items())
+            )
+        else:
+            listing = "   ·（DEFAULT_LIMITS 为空——检查器未登记任何文件）"
+        print(
+            f"🔴 该文件未登记注入上限，拒绝猜测：{path}\n"
+            f"   已登记的上限：\n{listing}\n"
+            f"   请用 --limit <字节> 显式指定本文件的上限。\n"
+            f"   拿别的文件的上限顶替会误判 —— 实测过：会把项目级（余量 +801B）判成溢出 −7916B。",
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        lines, info = mod._layout(text, limit)
+    except Exception as e:  # noqa: BLE001
+        print(f"🔴 结构解析失败（{e}）—— 拒绝写入（rc=2）", file=sys.stderr)
+        return 2
+
+    if "rule_off" not in info:
+        print("🔴 解析不出规则层（文件结构可能已变）—— 拒绝写入（rc=2）", file=sys.stderr)
+        return 2
+
+    cur_off = int(info["rule_off"])
+    cur_headroom = limit - cur_off
+
+    if args.refresh:
+        # 只重算头注，不增删规则。**必须复用 _refresh_header** —— 它内部已经
+        # 「重算→再写→再重算」迭代到收敛（见 99c13c9）。
+        # 2026-10-23 的教训：当天在 ~/.workbuddy/scripts/ 下另起了一份简化实现，
+        # 独立重写了这段逻辑且没迭代，于是**回归了 99c13c9 早已修好的头注偏移 bug**，
+        # 还被我当成「新发现」写进复盘。同一件事不要写第二遍。
+        new_text, hdr_msg = _refresh_header(text, limit, mod)
+        print(f"  文件: {path}")
+        print(f"  上限: {limit}B | 当前规则止: {cur_off}B | 当前余量: {cur_headroom}B")
+        print(f"  {hdr_msg}")
+        # ⚠️ 必须先判**刷新是否成功**，再判「文本有没有变」。
+        # 这两个条件会重合：_refresh_header 失败时原样返回入参文本，于是
+        # `new_text == text` 成立 —— 若先判它就会打印「头注与实测一致」并 rc=0，
+        # 与同一段里的「⚠️ 头注未刷新」自相矛盾（2026-10-23 审计实测复现：
+        # 把头注行的半角冒号改成全角即可触发）。刷新模式下头注就是全部产物，
+        # 失败必须致命，不能像写入路径那样只喊一句还继续。
+        if hdr_msg.startswith("⚠️"):
+            print(
+                "🔴 刷新失败：头注结构与脚本预期不符，未写入任何内容。\n"
+                "   请人工核对该文件的头注行（**本文件**:注入上限… / **规则层**（下方…）",
+                file=sys.stderr,
+            )
+            return 2
+        if new_text == text:
+            print("  ✅ 头注与实测一致，无需改写")
+            return 0
+        if args.dry_run:
+            print("  （--dry-run：未写盘）")
+            return 0
+        bak = "(已关闭)"
+        # 与写入路径同一条并发守卫（2026-10-19 审计加的）：读到写之间文件可能被
+        # 别的会话改过，用旧快照落盘会**静默覆盖**。刷新虽然只动头注，但落盘的是
+        # 整份文件 —— 覆盖面一样大。内容级比对（mtime 会因 touch 误报）。
+        # ★ 2026-10-23 审计 A8：比对与写盘必须包在**同一把锁**里，
+        #   否则「比对→写」之间仍有间隙，两个会话并发执行本脚本时能撞进去。
+        #   锁只约束同样走本脚本的写入方；绕过脚本直接 append 的进程靠
+        #   内容比对 + 原子替换兜底（见 _flock 文档串的边界说明）。
+        with _flock_or_reject(path) as _got:
+            if not _got:
+                return 2
+            if path.read_text(encoding="utf-8") != text:
+                return _reject_concurrent("刷新前")
+            if args.backup:
+                bak = _backup(path)
+            _atomic_write(path, new_text)
+
+        # 写后复核：再跑一次必须**不再产生改动**（不动点 = 头注与实测自洽）。
+        # 这是口径校验，不是格式校验 —— 头注里每个数字都来自 _layout 的实测值。
+        text2 = path.read_text(encoding="utf-8")
+        again, msg2 = _refresh_header(text2, limit, mod)
+        # 同样要两判：文本不再变（不动点）+ 这一轮刷新本身成功。
+        # 只判前者会漏掉「两轮都失败、文本都没变」的情况。
+        if again != text2 or msg2.startswith("⚠️"):
+            print(
+                "🔴 刷新后复核失败：头注仍不稳定（再刷一次还会变，或刷新本身报错）。\n"
+                f"   请从备份恢复：{bak}",
+                file=sys.stderr,
+            )
+            return 2
+        _, info2 = mod._layout(text2, limit)
+        new_off = int(info2.get("rule_off") or 0)
+        print(
+            f"  ✅ 头注已刷新 | 规则止: {new_off}B | 余量: {limit - new_off}B | 规则数: {info2.get('rules')}"
+        )
+        print(f"  备份: {bak}")
+        if args.backup:
+            _prune_backups(path)
+        return 0
+
+    longest = int(info.get("longest_rule") or 0)
+    print(f"  文件: {path}")
+    print(
+        f"  上限: {limit}B | 当前规则止: {cur_off}B | 当前余量: {cur_headroom}B | 最长规则: {longest}B"
+    )
+    print(f"  拟加规则: {rule_bytes}B  →  加后余量: {cur_headroom - rule_bytes}B")
+
+    # 贴边提醒（2026-10-21）：上面那条判据只回答「会不会溢出」，不回答「还剩多少缓冲」。
+    # 实测用户级 MEMORY 已经走到 92 条 / 余量 245B —— 此时加规则虽然仍能通过，但下一次
+    # 很可能就撞线，而撞线时的处置成本（临时想删哪条）远高于提前一次合并。
+    # 故在**通过**的路径上也提醒一句：这不是拒绝，是让"该精简了"这件事在写之前出现。
+    after_headroom = cur_headroom - rule_bytes
+    if 0 <= after_headroom < HEADROOM_WARN_B:
+        print(
+            f"  🟡 贴边提醒：加后余量仅 {after_headroom}B（建议 ≥ {HEADROOM_WARN_B}B）。"
+            f"建议先合并/精简一条旧规则再加新的。",
+            file=sys.stderr,
+        )
+
+    # 判据：加后余量必须 ≥ 0（全部规则仍可见）。
+    # 更严的可选判据是「≥ 最长那条规则」，但那是物理约束、不是准入门槛，
+    # 门槛只回答一个问题：写完还看得见吗。
+    if cur_headroom - rule_bytes < 0:
+        print()
+        print(
+            f"🔴 拒绝写入：加后会溢出 {-(cur_headroom - rule_bytes)}B，末尾规则将被挤出可见区。",
+            file=sys.stderr,
+        )
+        print("   处置（三选一）：", file=sys.stderr)
+        print("     a) 先精简/合并一条旧规则，再加新的", file=sys.stderr)
+        print("     b) 这条不写进规则层，只写进证据块（不注入，但可 grep）", file=sys.stderr)
+        print("     c) 确认无误则加 --force（不推荐：写进去 = 模型读不到 = 白写）", file=sys.stderr)
+        if not args.force:
+            return 1
+        print("   ⚠️ 已指定 --force，继续写入（末尾规则将不可见）", file=sys.stderr)
+
+    # 🔴 2026-10-31 字符闸门：**字节不是截断单位**。
+    #   本脚本历来只算字节余量，于是「字节还余 400B、字符已超上限」能过闸门，
+    #   而注入按字符截断 → 写进去的尾部模型读不到（10-18/10-19 两次事故的同一病，换了个量纲）。
+    #   预检用估算（len(text)+新规则+换行）：头注刷新会让总长再差几个字符，故随后**写后精确复核**。
+    cb = _char_budget(path)
+    if cb is None:
+        print(
+            "  ⚠️ 字符水位未知（读不到 check_memory_budget.py）—— 本次只按字节闸门判定；"
+            "请人工确认字符余量（注入按字符截断，字节口径可能偏乐观）",
+            file=sys.stderr,
+        )
+    else:
+        proj_chars = len(text) + len(rule) + 1
+        proj_left = cb["limit"] - proj_chars
+        print(
+            f"  字符口径: 上限 {cb['limit']}（自设；实测截断≈{cb['limit'] + 35}）"
+            f" | 加后约 {proj_chars} 字 | 约余 {proj_left} 字"
+        )
+        if proj_left < 0:
+            print()
+            print(
+                f"🔴 拒绝写入：加后约超出字符上限 {-proj_left} 字 —— 注入按**字符**截断，"
+                "尾部规则模型读不到（字节余量再大也没用）。",
+                file=sys.stderr,
+            )
+            print("   处置：a) 同族归并一条旧规则  b) 降层到 EVIDENCE（不注入）", file=sys.stderr)
+            if not args.force:
+                return 1
+            print("   ⚠️ 已指定 --force，继续写入（尾部将被截断）", file=sys.stderr)
+        elif proj_left < cb["crit"]:
+            print(
+                f"  🟡 字符贴边：加后仅余约 {proj_left} 字（< 红线 {cb['crit']}）"
+                "—— 下一条只能归并，不能追加",
+                file=sys.stderr,
+            )
+
+    if args.dry_run:
+        print("  ✅ dry-run：可写（未落盘）")
+        return 0
+
+    # 并发**预检**（快速失败用）：不值得为一个已知被改过的文件再算一遍插桩与头注。
+    # 权威判定在下面的临界区里 —— 那里持锁重读再比，才是真正消除窗口的地方。
+    # 内容级比对（mtime 会因 touch 误报）。
+    if path.read_text(encoding="utf-8") != text:
+        return _reject_concurrent("写入前")
+
+    # 落盘：插到规则层末尾。2026-10-19 审计修：**不再依赖上游 rule_last 的内部语义**
+    # （「末条规则行的下一行」若定义变化，插入位置会错），改为在规则层范围内
+    # 自行定位最后一个 `- ` 行——只依赖两个稳定字段 rule_head/rule_end。
+    rule_head = int(info.get("rule_head") or 0)
+    rule_end = int(info.get("rule_end") or 0)
+    if rule_end <= rule_head:
+        print(
+            "🔴 定位不到规则层范围（rule_head/rule_end 异常）—— 拒绝写入（rc=2）", file=sys.stderr
+        )
+        return 2
+    last_rule_idx = max(
+        (i for i in range(rule_head, rule_end) if lines[i].startswith("- ")),
+        default=-1,
+    )
+    if last_rule_idx < 0:
+        print("🔴 规则层内找不到任何规则行 —— 拒绝写入（rc=2）", file=sys.stderr)
+        return 2
+
+    bak = "(待写时创建)"  # 备份移进临界区：必须反映**锁内**看到的内容
+
+    new_lines = list(lines)
+    new_lines.insert(last_rule_idx + 1, rule)
+    out = "\n".join(new_lines)
+
+    if args.evidence:
+        out_new = _insert_evidence(out, args.evidence)
+        if out_new is None:
+            print(
+                "⚠️ 未找到证据库（## 📎）—— 本次 evidence 参数被忽略（规则本身仍会写入）",
+                file=sys.stderr,
+            )
+        else:
+            out = out_new
+
+    # 写后重算头注统计（条数/行范围/偏移/余量/证据数），否则那份「地图」会从此刻起骗人
+    out, hdr_msg = _refresh_header(out, limit, mod)
+    print(f"  {hdr_msg}")
+    if hdr_msg.startswith("⚠️"):
+        print(f"  {hdr_msg}", file=sys.stderr)
+
+    # ★ 临界区（2026-10-23 审计 A8）：再读 → 比对 → 备份 → force 留痕 → 原子写，
+    #   全部持锁完成。备份放在锁内，是为了让它反映「即将被覆盖的那一版」——
+    #   放锁外就可能是别人写入前的旧状态，恢复时对不上。
+    with _flock_or_reject(path) as _got:
+        if not _got:
+            return 2
+        if path.read_text(encoding="utf-8") != text:
+            return _reject_concurrent("写入前")
+        bak = _backup(path) if args.backup else "(已关闭)"
+        # --force 留痕放在**写盘前**：先记「打算强写」，万一写盘失败，
+        # 日志里也留下了这次尝试；反之若写后才记，崩溃就查不到。
+        if args.force:
+            _log_force(path, rule, cur_headroom - rule_bytes, args.reason)
+        _atomic_write(path, out)
+
+    # 写后复核（不许只信 write 成功）
+    text2 = path.read_text(encoding="utf-8")
+    _, info2 = mod._layout(text2, limit)
+    if "rule_off" not in info2:
+        print(
+            f"🔴 写入后复核失败：重读解析不出 rule_off —— 文件可能已损坏，请从备份恢复：{bak}",
+            file=sys.stderr,
+        )
+        return 2
+    new_off = int(info2["rule_off"])
+    print(
+        f"  ✅ 已写入 | 新规则止: {new_off}B | 新余量: {limit - new_off}B | 规则数: {info2.get('rules')}"
+    )
+    # 精确复核（不许只信预估，更不许只信 write 成功）：字符是否真的在上限内。
+    if cb is not None:
+        exact = len(text2)
+        if exact > cb["limit"]:
+            print(
+                f"🔴 写后复核失败：实际 {exact} 字 > 上限 {cb['limit']} —— "
+                f"注入已截断，尾部规则读不到。请从备份恢复：{bak}",
+                file=sys.stderr,
+            )
+            return 2
+        print(f"  字符复核: {exact} 字 / 上限 {cb['limit']}（余 {cb['limit'] - exact}）")
+    print(f"  备份: {bak}")
+    if limit - new_off < 0:
+        print("  ⚠️ 注意：写入后余量为负（本次用了 --force）", file=sys.stderr)
+
+    # 备份清理（2026-10-19 审计修：此前无限累积，当天已 6 个）。
+    # 2026-10-23 抽成 _prune_backups，供 --refresh 路径共用（原先只有写入路径清理，
+    # 反复 --refresh 会无限攒备份）。
+    if args.backup:
+        _prune_backups(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

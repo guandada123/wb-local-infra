@@ -1,0 +1,441 @@
+#!/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3
+"""
+agent-autoloop 飞书中台工作台（2026-11-11）
+
+两种运行模式：
+  --brief             每日值班简报（主动播报，09:00 由 launchd 触发；只需发送权限）
+  --poll              轮询群指令（每 2 分钟；需 im:message.group_msg 权限，未批则优雅跳过）
+  无参数              先 poll 再判断是否到播报时点（launchd 统一入口）
+
+设计红线（用户 2026-11-11 授权「让它推动项目」时定）：
+  · 指令白名单，只认 5 条；不接自由文本、不接 LLM 自由发挥
+  · 全部动作 = 只读 + 播报；不交易、不改账本、不删文件、不落审批
+  · 高影响动作只给「建议 + 命令模板」，执行权留在人手
+  · 每条处理写审计日志 ~/.agent-autoloop/logs/feishu-hub.log
+
+零新依赖：仅标准库 urllib；凭据复用 ~/.agent-autoloop/feishu.json。
+退出码：0=成功（含权限缺失降级）｜1=配置错
+"""
+
+import json
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+_BIN_DIR = str(Path(__file__).resolve().parent)
+if _BIN_DIR not in sys.path:
+    sys.path.insert(0, _BIN_DIR)
+from feishu_post import post_content  # noqa: E402
+
+HOME = Path.home()
+CONF = HOME / ".agent-autoloop" / "feishu.json"
+STATE = HOME / ".agent-autoloop" / "feishu-hub-state.json"
+LOG = HOME / ".agent-autoloop" / "logs" / "feishu-hub.log"
+CLAW = Path("/Users/guan/WorkBuddy/Claw")
+REPORT_DIR = CLAW / "output" / "inspection-daily"
+API = "https://open.feishu.cn/open-apis"
+COMMANDS = ["重试", "群总结", "协同", "重推日报", "季报", "月报", "周报",
+            "状态", "巡检", "待办", "日报"]
+# 「群总结/协同」置顶：显式派活指令优先；长问题里常带「状态/日报」等泛词。
+# 周期报告词与「重推日报」都在「日报」前，防子串抢匹配。
+LAST_TEXT = ""  # 供 cmd_collab 取群消息原文（handle 内赋值）
+
+
+def log(msg):
+    LOG.parent.mkdir(parents=True, exist_ok=True)
+    with LOG.open("a") as f:
+        f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    print(msg)
+
+
+def load_conf():
+    if not CONF.exists():
+        log(f"[ERR] 配置缺失: {CONF}")
+        sys.exit(1)
+    return json.loads(CONF.read_text())
+
+
+def token(conf):
+    req = urllib.request.Request(
+        f"{API}/auth/v3/tenant_access_token/internal",
+        data=json.dumps({"app_id": conf["app_id"], "app_secret": conf["app_secret"]}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    d = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    if d.get("code") != 0:
+        log(f"[ERR] token: {d}")
+        sys.exit(1)
+    return d["tenant_access_token"]
+
+
+def api(method, path, tk, data=None, params=None):
+    url = API + path + ("?" + urllib.parse.urlencode(params) if params else "")
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(data).encode() if data is not None else None,
+        headers={"Authorization": f"Bearer {tk}", "Content-Type": "application/json"},
+        method=method,
+    )
+    return json.loads(urllib.request.urlopen(req, timeout=20).read())
+
+
+_SECRET_PATTERNS = [
+    # 顺序有意义：更具体的必须排在更宽的前面（sk-ant- 若排在 sk- 之后会被吞成 OPENAI_KEY，
+    # 拦是拦住了但类型错，归因时会误导——2026-11-14 测试发现）。
+    ("PRIVATE_KEY", re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----")),
+    ("GITHUB_TOKEN", re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}")),
+    ("ANTHROPIC_KEY", re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{20,}")),
+    ("OPENAI_KEY", re.compile(r"\bsk-(?!ant-)[A-Za-z0-9_\-]{20,}")),
+    ("AWS_AKID", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("SLACK_TOKEN", re.compile(r"\bxox[baprs]-[A-Za-z0-9\-]{10,}")),
+    ("BEARER", re.compile(r"\bBearer\s+[A-Za-z0-9._\-]{20,}")),
+]
+
+
+def scan_secret(text: str) -> str | None:
+    """出站内容疑似凭据检测（2026-11-14 审计：send 原样外发，构成读密钥→回群链路）。
+
+    只匹配有固定形态的凭据；**不拦长 hash / 长数字**（报告里常见，误杀会废掉正常播报）。
+    返回命中的类型名，未命中返回 None。
+    """
+    for name, pat in _SECRET_PATTERNS:
+        if pat.search(text):
+            return name
+    return None
+
+
+def send(conf, tk, text):
+    """四段骨架报告自动渲染成 post 富文本（text 消息不渲染 markdown 表格）。
+
+    出口过滤（2026-11-14）：命中疑似凭据时不发原文，改发固定提示并记审计，
+    避免「读到密钥 → 写进回复 → 发群」这条链路真的走通。
+    """
+    hit = scan_secret(text)
+    if hit:
+        log(f"[SECRET-BLOCK] 出站内容命中疑似凭据 {hit}，已拦截原文，长度 {len(text)}")
+        text = (f"[中台] 本次回复疑似包含凭据（{hit}），已拦截未发送。\n"
+                f"如需该内容请从本机日志或产物文件查看，勿经群通道传输。")
+    is_report = text.startswith("【盘面信息·")
+    body = {"receive_id": conf["chat_id"],
+            "msg_type": "post" if is_report else "text",
+            "content": (post_content(text) if is_report
+                        else json.dumps({"text": text}, ensure_ascii=False))}
+    d = api("POST", "/im/v1/messages?receive_id_type=chat_id", tk, body)
+    if d.get("code") != 0 and is_report:
+        log(f"[WARN] post 发送失败 code={d.get('code')}，降级纯文本")
+        d = api("POST", "/im/v1/messages?receive_id_type=chat_id", tk,
+                {"receive_id": conf["chat_id"], "msg_type": "text",
+                 "content": json.dumps({"text": text}, ensure_ascii=False)})
+    if d.get("code") != 0:
+        log(f"[ERR] send: {d}")
+        return False
+    return True
+
+
+def read_state():
+    return json.loads(STATE.read_text()) if STATE.exists() else {"seen": [], "last_brief": ""}
+
+
+def save_state(s):
+    s["seen"] = s["seen"][-200:]  # 只保留最近 200 条幂等记录
+    STATE.write_text(json.dumps(s, ensure_ascii=False))
+
+
+def run_cmd(argv, timeout=90):
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=str(CLAW))
+        return p.stdout.strip(), p.returncode
+    except subprocess.TimeoutExpired:
+        return "(命令超时)", 124
+    except Exception as e:
+        return f"(命令异常: {e})", 1
+
+
+THROTTLE = Path.home() / ".agent-autoloop" / "retry-throttle.json"
+
+
+def _retry_throttled(tid: str, minutes: int = 5) -> bool:
+    """同一任务编号 5 分钟内只受理一次重试（审计 R6：原实现无节流，连点会多次派活）。"""
+    import time
+    now = time.time()
+    try:
+        d = json.loads(THROTTLE.read_text(encoding="utf-8"))
+    except Exception:
+        d = {}
+    d = {k: v for k, v in d.items() if now - v < 86400}
+    last = d.get(tid, 0)
+    if now - last < minutes * 60:
+        return True
+    d[tid] = now
+    try:
+        THROTTLE.parent.mkdir(parents=True, exist_ok=True)
+        THROTTLE.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+    return False
+
+
+def cmd_retry():
+    """重试指定任务：从群消息解析任务编号，emit triage.work 派实做轮。
+
+    编号必须在 QUEUE 里真实存在（防伪造编号派活）；无编号则重派最老 AI 研判待办。
+    """
+    import re as _re
+    t = LAST_TEXT or ""
+    m = _re.search(r"T-(?:INS-[0-9a-f]{12}|\d{3}(?!\d))", t)
+    tid = m.group(0) if m else ""
+    queue = ""
+    try:
+        queue = (CLAW / ".autopilot" / "QUEUE.md").read_text(encoding="utf-8")
+    except Exception:
+        pass
+    if tid and f"{tid} ·" not in queue and tid not in queue:
+        return (f"【重试】编号 {tid} 不在 QUEUE.md 里，拒绝派活（防伪造）。"
+                "先发「待办」查当前清单。")
+    if tid and _retry_throttled(tid):
+        return (f"【重试】{tid} 5 分钟内已受理过，本次不再派活（防连点重复）。"
+                "如仍要重跑，等 5 分钟后再发，或发「状态」查看当前进度。")
+    subject = f"retry-{tid or 'oldest'}-{datetime.now():%H%M%S}"
+    detail = f"本轮优先任务（用户群指令重试）: {tid}" if tid else "重派最老的群消息 AI 研判待办"
+    r = run_cmd(["/Users/guan/.local/bin/agent-autoloop", "emit", "triage.work",
+                 "--subject", subject,
+                 "--summary", f"群指令重试 {tid or '最老研判待办'}",
+                 "--detail", detail])
+    if r[1] != 0:
+        return f"【重试】emit 失败 rc={r[1]}: {r[0][:150]}（不影响轮次台账）"
+    return (f"【重试】已受理：{tid or '最老 AI 研判待办'} 已派实做轮，"
+            "完成后推轮次回执卡片；用「状态」查进度。")
+
+
+def cmd_status():
+    out, rc = run_cmd(["git", "log", "--oneline", "-3"], 20)
+    rules = json.loads((HOME / ".agent-autoloop" / "rules.json").read_text())
+    runs = sorted((HOME / ".agent-autoloop" / "worker" / "runs").glob("*-*"),
+                  key=lambda p: p.stat().st_mtime, reverse=True)[:3]
+    today = datetime.now().strftime("%Y-%m-%d")
+    sched = "；".join(
+        f"{x['name']} {x['when'].get('cron') or '事件触发'}" for x in rules["rules"]
+    )
+    return (f"【中台状态 {datetime.now():%m-%d %H:%M}】\n"
+            f"· 规则 {len(rules['rules'])} 条：{sched}\n"
+            f"· 最近 3 次 run: {', '.join(p.name for p in runs) or '无'}\n"
+            f"· 今日日报: {'已生成' if (REPORT_DIR / f'{today}.md').exists() else '未生成（17:10 后出）'}\n"
+            f"· Claw 最近 3 提交:\n{out or '(取不到)'}")
+
+
+def cmd_inspect():
+    out, rc = run_cmd(["python3", str(CLAW / "scripts" / "inspection_report.py"), "--json"])
+    if rc != 0:
+        return f"【巡检】脚本失败 rc={rc}: {out[:200]}\n（不自行编数，请查日志）"
+    try:
+        d = json.loads(out)
+        cov = d.get("coverage", {})
+        return (f"【实时巡检 {d.get('generated_at','?')}】\n"
+                f"· 覆盖度: {json.dumps(cov, ensure_ascii=False)[:220]}\n"
+                f"· 近24h失败 {len(d.get('failures', []))} 条 | 限流 {len(d.get('rate_limited', []))} 条 | "
+                f"需人工 {len(d.get('needs_human', []))} 条\n"
+                f"· 疑似漏跑 {len(d.get('missed', {}).get('疑似真漏跑', []))} 条\n"
+                f"（数值均来自脚本 JSON，未另算）")
+    except Exception as e:
+        return f"【巡检】JSON 解析失败: {e}（原文前 200 字：{out[:200]}）"
+
+
+def cmd_daily():
+    today = datetime.now().strftime("%Y-%m-%d")
+    p = REPORT_DIR / f"{today}.md"
+    if not p.exists():
+        return f"【日报 {today}】尚未生成（中台 17:10 触发、17:40 自动推送）"
+    text = p.read_text(encoding="utf-8")
+    return f"【日报 {today} 摘要】\n{text[:900]}{'…（全文见群内推送）' if len(text) > 900 else ''}"
+
+
+def cmd_todo():
+    q = (CLAW / "docs" / "open-questions.md").read_text(encoding="utf-8")
+    heads = [l.strip() for l in q.splitlines() if l.startswith("### Q-")]
+    blocked = [h for h in heads[:6]]
+    others = [h for h in heads[6:]]
+    return ("【未决项】\n■ 阻塞 6 项:\n" + "\n".join(blocked[:6]) +
+            "\n■ 不阻塞:\n" + "\n".join(others[:7]) +
+            "\n■ 用户侧: 方案B下单(已跳过) / 588170建仓日(已回填10-09) / 实盘快照(11-10已盖章) / Q-12 P3-1(MCP接入待决策)" +
+            "\n（只读清单；高影响动作只给建议，不代执行）")
+
+
+def cmd_repush(conf, tk):
+    today = datetime.now().strftime("%Y-%m-%d")
+    out, rc = run_cmd([str(HOME / ".local" / "bin" / "autoloop-feishu-push.py"),
+                       "--date", today, "--force"], 30)
+    return f"【重推日报】rc={rc}\n{out[:200]}"
+
+
+def cmd_digest(period="day"):
+    """群内「群总结/周报/月报/季报」→ 现场生成对应周期报告（只读取数 + 模型归纳，不发群）。"""
+    label = {"day": "群总结", "week": "周报", "month": "月报", "quarter": "季报"}[period]
+    py = str(HOME / ".workbuddy" / "binaries" / "python" / "versions" /
+             "3.13.12" / "bin" / "python3")
+    out, rc = run_cmd(
+        [py, str(CLAW / "scripts" / "feishu_daily_digest.py"),
+         "--dry-run", "--period", period], 300)
+    if rc != 0 or not out.strip():
+        return f"【{label}】生成失败 rc={rc}：{out[:200]}"
+    return out
+
+
+def cmd_collab():
+    """群内「协同」→ 把群消息原文塞进事件，触发中台内核的 emits 双角色链。"""
+    import time
+    subject = f"collab-{int(time.time())}"
+    raw = (LAST_TEXT or "（群里未附具体问题）").replace("\n", " ").strip()[:400]
+    out, rc = run_cmd(
+        [str(HOME / ".local" / "bin" / "agent-autoloop"), "emit", "chain.start",
+         "--subject", subject, "--summary", raw, "--detail", raw], 30,
+    )
+    return (f"【协同已受理】群消息原文已交给中台双角色链（诊断 → 复核）。\n"
+            f"· 问题: {raw[:100]}\n· 事件: chain.start / {subject}\n"
+            f"· 内核回执: {out or '(无输出)'} rc={rc}\n"
+            f"· 诊断结论落盘 `output/collab/{subject}.md`，复核后发回本群")
+
+
+def handle(text, conf, tk):
+    global LAST_TEXT
+    LAST_TEXT = text
+    t = text.strip()
+    # 长文本（自动化卡片/长问题）只在开头 30 字内认指令，防正文里出现「状态/日报」误命中；
+    # 但「协同」是显式派活指令，长问题里出现时始终受理。
+    scope = t[:30] if len(t) > 80 else t
+    for name in COMMANDS:
+        if name in scope or (name == "协同" and name in t):
+            fn = {"重试": cmd_retry, "状态": cmd_status, "巡检": cmd_inspect, "日报": cmd_daily,
+                  "待办": cmd_todo, "重推日报": lambda: cmd_repush(conf, tk),
+                  "协同": cmd_collab,
+                  "群总结": lambda: cmd_digest("day"),
+                  "周报": lambda: cmd_digest("week"),
+                  "月报": lambda: cmd_digest("month"),
+                  "季报": lambda: cmd_digest("quarter")}[name]
+            return name, fn()
+    return None, None
+
+
+def brief(conf, tk):
+    """每日值班简报：未决项 + 昨日异常 + 今日调度（主动推动，不依赖群指令）"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    lines = [f"【中台值班简报 {today} 09:00】", "", "■ 今日调度",
+             "· 12:30 / 17:30 / 21:30 项目自动驾驶｜17:10 巡检日报｜17:40 日报推本群", "",
+             "■ 未决项（只读）"]
+    q = (CLAW / "docs" / "open-questions.md").read_text(encoding="utf-8")
+    heads = [l.strip() for l in q.splitlines() if l.startswith("### Q-")]
+    lines += heads[:6]
+    lines += ["", "■ 昨日产物"]
+    y = REPORT_DIR / f"{today}.md"
+    lines.append(f"· 今日日报: {'已生成' if y.exists() else '待 17:10 生成'}")
+    lines += ["", "■ 群内指令（@中台 + 关键词）",
+              "群总结(群日报) / 周报 / 月报 / 季报 / 协同 / 重试 <任务编号> / 状态 / 巡检 / 日报(巡检摘要) / 待办 / 重推日报",
+              "", "· 中台只做只读与播报；交易、改账本、审批落库不代执行"]
+    ok = send(conf, tk, "\n".join(lines))
+    log(f"brief {'OK' if ok else 'FAIL'}")
+    return ok
+
+
+def poll(conf, tk):
+    state = read_state()
+    # 权限缺失时优雅降级：不刷屏、不报错，等待用户加 scope
+    params = {"container_id_type": "chat", "container_id": conf["chat_id"],
+              "sort_type": "ByCreateTimeDesc", "page_size": 10}
+    url = API + "/im/v1/messages?" + urllib.parse.urlencode(params)
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {tk}"})
+    try:
+        d = json.loads(urllib.request.urlopen(req, timeout=20).read())
+    except urllib.error.HTTPError as e:
+        # 飞书把权限不足包成 HTTP 400，业务码在 body 里
+        try:
+            d = json.loads(e.read())
+        except Exception:
+            log(f"[WARN] 拉消息 HTTP {e.code}（无可读 body）")
+            return
+    except Exception as e:
+        log(f"[WARN] 拉消息异常: {e}")
+        return
+    if d.get("code") == 230027:
+        log("[SKIP] 缺 im:message.group_msg 权限，指令通道待批（简报/推送不受影响）")
+        state["last_poll_status"] = "denied"
+        save_state(state)
+        return
+    if d.get("code") != 0:
+        log(f"[WARN] 拉消息 code={d.get('code')}: {d.get('msg')}")
+        return
+    if state.get("last_poll_status") != "ok":
+        log("[POLL OK] 指令通道已生效（im:message.group_msg）")
+        state["last_poll_status"] = "ok"
+        save_state(state)
+    items = (d.get("data") or {}).get("items", [])
+    # 只处理最近 2 小时消息：防首次启动把历史消息里的关键词误当指令
+    cutoff = int(time.time()) - 7200
+    processed = 0
+    for m in reversed(items):
+        mid = m.get("message_id", "")
+        if mid in state["seen"]:
+            continue
+        # 2026-11-14 审计修复：seen 只在「确认不必再处理」时记录。
+        # 旧实现进循环就 append，导致 send 失败后该 mid 永久标记已处理 → 静默丢消息
+        # （桥接未接管、回退到本通道时生效）。现在发送失败不记 seen，下一拍重试。
+        try:
+            created = int(m.get("create_time", 0)) // 1000
+        except (TypeError, ValueError):
+            created = 0
+        if created and created < cutoff:
+            state["seen"].append(mid)
+            continue
+        sender_type = (m.get("sender") or {}).get("sender_type", "")
+        if sender_type == "app":  # 不回自己的消息，防回环
+            state["seen"].append(mid)
+            continue
+        body = (m.get("body") or {}).get("content", "")
+        # 桥接激活时群指令全权交给 feishu-event-bridge.py。
+        # 必须连 handle 都不调用：「协同」的 emit 副作用在 handle 内，只挡 send 会重复派活。
+        # 删掉 ~/.agent-autoloop/feishu-bridge-active 即回退到轮询回复（可能重放近 2 小时消息一次）。
+        if (HOME / ".agent-autoloop" / "feishu-bridge-active").exists():
+            state["seen"].append(mid)
+            continue
+        try:
+            text = json.loads(body).get("text", "")
+        except Exception:
+            text = body
+        name, reply = handle(text, conf, tk)
+        if name and reply:
+            if send(conf, tk, reply):
+                state["seen"].append(mid)
+                log(f"CMD {name} <- {text[:40]} | reply {len(reply)} chars | mid={mid[:16]}")
+                processed += 1
+            else:
+                log(f"[DELIVER-FAIL] {name} 回执发送失败，本拍不记 seen，下轮重试 | mid={mid[:16]}")
+        else:
+            state["seen"].append(mid)  # 无指令可回，归档不再重复扫描
+    save_state(state)
+    if processed:
+        log(f"poll 处理 {processed} 条指令")
+
+
+def main():
+    conf = load_conf()
+    tk = token(conf)
+    args = sys.argv[1:]
+    if "--brief" in args:
+        brief(conf, tk)
+        return
+    poll(conf, tk)
+    # 09:00 主动简报（幂等：当日已发则不重发）
+    if datetime.now().hour == 9:
+        s = read_state()
+        today = datetime.now().strftime("%Y-%m-%d")
+        if s.get("last_brief") != today and brief(conf, tk):
+            s["last_brief"] = today
+            save_state(s)
+
+
+if __name__ == "__main__":
+    main()

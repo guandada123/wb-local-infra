@@ -1,0 +1,120 @@
+#!/bin/zsh
+# ============================================================
+# memwatch_verify.sh — memwatch 优雅退出链受控重启验证 (2026-08-05)
+#
+# 目的: 验证新优雅退出链(AppleScript quit→轮询→TERM→KILL兜底)下,
+#       重启后 UI 对话数据能否完整恢复 (修复"重启后对话消失"问题)。
+#
+# 流程: 记录基线 → 注入低阈值(RSS_RESTART_MB=500)重载守护 → 等待真实重启
+#       → 恢复阈值 → 检查退出链日志 + 会话恢复指标 → 飞书推送报告
+#
+# 安全: 独立 zsh 进程(不受 WorkBuddy 重启影响); trap EXIT 兜底恢复阈值;
+#       plist 操作前后备份; 全程只读探测 + 阈值注入, 不碰对话数据。
+# ============================================================
+
+PLIST="$HOME/Library/LaunchAgents/com.workbuddy.memwatch.plist"
+PLIST_BAK="/tmp/memwatch_verify_plist.bak"
+MEMLOG="$HOME/Library/Logs/workbuddy_memwatch.log"
+RENDERER="$HOME/Library/Logs/WorkBuddy/renderer.log"
+SF="$HOME/.workbuddy/app/sessions.json"
+REPORT="/tmp/memwatch_verify_report.txt"
+CARD="$HOME/WorkBuddy/Claw/.workbuddy/scripts/push_card.py"
+CHAT="oc_9ee5303497f5e0e71666b610d6bdc346"
+
+log(){ echo "[$(date '+%F %T')] $*" | tee -a "$REPORT"; }
+push(){ [ -x "$CARD" ] && "$CARD" --title "$1" --level "${2:-info}" --section "验证详情" "$3" --chat-id "$CHAT" >/dev/null 2>&1 & }
+
+# 兜底恢复(脚本异常退出时也必须恢复正式守护, 防无监控空窗)
+restore(){
+  launchctl bootstrap gui/$(id -u) "$PLIST" 2>/dev/null \
+    || launchctl load "$PLIST" 2>/dev/null \
+    || launchctl kickstart -k gui/$(id -u)/com.workbuddy.memwatch 2>/dev/null
+  log "[恢复] 正式守护已恢复(bootstrap)"
+}
+trap 'restore' EXIT
+
+# 主进程 PID (与 memwatch 同口径: 排除子进程特征)
+main_pid(){
+  ps -axo pid=,command= | awk '/WorkBuddy\.app\/Contents\/MacOS\/Electron([[:space:]]|$)/ && !/(--serve|--prewarm|daemon-app-server-entry|sidecar-entry|--require)/ {print $1}' | head -1
+}
+
+: > "$REPORT"
+log "========== memwatch 受控重启验证开始 =========="
+# 自清理: 删除一次性验证 LaunchAgent plist (防二次加载; 本脚本由 launchd 托管时生效)
+rm -f "$HOME/Library/LaunchAgents/com.workbuddy.memwatch-verify.plist" 2>/dev/null
+
+# 0) 基线
+BEFORE_N=$(grep -c '"conversationId"' "$SF" 2>/dev/null || true); BEFORE_N=${BEFORE_N:-0}
+BEFORE_PID=$(main_pid)
+BASE_LINES=$(wc -l < "$MEMLOG" 2>/dev/null | tr -d ' ')
+cp -p "$PLIST" "$PLIST_BAK"
+log "基线: sessions会话数=$BEFORE_N 主进程PID=$BEFORE_PID memwatch日志行数=$BASE_LINES"
+push "🔄 memwatch 受控重启验证启动" "info" "基线会话数=$BEFORE_N, 即将触发一次真实重启(约1-2分钟)"
+
+# 1) 触发由 launchd 直接托管 (plist: com.workbuddy.memwatch-trigger), 本脚本只做监控
+#    2026-08-05 修正: 本脚本 fork 的触发实例会在 agent 回合结束时被清理,
+#    必须由 launchd 直接启动触发实例 (独立于任何 agent 回合生命周期)。
+log "触发实例由 launchd 托管 (RSS_RESTART_MB=500), 开始监控..."
+sleep 2
+
+# 2) 等待触发 (最多 90s: 采样10s×2确认 + 缓冲)
+TRIG=""; T=0
+while (( T < 90 )); do
+  TRIG=$(tail -n +$((BASE_LINES+1)) "$MEMLOG" 2>/dev/null | grep "触发重启" | tail -1)
+  [ -n "$TRIG" ] && break
+  sleep 3; T=$((T+3))
+done
+if [ -z "$TRIG" ]; then
+  log "!! 90s 内未检测到触发, 中止验证"
+  push "🔄 memwatch 验证中止" "warn" "90s 内未检测到重启触发"
+  exit 1
+fi
+log "触发确认: $TRIG"
+
+# 3) 等待重启完成 (新主进程 + 日志"重启成功", 最多 180s)
+OK=""; T=0
+while (( T < 180 )); do
+  OK=$(tail -n +$((BASE_LINES+1)) "$MEMLOG" 2>/dev/null | grep "重启成功" | tail -1)
+  [ -n "$OK" ] && break
+  sleep 5; T=$((T+5))
+done
+NEW_PID=$(main_pid)
+if [ -n "$OK" ]; then log "重启完成: $OK 新主进程PID=$NEW_PID"; else log "!! 180s 未确认重启成功(新主进程PID=$NEW_PID), 继续检查"; fi
+
+# 4) 恢复正式守护 (bootstrap 重新加载 plist)
+restore
+
+# 5) 等待 app 加载会话
+log "等待 75s 让 app 完成会话加载..."
+sleep 75
+
+# 6) 退出链日志 (本次重启段)
+log "=== 退出链日志(本次) ==="
+tail -n +$((BASE_LINES+1)) "$MEMLOG" 2>/dev/null | grep -E "优雅退出|AppleScript quit|降级|清理残留|KILL -9|TERM" | tail -8 >> "$REPORT"
+
+# 7) 对话恢复指标
+AFTER_N=$(grep -c '"conversationId"' "$SF" 2>/dev/null || true); AFTER_N=${AFTER_N:-0}
+LC=$(grep -o '"conversations":[0-9]*' "$RENDERER" 2>/dev/null | tail -1)
+MIG_MT=$(stat -f "%Sm" "$HOME/.workbuddy/desktop_conversation_migrated" 2>/dev/null)
+log "=== 对话恢复检查 ==="
+log "sessions.json 会话数: 重启前=$BEFORE_N 重启后=$AFTER_N"
+log "renderer 最新 listConversations: ${LC:-未找到}"
+log "desktop_conversation_migrated mtime: ${MIG_MT}"
+
+# 8) 判定
+PASS=1
+(( AFTER_N < BEFORE_N * 9 / 10 )) && PASS=0
+echo "$LC" | grep -qE '"conversations":[0-9]{3,}' || PASS=0
+if (( PASS )); then
+  RES="PASS"
+  log "判定: PASS — 对话数据完整恢复($AFTER_N 会话)"
+  push "✅ memwatch 受控重启验证 PASS" "info" "会话数 $BEFORE_N→$AFTER_N | $LC"
+else
+  RES="FAIL"
+  log "判定: FAIL — 对话数据未完整恢复"
+  push "🔴 memwatch 受控重启验证 FAIL" "alert" "会话数 $BEFORE_N→$AFTER_N | $LC"
+fi
+
+log "========== 验证结束: $RES =========="
+log "报告: $REPORT"
+exit 0

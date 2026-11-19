@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>COST_OPS_SHARED_ENABLED</key>
+		<string>true</string>
+		<key>THINK_BUDGET</key>
+		<string>off</string>
+	</dict>
+	<key>KeepAlive</key>
+	<true/>
+	<key>Label</key>
+	<string>com.workbuddy.proxy-deepseek</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+		<string>/Users/guan/.workbuddy/proxy-deepseek.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/tmp/proxy-deepseek.stderr.log</string>
+	<key>StandardOutPath</key>
+	<string>/tmp/proxy-deepseek.stdout.log</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/guan/.workbuddy</string>
+</dict>
+</plist>

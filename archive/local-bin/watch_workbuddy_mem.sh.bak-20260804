@@ -1,0 +1,202 @@
+#!/bin/zsh
+# ============================================================
+# watch_workbuddy_mem.sh — WorkBuddy 内存自愈守护 (Mac Mini M4 16G)
+#
+# 双通道触发(连续 SUSTAIN 次采样均满足才动作, 防误杀):
+#   A) WorkBuddy 进程树自身总内存 > RSS_RESTART_MB   (默认 6000MB, 主通道: 治泄漏)
+#   B) 整机可用内存 < SYS_CRIT_AVAILABLE_MB           (默认 512MB, 用户原始诉求: 治标)
+#      或系统内存压力等级 >= 4(critical)
+#      → B 通道同时要求 WB 树内存 > RSS_FLOOR_MB(默认 800MB, 避免重启"无辜"的空闲应用)
+#
+# 安全护栏:
+#   - SUSTAIN 连续确认 / COOLDOWN_SEC 冷却 / 30 分钟内最多 MAX_RESTARTS_30MIN 次
+#   - 精确 PID 定位, 先 TERM 优雅退出, 再 KILL 残留; 重启后回读验证新主进程
+#   - 绝不使用 pkill -f "WorkBuddy" 模糊匹配 (会误杀 sidecar 对话载体)
+#   - --dry-run 只测量打印, 不执行任何 kill
+#
+# 用法: watch_workbuddy_mem.sh [--dry-run] [--oneshot]
+# 环境变量可在 launchd plist 中覆盖: WATCH_INTERVAL/SUSTAIN/RSS_RESTART_MB/
+#     SYS_CRIT_AVAILABLE_MB/RSS_FLOOR_MB/COOLDOWN_SEC/MAX_RESTARTS_30MIN/LOG_FILE
+# ============================================================
+
+: "${WATCH_INTERVAL:=10}"
+: "${SUSTAIN:=2}"
+: "${RSS_RESTART_MB:=6000}"
+: "${SYS_CRIT_AVAILABLE_MB:=512}"
+: "${RSS_FLOOR_MB:=800}"
+: "${COOLDOWN_SEC:=300}"
+: "${MAX_RESTARTS_30MIN:=2}"
+: "${LOG_FILE:=$HOME/Library/Logs/workbuddy_memwatch.log}"
+
+DRY_RUN=0; ONESHOT=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY_RUN=1 ;;
+    --oneshot) ONESHOT=1 ;;
+  esac
+done
+
+PAGE_SIZE=$(sysctl -n hw.pagesize)
+
+log(){ echo "[$(date '+%F %T')] $*" >> "$LOG_FILE"; }
+
+trim_log(){
+  local size
+  size=$(stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+  if (( size > 5242880 )); then
+    tail -n 500 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+  fi
+}
+
+# ---- 互斥锁(防止 launchd KeepAlive 与手动运行叠加) ----
+LOCK_DIR="/tmp/workbuddy_memwatch.lock"
+if ! mkdir "$LOCK_DIR" 2>/dev/null; then
+  if [ -f "$LOCK_DIR/pid" ]; then
+    oldpid=$(cat "$LOCK_DIR/pid" 2>/dev/null)
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "[$(date '+%F %T')] 已有实例 PID=$oldpid 在运行, 退出" >> "$LOG_FILE"
+      exit 0
+    fi
+  fi
+  rmdir "$LOCK_DIR" 2>/dev/null   # 陈旧锁, 清掉
+  mkdir "$LOCK_DIR" 2>/dev/null || { echo "[$(date '+%F %T')] 无法获取锁" >> "$LOG_FILE"; exit 1; }
+fi
+echo $$ > "$LOCK_DIR/pid"
+trap 'rm -f "$LOCK_DIR/pid"; rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+# ---- 采集函数 ----
+# WorkBuddy 进程树: 命令行含 WorkBuddy.app 的进程, 输出 "pid rss_kb"
+wb_procs(){
+  ps -axo pid=,rss=,command= | awk '/WorkBuddy\.app/ && !/watch_workbuddy_mem/ {print $1, $2}'
+}
+# 进程树总内存 MB
+wb_total_mb(){
+  local t=0 r
+  while read -r _p r; do
+    r=${r:-0}
+    t=$(( t + r ))
+  done < <(wb_procs)
+  echo $(( t / 1024 ))
+}
+# 整机可用内存 MB (free+inactive+speculative+purgeable, 苹果可回收口径)
+sys_available_mb(){
+  local vm f i s p
+  vm=$(vm_stat)
+  f=$(echo "$vm" | awk '/Pages free/       {print $3}' | tr -d '.')
+  i=$(echo "$vm" | awk '/Pages inactive/   {print $3}' | tr -d '.')
+  s=$(echo "$vm" | awk '/Pages speculative/{print $3}' | tr -d '.')
+  p=$(echo "$vm" | awk '/Pages purgeable/  {print $3}' | tr -d '.')
+  echo $(( (f + i + s + p) * PAGE_SIZE / 1048576 ))
+}
+# 系统内存压力等级: 1=normal 2=warn 4=critical
+sys_pressure_level(){ sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 0; }
+# WorkBuddy 主进程 PID (cmdline 精确以 .../Contents/MacOS/Electron 结尾, 无参数)
+wb_main_pids(){
+  ps -axo pid=,command= | awk '/WorkBuddy\.app\/Contents\/MacOS\/Electron$/ {print $1}'
+}
+
+# ---- 重启动作 ----
+do_restart(){
+  local reason="$1" now mainpids remaining newpids
+  now=$(date +%s)
+
+  # 冷却
+  if (( now - LAST_RESTART < COOLDOWN_SEC )); then
+    log "== 冷却期内(距上次重启 $((now-LAST_RESTART))s < ${COOLDOWN_SEC}s), 跳过"
+    return
+  fi
+  # 30 分钟窗口内次数上限
+  local cutoff=$(( now - 1800 )) n=0
+  for ts in "${RESTART_HISTORY[@]}"; do
+    (( ts > cutoff )) && ((n++))
+  done
+  if (( n >= MAX_RESTARTS_30MIN )); then
+    log "== 30 分钟内已重启 ${n} 次, 进入 30min 冷静期"
+    sleep 1800
+    return
+  fi
+  RESTART_HISTORY+=("$now")
+
+  log "==> 触发重启($reason): WB树=${WB_MB}MB 整机可用=${SYS_MB}MB 压力等级=${LVL} dry_run=${DRY_RUN}"
+  if (( DRY_RUN )); then
+    log "    [dry-run] 以上为将执行的重启动作, 未做任何操作"
+    return
+  fi
+
+  # 1) 优雅 TERM 主进程 (Electron 主进程收到 SIGTERM 自行收尾)
+  mainpids=($(wb_main_pids))
+  if (( ${#mainpids[@]} == 0 )); then
+    log "!! 未找到 WorkBuddy 主进程, 中止重启"
+    return 1
+  fi
+  log "    优雅退出主进程: ${mainpids[*]}"
+  kill -TERM "${mainpids[@]}" 2>/dev/null
+  sleep 8
+
+  # 2) 清理残留 (含被孤儿化的 sidecar/会话 —— 用户明确要求"关闭并重启", 属刻意全树重启)
+  remaining=($(wb_procs | awk '{print $1}'))
+  if (( ${#remaining[@]} > 0 )); then
+    log "    清理残留进程: ${remaining[*]}"
+    kill "${remaining[@]}" 2>/dev/null
+    sleep 3
+    remaining=($(wb_procs | awk '{print $1}'))
+    (( ${#remaining[@]} > 0 )) && kill -9 "${remaining[@]}" 2>/dev/null
+  fi
+  sleep 2
+
+  # 3) 验证已退出 (验证回读: 观察≠完成)
+  remaining=($(wb_procs | awk '{print $1}'))
+  if (( ${#remaining[@]} > 0 )); then
+    log "!! 仍有残留进程 ${remaining[*]} 无法退出, 放弃重启"
+    return 1
+  fi
+
+  # 4) 重启 + 回读验证新主进程
+  open -a WorkBuddy 2>/dev/null || open "$HOME/Desktop/WorkBuddy.app" 2>/dev/null
+  sleep 12
+  newpids=($(wb_main_pids))
+  if (( ${#newpids[@]} > 0 )); then
+    log "==> 重启成功, 新主进程 PID: ${newpids[*]}"
+    sleep 60   # 启动保护期
+  else
+    log "!! 重启失败: open 后未检测到新主进程"
+  fi
+}
+
+# ---- 主循环 ----
+LAST_RESTART=0
+RESTART_HISTORY=()
+streak=0
+log "监控启动: interval=${WATCH_INTERVAL}s sustain=${SUSTAIN} rss_thr=${RSS_RESTART_MB}MB sys_crit=${SYS_CRIT_AVAILABLE_MB}MB floor=${RSS_FLOOR_MB}MB cooldown=${COOLDOWN_SEC}s max30m=${MAX_RESTARTS_30MIN} dry_run=${DRY_RUN} $(zsh --version | head -1)"
+
+while true; do
+  WB_MB=$(wb_total_mb)
+  SYS_MB=$(sys_available_mb)
+  LVL=$(sys_pressure_level)
+
+  trigger=0; reason=""
+  if (( WB_MB > RSS_RESTART_MB )); then
+    trigger=1; reason="WB树 ${WB_MB}MB > ${RSS_RESTART_MB}MB"
+  elif (( SYS_MB < SYS_CRIT_AVAILABLE_MB && WB_MB > RSS_FLOOR_MB )); then
+    trigger=1; reason="整机可用 ${SYS_MB}MB < ${SYS_CRIT_AVAILABLE_MB}MB 且 WB=${WB_MB}MB"
+  elif (( LVL >= 4 && WB_MB > RSS_FLOOR_MB )); then
+    trigger=1; reason="压力等级 ${LVL}(critical) 且 WB=${WB_MB}MB"
+  fi
+
+  if (( trigger )); then
+    ((streak++))
+    log "候选 ${streak}/${SUSTAIN}: ${reason}"
+    if (( streak >= SUSTAIN )); then
+      streak=0
+      do_restart "$reason"
+    fi
+  else
+    (( streak > 0 )) && log "候选解除"
+    streak=0
+  fi
+
+  (( ONESHOT )) && break
+  sleep "$WATCH_INTERVAL"
+  trim_log
+done
+exit 0
