@@ -1,0 +1,301 @@
+#!/bin/bash
+# ============================================================
+# wb_health_check.sh — WorkBuddy 会话健康外部监管 (Marvis 侧)
+# 2026-08-12 建立: 绕开 WorkBuddy 自管自的盲区, 外部独立巡检
+#
+# 4 项检查:
+#   1) 会话数据完整性: 快照计数源(wb-404-watcher 日志) vs 滚动基线, 骤降告警(数据真丢失)
+#   2) UI 列表可用性:   edge-sync.log 出现 LIST failed 404 (历史对话消失前置信号)
+#   3) 窗口索引:        sessions.json 会话数<1 (memwatch 重启后未恢复)
+#   4) 守护存活:        memwatch / history-server 挂了自动拉起
+# 异常动作: 飞书卡片 + 写 Bridge 任务文件(claw/tasks/) + 触发 consumer 派发一次
+#
+# 用法: wb_health_check.sh [--dry-run]
+# 调度: launchd StartInterval=1800 (com.workbuddy.wb-health-check)
+# ============================================================
+set -uo pipefail
+
+# launchd 环境可能不注入 HOME (2026-08-12 实测: 首跑 jsonl=0/sessions空 全误报)
+export HOME="${HOME:-/Users/guan}"
+WB="$HOME/.workbuddy"
+
+DRY_RUN=0
+for a in "$@"; do [ "$a" = "--dry-run" ] && DRY_RUN=1; done
+
+BASE="$WB/projects"
+STATE_DIR="$HOME/.local/etc/wb_health"
+mkdir -p "$STATE_DIR"
+# 2026-11-13: 口径切换为「快照计数源」, 用独立基线文件; 旧 baseline/history(全 0)仅存档不再读取
+BASELINE_FILE="$STATE_DIR/baseline_snapshot"
+LAST404_FILE="$STATE_DIR/last404_ts"
+LOG="$HOME/Library/Logs/wb_health_check.log"
+CARD="$HOME/WorkBuddy/Claw/.workbuddy/scripts/push_card.py"
+
+log(){ echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+alert(){ log "⚠️ $*"; }
+[ "$DRY_RUN" = 1 ] && log "== [dry-run] 本轮只检测不告警不派发 =="
+
+B=0        # 当前基线(滚动后, 用于日志)
+B_JUDGE="" # 判定时刻的基线(告警展示用, 不随滚动变化)
+
+# ---- 1) 会话数据完整性 ----
+# 2026-11-07 修(四态): 原实现 find 计数=0 一律"探测异常, 跳过判断", 把「读不到」与
+#   「数据真丢光」混为一谈, 且 0 仍写 history → 永久失明。改为四态 + 仅 ok 滚动基线。
+# 2026-11-13 修(真源): launchd 以 /bin/bash 启动, 该二进制无 TCC 授权 → find 恒定
+#   "Operation not permitted"(11-07 09:11-11:11 五轮实锤)。四态修复做到「不静默」,
+#   但判据仍永远无效。改读现成计数, 不再碰受保护目录:
+#     com.workbuddy.wb-404-watcher 由**已授权 python** 常驻(KeepAlive), 每日 20:1x 调
+#     wb_history_snapshot.py 的 build_index() → glob(BASE/*/*.jsonl) 全量数一遍, 并把
+#     「N 会话」写进 ~/Library/Logs/wb_404_watcher.log。语义同源, 8 天实测与 HTML 头部一致。
+#   派生源三道闸门(缺一即判无效: 绝不记 0、绝不写基线、显式进 ISSUE):
+#     ① 日志存在且有「N 会话」行  ② 该行时间戳在 26h 内(每日保新 + 2h 余量)
+#     ③ 数字为正整数; 计数=0 视为「疑似全部丢失」, 不视为探测失败
+#   ⚠️ 已知代价: 源每日刷新一次 → 数据丢失最长 24h 后才反映(验收文档 §17 明示)。
+SNAP_LOG="$HOME/Library/Logs/wb_404_watcher.log"
+SNAP_MAX_AGE=93600          # 26h
+JSONL_COUNT=0
+JSONL_PROBE="ok"
+JSONL_FIND_ERR=""
+SNAP_TS=""
+SNAP_AGE=""
+if [ ! -f "$SNAP_LOG" ]; then
+  JSONL_PROBE="missing"
+else
+  SNAP_LINE=$(grep -E '快照已生成.*[0-9]+ 会话' "$SNAP_LOG" 2>/dev/null | tail -1)
+  if [ -z "$SNAP_LINE" ]; then
+    JSONL_PROBE="missing"
+  else
+    SNAP_TS=$(printf '%s\n' "$SNAP_LINE" | sed -nE 's/^\[([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2})\].*/\1/p')
+    SNAP_N=$(printf '%s\n' "$SNAP_LINE" | sed -nE 's/.*[^0-9]([0-9]+) 会话.*/\1/p')
+    if [ -z "$SNAP_TS" ] || [ -z "$SNAP_N" ]; then
+      JSONL_PROBE="unreadable"
+      JSONL_FIND_ERR="快照日志行无法解析: ${SNAP_LINE}"
+    else
+      SNAP_EPOCH=$(date -j -f '%Y-%m-%d %H:%M:%S' "$SNAP_TS" +%s 2>/dev/null || echo 0)
+      if [ "$SNAP_EPOCH" = "0" ]; then
+        JSONL_PROBE="unreadable"
+        JSONL_FIND_ERR="快照时间戳无法解析: ${SNAP_TS}"
+      else
+        SNAP_AGE=$(( $(date +%s) - SNAP_EPOCH ))
+        if [ "$SNAP_AGE" -gt "$SNAP_MAX_AGE" ] || [ "$SNAP_AGE" -lt 0 ]; then
+          JSONL_PROBE="stale"
+        else
+          JSONL_COUNT="$SNAP_N"
+          [ "$JSONL_COUNT" -eq 0 ] && JSONL_PROBE="empty"
+        fi
+      fi
+    fi
+  fi
+fi
+
+if [ "$JSONL_PROBE" != "ok" ]; then
+  JSONL_STAMP="$STATE_DIR/jsonl_probe_ts"
+  JN=$(date +%s); JL=0
+  [ -f "$JSONL_STAMP" ] && JL=$(cat "$JSONL_STAMP" 2>/dev/null || echo 0)
+  case "$JSONL_PROBE" in
+    missing)    JSONL_MSG="快照计数源缺失(${SNAP_LOG} 无有效记录) → 无法判断数据完整性" ;;
+    unreadable) JSONL_MSG="快照计数源解析失败: ${JSONL_FIND_ERR}" ;;
+    stale)      JSONL_MSG="快照计数源过期(源 ${SNAP_TS}, 距今 ${SNAP_AGE}s > ${SNAP_MAX_AGE}s) → wb-404-watcher 保新可能已停" ;;
+    empty)      JSONL_MSG="快照计数=0 且来源新鲜 → 疑似会话数据全部丢失(需人工确认)" ;;
+  esac
+  if [ $((JN - JL)) -gt 21600 ]; then
+    echo "$JN" > "$JSONL_STAMP"
+    alert "$JSONL_MSG"
+    ISSUE="${ISSUE:+$ISSUE + }会话数据探测异常(${JSONL_PROBE})"
+  else
+    log "== $JSONL_MSG (6h 冷却内, 不重复告警) =="
+  fi
+elif [ -f "$BASELINE_FILE" ]; then
+  B=$(cat "$BASELINE_FILE")
+  B_JUDGE="$B"
+  if [ "$JSONL_COUNT" -lt $((B * 85 / 100)) ] && [ $((B - JSONL_COUNT)) -gt 200 ]; then
+    alert "会话数骤降(快照源): ${B} → ${JSONL_COUNT} (可能数据丢失)"
+    ISSUE="会话数据骤降(${B}→${JSONL_COUNT})"
+  fi
+fi
+# 基线滚动: 取历史最大值(含今日, 防用户主动清理后误报); 仅探测有效时写入
+if [ "$JSONL_PROBE" = "ok" ]; then
+  echo "$JSONL_COUNT" >> "$STATE_DIR/history_snapshot"
+  tail -n 200 "$STATE_DIR/history_snapshot" | sort -n | tail -1 > "$BASELINE_FILE"
+  B=$(cat "$BASELINE_FILE")   # 首轮初始化后同步显示, 避免日志 baseline=0 与落盘值不一致
+else
+  log "== 探测无效(${JSONL_PROBE}), 本轮不更新基线/历史 =="
+fi
+
+# ---- 2) UI 列表 404 检测 (历史对话消失前置信号) ----
+TODAY_LOG=$(ls -t "$HOME/.workbuddy/logs/2026-"*/edge-sync.log 2>/dev/null | head -1)
+NEW404=""
+if [ -n "$TODAY_LOG" ] && grep -q "LIST failed.*404" "$TODAY_LOG" 2>/dev/null; then
+  NOW=$(date +%s)
+  LAST=0; [ -f "$LAST404_FILE" ] && LAST=$(cat "$LAST404_FILE")
+  if [ $((NOW - LAST)) -gt 82800 ]; then   # 23h 冷却, 避免每日轰炸
+    echo "$NOW" > "$LAST404_FILE"
+    NEW404="UI历史列表接口404(edge-sync LIST failed)"
+    alert "$NEW404 (今日日志: $(basename "$TODAY_LOG"))"
+    ISSUE="${ISSUE:+$ISSUE + }$NEW404"
+  fi
+fi
+
+# ---- 3) sessions.json 窗口索引 ----
+# 2026-08-12: launchd 进程读 ~/.workbuddy/app/ 被 TCC 拦(Operation not permitted, 实测),
+#             该项与 memwatch 自管职责(verify_conversations+备份恢复)重复, 故移除。
+#             如需复核: 手动执行 grep -c '"conversationId"' ~/.workbuddy/app/sessions.json
+
+# ---- 4) 守护存活自愈 ----
+for svc in memwatch history-server; do
+  if ! launchctl list 2>/dev/null | grep -q "com.workbuddy.$svc"; then
+    alert "守护 com.workbuddy.$svc 未运行, 尝试拉起"
+    if [ "$DRY_RUN" != 1 ]; then
+      launchctl load "$HOME/Library/LaunchAgents/com.workbuddy.$svc.plist" 2>/dev/null \
+        && log "  com.workbuddy.$svc 已拉起" \
+        || log "  com.workbuddy.$svc 拉起失败, 请人工检查 plist"
+    fi
+  fi
+done
+
+# ---- 5) 中枢自动化心跳 / 外部死信检测 (2026-09-24 新增) ----
+# 原理: 中枢所有"看门狗"本身都是平台内的 agent 自动化 -> 平台/调度器一死, 全员静默, 没人报警。
+#       "Never rely on the AI to report its own death." 故本项在平台之外(launchd 原生, 无 LLM)
+#       直接读调度库 automation_runs, 判"该跑没跑", 并复检 registry 与库的声明式漂移。
+# 实现: 委托 Claw 仓库内的 hub_reconcile.py(版本化, 单一实现), 本脚本只负责"跑它 + 判退出码 + 告警"。
+# 退出码: 0=全净; 10=仅镜像漂移(可 --fix 自愈, 由 23:02 自诊自动化收敛, 不告警);
+#         20=声明悬空/未纳管/心跳超时/文档漂移/待办逾期/契约盲区 → 告警;
+#         **其它(1/2/127…)= 对账器自己出错 → 必须告警**(三次审计 S2: 原先一律记成"正常")
+#
+# ⚠️ 三次审计 S2/S3 修正(2026-09-24): 原实现有两个"死守卫"式盲区——
+#   ① 输入缺失静默跳过: 条件写成 [ -x $HUB_PY ] && [ -f $HUB_RECON ] && [ -r $DB ] 的**合取**,
+#      任一不成立就整节无声跳过(无日志、无告警)。于是"对账器被改名/python 环境重建/库被挪走"
+#      这三种情况会让**监管者自己消失**——正是本项存在的理由(不依赖 AI 自报死亡)被反向击穿。
+#   ② 退出码误判: 只要 rc < 20 就记"中枢对账正常"; 对账器崩溃(rc=1)或用法错误(rc=2)
+#      也会被记成"正常"。
+#    修正: 输入缺失 → 显式告警并列出缺哪个; 退出码白名单 0/10/20, 其余按"执行异常"告警。
+HUB_RECON="$HOME/WorkBuddy/Claw/.workbuddy/scripts/hub_reconcile.py"
+HUB_PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python"
+HUB_DETAIL=""
+HUB_INPUTS_MISSING=""
+[ -x "$HUB_PY" ] || HUB_INPUTS_MISSING="${HUB_INPUTS_MISSING}python解释器($HUB_PY) "
+[ -f "$HUB_RECON" ] || HUB_INPUTS_MISSING="${HUB_INPUTS_MISSING}对账器($HUB_RECON) "
+[ -r "$WB/workbuddy.db" ] || HUB_INPUTS_MISSING="${HUB_INPUTS_MISSING}调度库($WB/workbuddy.db) "
+
+if [ -n "$HUB_INPUTS_MISSING" ]; then
+  # 对账不可用 = 外部监管盲区, 属"必须让人知道"的异常(24h 冷却, 避免每 30 分钟轰一次)
+  HUB_BAD_STAMP="$STATE_DIR/hub_badinput_ts"
+  HUB_NOW=$(date +%s); HUB_LAST=0
+  [ -f "$HUB_BAD_STAMP" ] && HUB_LAST=$(cat "$HUB_BAD_STAMP" 2>/dev/null || echo 0)
+  msg="中枢对账不可用(输入缺失: ${HUB_INPUTS_MISSING})→ 外部监管已进入盲区"
+  if [ $((HUB_NOW - HUB_LAST)) -gt 86400 ]; then
+    echo "$HUB_NOW" > "$HUB_BAD_STAMP"
+    alert "$msg"
+    ISSUE="${ISSUE:+$ISSUE + }中枢对账不可用(输入缺失)"
+    HUB_DETAIL="$msg"
+  else
+    log "== $msg (24h 冷却内, 不重复告警) =="
+  fi
+else
+  HUB_JSON=$("$HUB_PY" "$HUB_RECON" --json 2>/dev/null)
+  HUB_RC=$?
+  if [ "$HUB_RC" -eq 20 ] && [ -n "$HUB_JSON" ]; then
+    HUB_DETAIL=$("$HUB_PY" "$HUB_RECON" --brief 2>/dev/null)
+    # 6h 冷却: 心跳类异常会持续存在, 不必每 30 分钟轰一次
+    HUB_STAMP="$STATE_DIR/hub_alert_ts"
+    HUB_NOW=$(date +%s); HUB_LAST=0
+    [ -f "$HUB_STAMP" ] && HUB_LAST=$(cat "$HUB_STAMP" 2>/dev/null || echo 0)
+    if [ $((HUB_NOW - HUB_LAST)) -gt 21600 ]; then
+      echo "$HUB_NOW" > "$HUB_STAMP"
+      HUB_N=$(printf '%s\n' "$HUB_DETAIL" | grep -c . )
+      alert "中枢心跳/声明漂移异常(${HUB_N} 项)"
+      ISSUE="${ISSUE:+$ISSUE + }中枢心跳异常(${HUB_N} 项)"
+    else
+      log "== 中枢异常仍在(bump suppressed, 6h 冷却内): $(printf '%s' "$HUB_DETAIL" | head -1) =="
+    fi
+  elif [ "$HUB_RC" -eq 0 ]; then
+    log "== 中枢对账正常(rc=0): 声明/心跳/文档/待办/契约均无异常 =="
+  elif [ "$HUB_RC" -eq 10 ]; then
+    log "== 中枢仅镜像漂移(rc=10): 可 --fix 自愈, 交给 23:02 自诊自动化收敛, 不告警 =="
+  else
+    # rc ∉ {0,10,20} —— 对账器自己崩了/用法错误/被截断。**绝不能记成"正常"**。
+    HUB_ERR_STAMP="$STATE_DIR/hub_errcode_ts"
+    HUB_NOW=$(date +%s); HUB_LAST=0
+    [ -f "$HUB_ERR_STAMP" ] && HUB_LAST=$(cat "$HUB_ERR_STAMP" 2>/dev/null || echo 0)
+    msg="中枢对账器执行异常(rc=${HUB_RC})→ 外部监管可能已失效, 需人查 hub_reconcile.py"
+    if [ $((HUB_NOW - HUB_LAST)) -gt 86400 ]; then
+      echo "$HUB_NOW" > "$HUB_ERR_STAMP"
+      alert "$msg"
+      ISSUE="${ISSUE:+$ISSUE + }中枢对账器执行异常(rc=${HUB_RC})"
+      HUB_DETAIL="$msg"
+    else
+      log "== $msg (24h 冷却内, 不重复告警) =="
+    fi
+  fi
+fi
+
+# ---- 6) 加油站点数签到任务 (2026-09-28 新增) ----
+# 为什么放在这一层: 签到/派猫已改为两条 launchd 任务(com.workbuddy.auto-signin 每天 00:05 /
+#   com.workbuddy.signin-poll 每 4h), 零 Token、走官方接口、不依赖显示器 —— 但它们**不经过
+#   WorkBuddy 平台**, 平台内的自动化清单/健康快照/D1–D9 对账统统看不见它们。一旦静默死掉
+#   (腾讯改接口 / 凭据过期 / 客户端路径变化), 表现只是"积分悄悄不涨", 没有人会发现。
+# 判据测**产出**不测存活(2026-09-25 教训: 💓中枢存活看门狗连跑 48 次 0 成功, 而 last_run
+#   每 2h 刷新 → 只看"跑没跑"的判据判它全场最健康): 读日志最后一行的时刻 + result + needs_attention。
+# 实现: 委托 .local/bin/wb-signin-check(单一实现), 本脚本只负责跑它 + 判退出码 + 告警。
+# 退出码: 0=正常; 20=停摆/凭据失效/接口报错/任务被卸载; **2=取不到证 → 同样告警**(绝不记成正常)
+WB_SIGNIN_CHECK="$HOME/.local/bin/wb-signin-check"
+SIGNIN_STAMP="$STATE_DIR/signin_alert_ts"
+SIGNIN_NOW=$(date +%s); SIGNIN_LAST=0
+[ -f "$SIGNIN_STAMP" ] && SIGNIN_LAST=$(cat "$SIGNIN_STAMP" 2>/dev/null || echo 0)
+if [ ! -x "$WB_SIGNIN_CHECK" ]; then
+  # 检查器自己没了 = 这一层监管消失, 与 hub 输入缺失同级(不能无声跳过)
+  msg="签到检查器缺失(${WB_SIGNIN_CHECK})→ 签到停摆将无人发现"
+  if [ $((SIGNIN_NOW - SIGNIN_LAST)) -gt 86400 ]; then
+    echo "$SIGNIN_NOW" > "$SIGNIN_STAMP"
+    alert "$msg"; ISSUE="${ISSUE:+$ISSUE + }签到检查器缺失"
+  else
+    log "== $msg (24h 冷却内, 不重复告警) =="
+  fi
+else
+  SIGNIN_OUT=$("$WB_SIGNIN_CHECK" 2>&1); SIGNIN_RC=$?
+  if [ "$SIGNIN_RC" -eq 0 ]; then
+    log "== 签到任务正常: $SIGNIN_OUT =="
+  elif [ $((SIGNIN_NOW - SIGNIN_LAST)) -gt 86400 ]; then
+    echo "$SIGNIN_NOW" > "$SIGNIN_STAMP"
+    alert "签到任务异常(rc=${SIGNIN_RC}): $SIGNIN_OUT"
+    ISSUE="${ISSUE:+$ISSUE + }签到异常(rc=${SIGNIN_RC})"
+    SIGNIN_DETAIL="$SIGNIN_OUT"
+  else
+    log "== 签到异常仍在(rc=${SIGNIN_RC}, 24h 冷却内): $SIGNIN_OUT =="
+  fi
+fi
+
+# ---- 异常处置: 飞书 + Bridge 派发 ----
+if [ -n "${ISSUE:-}" ]; then
+  log "== 检测到异常: $ISSUE =="
+  if [ "$DRY_RUN" != 1 ]; then
+    if [ -x "$CARD" ]; then
+      # 2026-11-14: 探测异常时不得把 0 当「真实会话数」展示 —— 闸门呈现假事实比没闸门更危险
+      if [ "$JSONL_PROBE" = "ok" ]; then
+        JSONL_SECTION="$JSONL_COUNT (基线 ${B_JUDGE:-无}, 源 ${SNAP_TS:-无})"
+      else
+        JSONL_SECTION="N/A(探测无效:${JSONL_PROBE})"
+      fi
+      HUB_ARGS=()
+      [ -n "${HUB_DETAIL:-}" ] && HUB_ARGS=(--section "中枢心跳/声明漂移" "$HUB_DETAIL")
+      SIGNIN_ARGS=()
+      [ -n "${SIGNIN_DETAIL:-}" ] && SIGNIN_ARGS=(--section "加油站点数签到" "$SIGNIN_DETAIL")
+      ("$CARD" --title "🔍 WorkBuddy 会话健康异常" --level warn \
+        --section "检测项" "$ISSUE" \
+        --section "会话数(快照源)" "$JSONL_SECTION" \
+        ${HUB_ARGS[@]+"${HUB_ARGS[@]}"} \
+        ${SIGNIN_ARGS[@]+"${SIGNIN_ARGS[@]}"} \
+        --section "处置建议" "历史全文位于 projects/**/*.jsonl; 本次计数来自 wb-404-watcher 每日快照(最长滞后 24h)。① 静态快照 $HOME/wb_history_snapshot.html 可直接打开 ② 查看器 http://127.0.0.1:8791/ 可看; 若快照源过期先查 com.workbuddy.wb-404-watcher" \
+        --chat-id "oc_9ee5303497f5e0e71666b610d6bdc346" >/dev/null 2>&1 &)
+    fi
+    # 2026-08-15: Marvis Bridge 已停用, 移除派发逻辑, 仅飞书告警
+  fi
+else
+  if [ "$JSONL_PROBE" = "ok" ]; then
+    log "== 健康正常: 快照会话数=$JSONL_COUNT (源 ${SNAP_TS:-无}, ${SNAP_AGE:-?}s 前) baseline=$B memwatch=$(launchctl list 2>/dev/null | grep -c 'com.workbuddy.memwatch') =="
+  else
+    # 探测异常但处于冷却期时, 不能再打印"健康正常"(否则日志继续假绿)
+    log "== 本轮无新告警(探测异常=${JSONL_PROBE}, 冷却内): 快照会话数=$JSONL_COUNT baseline=$B =="
+  fi
+fi
+exit 0

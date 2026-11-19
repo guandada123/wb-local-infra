@@ -1,0 +1,504 @@
+#!/usr/bin/env python3
+"""
+push_card.py — 飞书 interactive 卡片推送中台
+=================================================
+统一替代 notify_center.py / push_feishu.sh 的纯 --markdown / --text 推送，
+让所有自动化用「语义配色 + 分区块 + 可选表格/按钮」的交互卡片，
+解决「纯文本看的不舒服、突出不了重点」问题。
+
+设计要点：
+  1. 语义配色：level 决定 header template
+       alert   → red    （告警/失败/止损击穿）
+       warning → orange  （警告/降级/逼近阈值）
+       info    → blue   （常规简报/信息通知）
+       success → green  （成功/完成/无异常）
+  2. 分区块：sections = [(title, markdown_content), ...]，每块一个 div + hr 分割
+  3. 可选表格：table = {"headers":[...], "rows":[[...],...]}，渲染成 markdown 表格
+  4. 可选按钮：buttons = [{"text":..., "url":...}]，作主操作入口（飞书当前按钮点不动，仅展示+链接）
+  5. 兜底：卡片发送失败 → 自动回退 --markdown（保留格式，绝不用 --text 丢格式）
+  6. 429 退避：发送带指数退避重试（3 次 5/10/20s）
+  7. 卡片 body ≤ 30KB（飞书硬限制），超长内容摘要 + 链云文档
+
+用法：
+  python3 push_card.py \
+    --title "📊 微信早报 — 2026-07-17（周五）" \
+    --level info \
+    --section "🩺 今日风险" "🔴 实盘止损击穿..." \
+    --section "📈 大盘行情" "上证 3882 -1.85%" \
+    --table-headers "指数|收盘|涨跌|状态" \
+    --table-rows "上证指数|3882.41|-1.85%|🟡" \
+    --button "📄 完整报告" "https://feishu.cn/docx/xxx" \
+    --chat-id oc_xxx \
+    --dedupe-key "早报-2026-07-17"
+
+  # 也支持从 stdin 读 JSON（结构化调用）：
+  echo '{"title":"...","level":"alert","sections":[...],"table":{...},"buttons":[...]}' | python3 push_card.py --json-stdin
+
+  ⚠️ --json-stdin 的 JSON schema（2026-09-01 实犯，务必照抄）：
+      {
+        "title": "卡片标题",                       // 必填
+        "level": "alert|warning|info|success",     // 可选，默认 info
+        "sections": [                              // 每块的键名是 **body**，不是 content
+          {"title": "小标题", "body": "markdown 正文"}
+        ],
+        "table": {"headers": ["列1","列2"], "rows": [["a","b"]]},  // 可选
+        "buttons": [{"text": "按钮", "url": "https://..."}],       // 可选
+        "footer": "页脚"                                            // 可选
+      }
+    写成 "content" 会被解析成 body='' → 占位符守卫报出莫名其妙的
+    「第 1 个 section body 疑似占位符/空」（排查成本很高）。
+    另：--title 是 argparse required，即使用 --json-stdin 也**必须**传
+    （可传任意占位值，JSON 内的 title 会覆盖）。
+
+  ⚠️ lark-cli 发卡片正确方式（1.0.68 无 --card flag）：
+      lark-cli im +messages-send --as bot --chat-id X \
+        --content '<card_json>' --msg-type interactive
+  早期早报卡片失败(230001)即因误用 --card / actions 字段格式错。
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+# lark-cli 真实安装位置（2026-08-31 实证）：
+#   ~/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli
+# 旧兜底写的是 .../node/versions/22.22.2/bin/lark-cli —— 该路径**不存在**，
+# 于是永远落到裸 "lark-cli"，全靠 PATH 里恰好有它才没炸。
+# 一旦 PATH 不含（非交互 shell / launchd 环境）→ command not found → 卡片静默丢失。
+# 2026-11-05：**本机副本优先**。原两条候选都落在外置卷
+# （~/.workbuddy 已迁至外置卷上的 workbuddy_data 目录），推送的最后一环会跟着外置卷一起
+# 静默失败 —— 11-02 外置卷 python 被 Code Signature Invalid 强杀那晚，
+# 库里有 16 条失败、飞书一条没响，根因之一就是这条链路的每一环都在外置卷。
+# 本机副本：~/.local/lib/lark-cli/bin/lark-cli（1.0.98，含同步说明与校验步骤）。
+# 原路径保留作 fallback：本机副本缺失/损坏时仍可推送，退化为旧行为而不是直接不可用。
+_LARK_CLI_CANDIDATES = (
+    os.path.expanduser("~/.local/lib/lark-cli/bin/lark-cli"),
+    os.path.expanduser("~/.workbuddy/binaries/node/cli-connector-packages/bin/lark-cli"),
+    os.path.expanduser("~/.workbuddy/binaries/node/versions/22.22.2/bin/lark-cli"),
+)
+LARK_CLI = next((p for p in _LARK_CLI_CANDIDATES if os.path.isfile(p)), "lark-cli")
+DEFAULT_CHAT = "oc_9ee5303497f5e0e71666b610d6bdc346"
+
+LEVEL_TEMPLATE = {
+    "alert": "red",
+    "warning": "orange",
+    "info": "blue",
+    "success": "green",
+}
+
+
+def _strip_surrogates(s):
+    """去掉孤立代理码点(U+D800~U+DFFF)。
+
+    某些环境下(Bash 以 C/POSIX locale 启动时)多字节 argv 经 surrogateescape
+    解码会混入孤立代理码点，导致后续 json.dumps(...).encode('utf-8') 直接抛
+    UnicodeEncodeError 而整个推送崩溃、连 markdown 兜底都走不到。这里在入卡前
+    净化，保证推送在任意 locale 下都不崩。对正常 UTF-8 输入零影响。
+    """
+    if not isinstance(s, str):
+        return s
+    return "".join(ch for ch in s if not (0xD800 <= ord(ch) <= 0xDFFF))
+
+
+def _normalize_table(table: dict) -> dict:
+    """表格归一化（2026-09-01 修复）。
+
+    JSON 模式的 table 是原样透传的（只有 CLI 模式才做 split("|")），而文档约定
+    rows=[[...]]。调用方若按 CLI 习惯传 "a|b|c" 字符串，`for row in rows` 会把
+    **每个字符**当成一列 → 表格渲染成一地碎字（实证：run#47 飞书卡
+    om_x100b666a6eca64a8b4bf2980fd16c57 的待办表全烂，每个字占一列）。
+    此处统一接受两种写法，并在列数不符时告警+自动补齐，避免静默产出垃圾表格。
+    """
+    if not table:
+        return table
+    headers = table.get("headers") or []
+    rows = table.get("rows") or []
+
+    if isinstance(headers, str):
+        headers = [h.strip() for h in headers.split("|")]
+
+    norm_rows = []
+    for r in rows:
+        cells = [c.strip() for c in r.split("|")] if isinstance(r, str) else [str(c) for c in r]
+        if headers and len(cells) != len(headers):
+            print(
+                f"  ⚠️ 表格列数不符: {len(cells)} 列 vs 表头 {len(headers)} 列"
+                f" → 已自动补齐/截断: {cells}"
+            )
+            cells = (cells + [""] * len(headers))[: len(headers)]
+        norm_rows.append(cells)
+
+    return {"headers": headers, "rows": norm_rows}
+
+
+def build_card(
+    title: str,
+    level: str,
+    sections: list,
+    table: dict | None = None,
+    buttons: list | None = None,
+    footer: str | None = None,
+) -> dict:
+    """构造飞书 interactive card JSON"""
+    template = LEVEL_TEMPLATE.get(level, "blue")
+    table = _normalize_table(table)
+    elements = []
+
+    for idx, (sec_title, sec_body) in enumerate(sections):
+        # 08-21 防御：占位符检测下沉到 build_card 内层（此前仅 main CLI 路径拦截，
+        # import send() / 自动化直接调 send_to_feishu 会被绕过 → LLM 模板漂移
+        # title/body 字面量原样推送给用户。08-20 15:44「全市场选股扫描」卡片事故根因）
+        if _looks_like_placeholder(sec_body):
+            raise ValueError(
+                f"占位符拦截：第 {idx + 1} 个 section body 疑似占位符/空 → "
+                f"title='{sec_title}' body='{str(sec_body)[:30]}'"
+            )
+        if _looks_like_placeholder(sec_title) and sec_title.strip():
+            raise ValueError(
+                f"占位符拦截：第 {idx + 1} 个 section title 疑似占位符 → title='{sec_title}'"
+            )
+        # 区块标题 + 内容
+        block = f"**{sec_title}**\n\n{sec_body}" if sec_title else sec_body
+        elements.append(
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": block},
+            }
+        )
+        # 区块间分割线（最后一块后不加）
+        if idx < len(sections) - 1:
+            elements.append({"tag": "hr"})
+
+    # 表格：渲染成 markdown 表格，作为独立 div 追加
+    if table and table.get("headers") and table.get("rows"):
+        md = "| " + " | ".join(table["headers"]) + " |\n"
+        md += "|" + "|".join(["------"] * len(table["headers"])) + "|\n"
+        for row in table["rows"]:
+            md += "| " + " | ".join(str(c) for c in row) + " |\n"
+        elements.append({"tag": "hr"})
+        elements.append(
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": md},
+            }
+        )
+
+    # 按钮（主操作入口，飞书当前点不动，仅展示+链接）
+    if buttons:
+        actions = []
+        for i, b in enumerate(buttons):
+            actions.append(
+                {
+                    "tag": "button",
+                    "text": {"tag": "plain_text", "content": b["text"]},
+                    "type": "primary" if i == 0 else "default",
+                    "url": b.get("url", ""),
+                }
+            )
+        elements.append({"tag": "action", "actions": actions})
+
+    # 页脚
+    if footer:
+        elements.append({"tag": "note", "elements": [{"tag": "plain_text", "content": footer}]})
+
+    card = {
+        "config": {"wide_screen_mode": True},
+        "header": {
+            "title": {"tag": "plain_text", "content": title[:50]},
+            "template": template,
+        },
+        "elements": elements,
+    }
+    return card
+
+
+def _send_via_lark(card: dict, chat_id: str, timeout: int = 30) -> tuple:
+    """用 lark-cli 发 interactive 卡片，返回 (ok, raw_stdout)
+
+    注意：lark-cli 1.0.68 无 --card flag，正确方式是
+    --content '<card_json>' --msg-type interactive
+    （--msg-type 缺省为 text，必须显式声明 interactive 才能渲染卡片）
+    """
+    payload = json.dumps(card, ensure_ascii=False)
+    r = subprocess.run(
+        [
+            LARK_CLI,
+            "im",
+            "+messages-send",
+            "--as",
+            "bot",
+            "--chat-id",
+            chat_id,
+            "--content",
+            payload,
+            "--msg-type",
+            "interactive",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return r.returncode == 0, r.stdout, r.stderr
+
+
+def _send_via_markdown_fallback(text: str, chat_id: str, timeout: int = 30) -> bool:
+    """兜底：卡片失败 → 用 --markdown 发送（保留格式，绝不用 --text）"""
+    r = subprocess.run(
+        [LARK_CLI, "im", "+messages-send", "--as", "bot", "--chat-id", chat_id, "--markdown", text],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    return r.returncode == 0
+
+
+def _compress_sections_for_size(card: dict, budget: int = 26000):
+    """卡片超 30KB 时压缩正文 div，但**保留按钮(action)与页脚(note)**。
+
+    策略：对 elements 里含 lark_md 正文的 div 区块，按长度降序逐轮把最长块
+    对半截断（统一加「已压缩」尾缀），直到整卡 JSON ≤ budget 或所有正文
+    已压到最小阈值。这样即使正文被挤掉，完整报告按钮/链接也绝不会丢。
+    """
+    elements = card.get("elements", [])
+    div_idx = [
+        i
+        for i, e in enumerate(elements)
+        if e.get("tag") == "div"
+        and isinstance(e.get("text"), dict)
+        and e["text"].get("tag") == "lark_md"
+    ]
+
+    def _size() -> int:
+        return len(json.dumps(card, ensure_ascii=False).encode("utf-8"))
+
+    MIN_BLOCK = 400  # 单块最低保留字数
+    TAIL = "\n…(内容过长已压缩，详见完整报告)"
+    guard = 0
+    while _size() > budget and div_idx and guard < 200:
+        guard += 1
+        sized = sorted(div_idx, key=lambda i: len(elements[i]["text"]["content"]), reverse=True)
+        longest = sized[0]
+        content = elements[longest]["text"]["content"]
+        if len(content) <= MIN_BLOCK:
+            break  # 所有可压块都到最小，尽力了
+        new_len = max(MIN_BLOCK, len(content) // 2)
+        elements[longest]["text"]["content"] = content[:new_len] + TAIL
+    return card
+
+
+def send_card(
+    title,
+    level="info",
+    sections=None,
+    table=None,
+    buttons=None,
+    footer=None,
+    chat_id=DEFAULT_CHAT,
+    max_retries=3,
+) -> bool:
+    """对外主函数：发卡片，带 429 退避 + markdown 兜底"""
+    sections = [(_strip_surrogates(t), _strip_surrogates(b)) for t, b in (sections or [])]
+    buttons = [
+        {"text": _strip_surrogates(b.get("text", "")), "url": b.get("url", "")}
+        for b in (buttons or [])
+    ]
+    title = _strip_surrogates(title)
+    footer = _strip_surrogates(footer) if footer else footer
+    card = build_card(title, level, sections, table, buttons, footer)
+
+    # 卡片 body 大小检查（≤30KB）：压缩正文区块但保留按钮/页脚，杜绝"废话+丢链接"
+    card_str = json.dumps(card, ensure_ascii=False)
+    if len(card_str.encode("utf-8")) > 30000:
+        print(f"  ⚠️ 卡片超 30KB({len(card_str)}B)，压缩正文区块（保留完整报告按钮/页脚）")
+        _compress_sections_for_size(card, budget=26000)
+
+    backoff = [5, 10, 20]
+    last_err = ""
+    for attempt in range(1, max_retries + 1):
+        ok, out, err = _send_via_lark(card, chat_id)
+        if ok:
+            try:
+                d = json.loads(out)
+                mid = d.get("data", {}).get("message_id", "?")
+                print(f"  ✅ 卡片已发送! message_id: {mid} (level={level})")
+                return True
+            except json.JSONDecodeError:
+                print("  ✅ 卡片已发送 (无法解析message_id)")
+                return True
+
+        # 失败：判断是否 429 限流
+        is_429 = "429" in (err or "") or "429" in (out or "")
+        last_err = (err or out)[:300]
+        print("  ⚠️ 卡片发送返回码非0" + (" (429限流)" if is_429 else ""))
+        if attempt < max_retries:
+            wait = backoff[attempt - 1] if attempt <= len(backoff) else backoff[-1]
+            print(f"  🔄 第{attempt}次失败，{wait}s后重试 ({attempt}/{max_retries})...")
+            time.sleep(wait)
+        else:
+            print(f"  🔴 卡片重试{max_retries}次失败，转 markdown 兜底")
+
+    # 兜底：markdown（保留格式）
+    md_text = f"**{title}**\n\n" + "\n\n".join(f"**{t}**\n{b}" for t, b in sections)
+    table = _normalize_table(table)
+    if table and table.get("headers"):
+        md_text += "\n\n" + "| " + " | ".join(table["headers"]) + " |\n"
+        md_text += "|" + "|".join(["------"] * len(table["headers"])) + "|\n"
+        for row in table["rows"]:
+            md_text += "| " + " | ".join(str(c) for c in row) + " |\n"
+    if ok_fb := _send_via_markdown_fallback(md_text, chat_id):
+        print("  ✅ markdown 兜底发送成功")
+        return True
+    print(f"  🔴 卡片+兜底均失败: {last_err}")
+    return False
+
+
+# 防护：LLM 常把模板占位符当真实内容传入，导致卡片显示 {日期}/title/body 字面量
+# 只检测「花括号模板变量」和「孤立占位单词」，不碰正常换行/emoji/中文
+_PLACEHOLDER_HAZARDS = (
+    "{日期}",
+    "{周几}",
+    "{date}",
+    "{weekday}",
+    "{{",
+    "}}",
+    "{x}",
+    "{y}",
+    "{n}",
+    "{m}",
+    "{code}",
+    "{标的}",
+)
+
+
+def _looks_like_placeholder(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return True  # 空内容/空标题一律拦截
+    low = t.lower()
+    # 花括号模板变量：直接判占位
+    if any(h.lower() in low for h in _PLACEHOLDER_HAZARDS):
+        return True
+    # 孤立占位单词：整段去掉空白后恰好是 title / body（小写）
+    bare = "".join(low.split())
+    return bare in ("title", "body", "body内容占位")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--title", required=True)
+    p.add_argument("--level", default="info", choices=list(LEVEL_TEMPLATE.keys()))
+    p.add_argument(
+        "--section",
+        action="append",
+        nargs=2,
+        metavar=("TITLE", "BODY"),
+        help="可重复：--section '标题' '内容'",
+    )
+    p.add_argument("--table-headers", default="")
+    p.add_argument("--table-rows", action="append", default=[], help="可重复：--table-rows 'a|b|c'")
+    p.add_argument(
+        "--button",
+        action="append",
+        nargs=2,
+        metavar=("TEXT", "URL"),
+        help="可重复：--button '文字' 'url'",
+    )
+    p.add_argument("--footer", default="")
+    p.add_argument("--chat-id", default=DEFAULT_CHAT)
+    p.add_argument("--dedupe-key", default="")
+    p.add_argument(
+        "--json-stdin",
+        action="store_true",
+        help="从 stdin 读完整 JSON {title,level,sections,table,buttons,footer}",
+    )
+    args = p.parse_args()
+
+    # ── 占位符/空内容防护（防止 LLM 把模板变量当真实内容传出）──
+    if _looks_like_placeholder(args.title):
+        print(f"  🔴 拒绝发送：title 疑似占位符/空值 → '{args.title}'")
+        print('  💡 调用方须传入真实标题，如 --title "📊 收盘晚报 — $(date +%Y-%m-%d)"')
+        return 2
+    if not args.json_stdin and not args.section:
+        print("  🔴 拒绝发送：未提供任何 --section 内容")
+        return 2
+    if not args.json_stdin:
+        for i, (t, b) in enumerate(args.section or []):
+            # 空标题 "" 是合法设计（整块无小标题）；只拦截空 BODY 或占位符
+            if _looks_like_placeholder(b):
+                print(
+                    f"  🔴 拒绝发送：第{i + 1}个 section 内容疑似占位符或空 → "
+                    f"title='{t}' body='{b[:30]}...'"
+                )
+                return 2
+            if _looks_like_placeholder(t) and t.strip():
+                print(f"  🔴 拒绝发送：第{i + 1}个 section 标题疑似占位符 → title='{t}'")
+                return 2
+
+    # 去重（文件级，冷却 6h）
+    # 🔴 2026-10-11 审计修复：标记必须在**发送成功后**才落盘。原实现「先写标记再发送」，
+    #    一旦发送失败（网络/限流耗尽重试），6 小时内的重试会被误判为「已发送」→
+    #    告警被静默吞掉，且调用方会拿到 rc=0 的假成功。
+    dedupe_file = ""
+    if args.dedupe_key:
+        dedupe_file = f"/tmp/feishu_card_dedupe_{args.dedupe_key.replace(' ', '_')[:40]}"
+        if os.path.exists(dedupe_file):
+            print(f"⚠️ 去重: {args.dedupe_key} (6h内已发)")
+            return 0
+
+    if args.json_stdin:
+        data = json.loads(sys.stdin.read())
+        # sections 兼容 [{"title":..,"body":..}] 与 [["title","body"]] 两种写法。
+        # 若直接把 dict 传给 build_card，`for t, b in section` 会把 dict 解包成**键名**
+        # → t='title' / b='body'，再被占位符守卫拦下，报出莫名其妙的
+        # 「第 1 个 section body 疑似占位符」（2026-08-31 实犯，排查成本很高）。
+        raw_sections = data.get("sections", [])
+        sections_in = []
+        for s in raw_sections:
+            if isinstance(s, dict):
+                sections_in.append((s.get("title", ""), s.get("body", "")))
+            elif isinstance(s, (list, tuple)) and len(s) == 2:
+                sections_in.append((s[0], s[1]))
+            else:
+                raise ValueError(f"section 格式不支持: {s!r}")
+        ok = send_card(
+            title=data["title"],
+            level=data.get("level", "info"),
+            sections=sections_in,
+            table=data.get("table"),
+            buttons=data.get("buttons", []),
+            footer=data.get("footer"),
+            chat_id=args.chat_id,
+        )
+    else:
+        sections = [(t, b) for t, b in (args.section or [])]
+        table = None
+        if args.table_headers:
+            table = {
+                "headers": [h.strip() for h in args.table_headers.split("|")],
+                "rows": [[c.strip() for c in r.split("|")] for r in args.table_rows],
+            }
+        buttons = [{"text": t, "url": u} for t, u in (args.button or [])]
+        ok = send_card(
+            title=args.title,
+            level=args.level,
+            sections=sections,
+            table=table,
+            buttons=buttons,
+            footer=args.footer,
+            chat_id=args.chat_id,
+        )
+
+    if ok and dedupe_file:
+        with open(dedupe_file, "w") as f:
+            f.write("sent")
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

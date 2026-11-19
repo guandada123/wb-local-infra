@@ -1,0 +1,210 @@
+#!/bin/zsh
+# ============================================================
+# workbuddy_graceful_restart.sh — WorkBuddy 正常重启(不丢 UI) 独立脚本
+#
+# 用途: 供外部调度方(马维斯/Marvis 检测到内存压力)调用, 让 WorkBuddy
+#       走完整正常关闭流程重启, 不丢失 UI 历史对话。
+#       memwatch 常驻守护仍保留双保险, 本脚本只做"重启动作"本身。
+#
+# 调用方式: 本脚本由马维斯检测到阈值后执行一次即可(不需要常驻/循环)。
+#   例: /Users/guan/.local/bin/workbuddy_graceful_restart.sh --reason "内存<512MB"
+#
+# 关键设计 (2026-08-13):
+#   1) 以主进程退出为准绳: AppleScript quit → 等待主进程退出(QUIT_WAIT_SEC=90)
+#      → 主进程退出后 renderer/daemon 自动跟随退出并 flush 会话状态
+#      → 额外 EXTRA_FLUSH_SEC=15 收尾窗口
+#   2) 只清理"可清理进程", sidecar/daemon-app-server/--serve 对话载体绝不 KILL
+#      (杀掉它们=重启后 UI 无法恢复历史对话)
+#   3) 重启前备份 sessions.json, 重启后自检会话数, 异常自动从备份恢复
+#
+# 参数: --reason "说明" (可选, 写入日志) | --dry-run (只打印不执行)
+# 配置源: ~/.local/etc/workbuddy_memwatch.conf (与 memwatch 共享, 单一配置源)
+# ============================================================
+
+# ---- 单一配置源 ----
+MEMWATCH_CONF="${MEMWATCH_CONF:-$HOME/.local/etc/workbuddy_memwatch.conf}"
+[ -f "$MEMWATCH_CONF" ] && source "$MEMWATCH_CONF"
+
+: "${QUIT_WAIT_SEC:=90}"
+: "${EXTRA_FLUSH_SEC:=15}"
+: "${TERM_WAIT_SEC:=10}"
+: "${LOG_FILE:=$HOME/Library/Logs/workbuddy_memwatch.log}"
+
+DRY_RUN=0; REASON="外部触发"
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY_RUN=1 ;;
+    --reason=*) REASON="${a#--reason=}" ;;
+  esac
+done
+
+log(){ echo "[$(date '+%F %T')] [graceful-restart] $*" >> "$LOG_FILE"; }
+
+# WorkBuddy 主进程 PID
+wb_main_pids(){
+  ps -axo pid=,command= | awk '/WorkBuddy\.app\/Contents\/MacOS\/Electron([[:space:]]|$)/ && !/(--serve|--prewarm|daemon-app-server-entry|sidecar-entry|--require)/ {print $1}'
+}
+# 可清理进程 (排除 sidecar 对话载体; daemon-app-server 是调度器非对话载体, 2026-08-13 事故修复:
+# 主进程 TERM 后 daemon 不跟随退出成 PPID=1 孤儿占 IPC 端口 → 必须可清理, 防 10h 自动化全挂复发)
+wb_killable_procs(){
+  ps -axo pid=,rss=,command= | awk '/WorkBuddy\.app/ && !/watch_workbuddy_mem/ && !/sidecar-entry/ && !/--serve/ {print $1, $2}'
+}
+
+# 重启前备份会话索引
+backup_sessions(){
+  local sf bak n
+  sf="$HOME/.workbuddy/app/sessions.json"
+  bak="$HOME/.workbuddy/app/sessions.json.bak"
+  if [ -f "$sf" ] && [ -s "$sf" ]; then
+    n=$(grep -c '"conversationId"' "$sf" 2>/dev/null || true)
+    n=${n:-0}
+    if (( n > 0 )); then
+      cp "$sf" "$bak" 2>/dev/null && log "已备份会话索引: ${n} 个会话"
+    fi
+  fi
+}
+
+# 等待主进程退出
+wait_main_exit(){
+  local limit="$1" waited mainleft
+  waited=0
+  while (( waited < limit )); do
+    mainleft=$(wb_main_pids | wc -l | tr -d ' ')
+    (( mainleft == 0 )) && return 0
+    sleep 2
+    waited=$((waited+2))
+  done
+  return 1
+}
+
+# 清理残留 (只清可清理进程, 排除 sidecar)
+cleanup_residual(){
+  local remaining
+  remaining=($(wb_killable_procs | awk '{print $1}'))
+  if (( ${#remaining[@]} > 0 )); then
+    log "清理残留(TERM, 已排除sidecar): ${remaining[*]}"
+    kill "${remaining[@]}" 2>/dev/null
+    sleep "$TERM_WAIT_SEC"
+    remaining=($(wb_killable_procs | awk '{print $1}'))
+    if (( ${#remaining[@]} > 0 )); then
+      log "TERM 超时, KILL -9 (排除sidecar): ${remaining[*]}"
+      kill -9 "${remaining[@]}" 2>/dev/null
+      sleep 2
+    fi
+  fi
+}
+
+# 重启后会话自检
+verify_conversations(){
+  local sf bak n
+  sf="$HOME/.workbuddy/app/sessions.json"
+  bak="$HOME/.workbuddy/app/sessions.json.bak"
+  n=$(grep -c '"conversationId"' "$sf" 2>/dev/null || true)
+  n=${n:-0}
+  if (( n < 1 )); then
+    if [ -f "$bak" ] && [ -s "$bak" ]; then
+      cp "$bak" "$sf" 2>/dev/null
+      n=$(grep -c '"conversationId"' "$sf" 2>/dev/null || true)
+      n=${n:-0}
+      log "!! 会话索引为空, 已从备份恢复: ${n} 个会话"
+    else
+      log "!! 会话索引为空且无备份, 请重启应用让 UI 重新扫描 jsonl"
+    fi
+  else
+    log "会话索引正常: ${n} 个会话"
+  fi
+}
+
+# 内存阈值自检护栏 (2026-08-13 事故修复)
+# 背景: Marvis 定时任务 id=26 每 30min 用 LLM 检测内存, 08-13 误判 7 次"内存超限"→触发重启
+#       (实为未超限: WB 树仅 4GB<8500MB), 其中 2 次降级 TERM 强杀致 daemon 孤儿 → 自动化 10h 全挂。
+# 本护栏: 无论谁调用, 先自检真实内存, 未超限一律拒绝, 防误判触发无效重启;
+#         真超限时 memwatch 常驻(5s 轮询)仍兜底, 双保险语义不变。
+mem_threshold_hit(){
+  local wb_mb sys_avail_mb page_size pf pi
+  wb_mb=$(ps -axo rss=,command= | awk '/WorkBuddy\.app/ && !/watch_workbuddy_mem/ {s+=$1} END {printf "%d", s/1024}')
+  wb_mb=${wb_mb:-0}
+  page_size=$(sysctl -n hw.pagesize)
+  pf=$(vm_stat | awk '/Pages free/ {gsub(/\./,"",$3); print $3}')
+  pi=$(vm_stat | awk '/Pages inactive/ {gsub(/\./,"",$3); print $3}')
+  sys_avail_mb=$(( (pf + pi) * page_size / 1024 / 1024 ))
+  if (( wb_mb > RSS_RESTART_MB )); then
+    log "护栏通过: WB树 ${wb_mb}MB > ${RSS_RESTART_MB}MB"
+    return 0
+  fi
+  if (( sys_avail_mb < SYS_CRIT_AVAILABLE_MB )); then
+    log "护栏通过: 整机可用 ${sys_avail_mb}MB < ${SYS_CRIT_AVAILABLE_MB}MB"
+    return 0
+  fi
+  log "护栏拦截: WB树=${wb_mb}MB(阈${RSS_RESTART_MB}) 整机可用=${sys_avail_mb}MB(阈${SYS_CRIT_AVAILABLE_MB}), 条件未命中, 拒绝重启(调用方可能误判)"
+  return 1
+}
+
+main(){
+  # 0) 内存阈值护栏: 未超限拒绝执行 (防外部调用方 LLM 误判)
+  if ! mem_threshold_hit; then
+    return 0
+  fi
+  log "=== 正常重启开始 (原因: ${REASON}, dry_run=${DRY_RUN}) ==="
+  if (( DRY_RUN )); then
+    log "[dry-run] 将执行: 备份会话 → AppleScript quit → 等主进程退出(${QUIT_WAIT_SEC}s) → flush窗口(${EXTRA_FLUSH_SEC}s) → 清理残留(排除sidecar) → open → 自检"
+    return 0
+  fi
+
+  # 0) 前置检查: WB 是否在运行
+  if (( $(wb_main_pids | wc -l | tr -d ' ') == 0 )); then
+    log "!! WorkBuddy 主进程未在运行, 直接拉起"
+    open "$HOME/Desktop/WorkBuddy.app" 2>/dev/null || open -a WorkBuddy 2>/dev/null
+    return 0
+  fi
+
+  # 1) 备份会话索引
+  backup_sessions
+
+  # 2) 优雅退出: AppleScript quit → 等主进程退出
+  mainpids=($(wb_main_pids))
+  log "优雅退出主进程: ${mainpids[*]} (AppleScript quit, 等待≤${QUIT_WAIT_SEC}s)"
+  result=$(osascript -e 'tell application "WorkBuddy" to quit' 2>&1)
+  if (( $? != 0 )); then
+    log "osascript quit 不可用($result), 降级 TERM"
+    kill -TERM "${mainpids[@]}" 2>/dev/null
+  elif ! wait_main_exit "$QUIT_WAIT_SEC"; then
+    log "等待 ${QUIT_WAIT_SEC}s 后主进程仍在, 降级 TERM"
+    kill -TERM "${mainpids[@]}" 2>/dev/null
+  else
+    log "主进程已退出, 等待 ${EXTRA_FLUSH_SEC}s 让 renderer flush 会话状态"
+    sleep "$EXTRA_FLUSH_SEC"
+  fi
+
+  # 3) 清理残留 (排除 sidecar)
+  cleanup_residual
+
+  # 4) 确认主进程退出 (验证回读)
+  if (( $(wb_main_pids | wc -l | tr -d ' ') > 0 )); then
+    log "!! 主进程仍存活, 重启中止"
+    return 1
+  fi
+
+  # 5) 重启 + 回读验证
+  open "$HOME/Desktop/WorkBuddy.app" 2>/dev/null || open -a WorkBuddy 2>/dev/null
+  sleep 12
+  newpids=($(wb_main_pids))
+  if (( ${#newpids[@]} == 0 )); then
+    open "$HOME/Desktop/WorkBuddy.app" 2>/dev/null
+    sleep 12
+    newpids=($(wb_main_pids))
+  fi
+  if (( ${#newpids[@]} > 0 )); then
+    log "==> 重启成功, 新主进程 PID: ${newpids[*]}"
+    sleep 15
+    verify_conversations
+  else
+    log "!! 重启失败: open 后未检测到新主进程"
+    return 1
+  fi
+  log "=== 正常重启完成 ==="
+  return 0
+}
+
+main
+exit $?
