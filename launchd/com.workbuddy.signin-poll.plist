@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  WorkBuddy 自动签到 · 成长中心轮询（macOS / launchd）
+  每 4 小时跑一次「补签（未签才签）+ 成长中心」。
+
+  为什么不能只靠 00:05 那一次：
+    · Buddy 派出去旅行 1~4 小时就带礼物回来，礼物要手动领 —— 只跑一次会把
+      礼物压到第二天，且当天的派出名额一旦没用上就整个浪费；
+    · 00:05 撞上关机/睡眠/网络未就绪，当天连签直接断（本机 09-26 就是这么断的）。
+      每次轮询先查一次签到状态、未签才补 → 一天七次机会，接口幂等不会重复领。
+
+  用 silent-poll 而非 silent：空跑（已签过 / Buddy 还在路上 / 名额用完）不落盘，
+  免得有价值的那几行被淹没。要逐轮看就设 WORKBUDDY_GROWTH_LOG_EMPTY=1。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workbuddy.signin-poll</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/guan/.local/bin/wb-signin</string>
+        <string>silent-poll</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>14400</integer>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/workbuddy-signin-poll.launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/workbuddy-signin-poll.launchd.err</string>
+</dict>
+</plist>

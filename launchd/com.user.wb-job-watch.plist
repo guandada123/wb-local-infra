@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd job 单点存活监控（router v0 扩展 #6，2026-11-10 全开授权）
+  每 30 分钟检查 wb-event-poller / wb-heartbeat / wb-failures / wb-liveness：
+  未加载 / 非零退出 / runs 停滞 / 流日志非空 → push_card 飞书告警。
+  源 + 安装说明：Claw .workbuddy/deploy/wb-job-watch.py
+  排查：launchctl print gui/$(id -u)/com.user.wb-job-watch | grep -E 'state|runs|last exit'
+        tail -20 ~/Library/Logs/wb-job-watch.launchd.log
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/guan</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+		<key>PATH</key>
+		<string>/Users/guan/.workbuddy/binaries/node/versions/22.22.2-6/bin:/Users/guan/.workbuddy/binaries/node/cli-connector-packages/bin:/Users/guan/.workbuddy/binaries/python/envs/default/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.user.wb-job-watch</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>exec /Users/guan/.workbuddy/binaries/python/envs/default/bin/python3 /Users/guan/.local/bin/wb-job-watch.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/guan/Library/Logs/wb-job-watch.launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/guan/Library/Logs/wb-job-watch.launchd.log</string>
+	<key>StartInterval</key>
+	<integer>1800</integer>
+</dict>
+</plist>

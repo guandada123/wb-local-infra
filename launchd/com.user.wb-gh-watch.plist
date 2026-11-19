@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  GitHub 事件源（router v0 扩展源 B，2026-11-10 全开授权）
+  每 30 分钟扫白名单 6 仓库 CI failure（updatedAt 窗口 40min）→ events.jsonl + 飞书（同 repo 24h 抑制）。
+  源 + 判据：Claw .workbuddy/deploy/wb-gh-watch.py；工作区 扩展实施总纲-20261110.md §四·B。
+  ⚠️ PATH 必须含 /opt/homebrew/bin（gh 所在）；认证走 gh keyring（env -i 实测可用）。
+  排查：launchctl print gui/$(id -u)/com.user.wb-gh-watch | grep -E 'state|runs|last exit'
+        tail -20 ~/.workbuddy/events/gh-watch.log
+-->
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/guan</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/Users/guan/.workbuddy/binaries/python/envs/default/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.user.wb-gh-watch</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>exec /Users/guan/.workbuddy/binaries/python/envs/default/bin/python3 /Users/guan/.local/bin/wb-gh-watch.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/guan/Library/Logs/wb-gh-watch.launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/guan/Library/Logs/wb-gh-watch.launchd.log</string>
+	<key>StartInterval</key>
+	<integer>1800</integer>
+</dict>
+</plist>

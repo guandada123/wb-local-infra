@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  外部心跳打卡 · 每 10 分钟（2026-10-18）
+
+  这一条是**唯一能发现整机失联**的通道：其余监控（launchd 巡检 / 中枢 / 失败扫表）
+  全部跑在这台 Mac 上，Mac 关机、断电、断网时它们一起消失，没人报警。
+
+  设计要点：
+    · 只出站：本任务不开放任何端口，也不接收任何连接（打卡是向外发一个 GET）。
+    · 未配置地址时脚本正常退出并记日志，不会报错刷屏。
+    · plist 里不写任何密钥 —— 打卡地址读 ~/.local/etc/wb-heartbeat.conf（600）。
+    · 入口脚本在内置盘（SSD 掉了也能打卡，正好覆盖"外置盘挂掉"这种半死状态）。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.wb-heartbeat</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/guan/.local/bin/wb-heartbeat.sh</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>600</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/guan</string>
+        <key>PATH</key>
+        <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/wb-heartbeat.launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/wb-heartbeat.launchd.err</string>
+</dict>
+</plist>

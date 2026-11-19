@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workbuddy.pmf</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/php</string>
+        <string>/Users/guan/WorkBuddy/project-monitor-fusion/artisan</string>
+        <string>serve</string>
+        <string>--port=8088</string>
+        <string>--host=127.0.0.1</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/guan/WorkBuddy/project-monitor-fusion</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/pmf_serve.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/pmf_serve.err</string>
+</dict>
+</plist>

@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  WorkBuddy 自动签到 · 每日兜底（macOS / launchd）
+  每天 00:05 跑一次「签到 + 成长中心」，结果写 ~/Library/Logs/workbuddy-auto-signin.log
+  零 Token、无窗口、不依赖显示器（走官方接口，不是 GUI 自动化）。
+  RunAtLoad：登录时补跑一次，接住关机/睡眠期间错过的签到。
+  轮询另见 com.workbuddy.signin-poll.plist。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workbuddy.auto-signin</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/guan/.local/bin/wb-signin</string>
+        <string>silent</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>0</integer>
+        <key>Minute</key>
+        <integer>5</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/workbuddy-auto-signin.launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/workbuddy-auto-signin.launchd.err</string>
+</dict>
+</plist>

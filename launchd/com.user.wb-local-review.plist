@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.wb-local-review</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/guan/.workbuddy/binaries/python/envs/default/bin/python3</string>
+        <string>/Users/guan/.local/bin/wb-local-review.py</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>21</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/wb-local-review.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/wb-local-review.launchd.log</string>
+</dict>
+</plist>

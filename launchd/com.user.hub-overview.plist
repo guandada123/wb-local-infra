@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>com.user.hub-overview</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+		<string>/Users/guan/.local/bin/hub-overview-server.py</string>
+		<string>--port</string>
+		<string>3355</string>
+		<string>--static-root</string>
+		<string>/Users/guan/.local/share/hub-overview</string>
+	</array>
+	<key>WorkingDirectory</key><string>/Users/guan/.local/bin</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key><string>/Users/guan</string>
+		<key>LANG</key><string>zh_CN.UTF-8</string>
+		<key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>ThrottleInterval</key><integer>15</integer>
+	<key>ProcessType</key><string>Background</string>
+	<key>LowPriorityIO</key><true/>
+	<key>StandardOutPath</key><string>/Users/guan/Library/Logs/hub-overview.out</string>
+	<key>StandardErrorPath</key><string>/Users/guan/Library/Logs/hub-overview.err</string>
+</dict>
+</plist>

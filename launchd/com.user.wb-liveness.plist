@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Claw 存活巡检（零 LLM 成本）· 每 2 小时
+
+  设计约束（每条都有本机事故样本）：
+    · 入口脚本必须在**内置盘**（~/.local/bin）—— ~/.workbuddy 与 ~/WorkBuddy 都是
+      /Volumes/ZHITAI 的软链，SSD 掉线时脚本本体就消失了。
+    · 不把 node 路径写进 plist：node 目录带版本号（versions/22.22.2-6/bin），
+      升级 WorkBuddy 后即失效；由脚本每次 glob 自愈，plist 只给通用 PATH。
+    · HOME 必须显式注入（launchd 可能不注入，2026-08-12 实测首跑全误报）。
+    · StandardOut/Err 不能指向 /dev/null：wb_health_check 就是因此把错误吞了 34 次。
+
+  排查：
+    launchctl print gui/$(id -u)/com.user.wb-liveness | grep -E 'state|runs|last exit'
+    tail -50 ~/Library/Logs/wb-liveness.log
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.wb-liveness</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/guan/.local/bin/wb-liveness.sh</string>
+        <string>liveness</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <integer>7200</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/guan</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/wb-liveness.launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/wb-liveness.launchd.err</string>
+</dict>
+</plist>

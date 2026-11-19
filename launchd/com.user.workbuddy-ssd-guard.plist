@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  WorkBuddy 记忆宿主盘（外置 SSD）挂载守卫 · macOS / launchd
+
+  为何需要：本机**全部** Agent 记忆都宿在 /Volumes/ZHITAI 上（~/.workbuddy 与 ~/WorkBuddy
+  都是软链）。SSD 一旦未挂载/被弹出，两条软链变悬空 → 记忆全部不可读写；更危险的是
+  可能在内置盘长出"分裂的第二大脑"。全机 91 条 ACTIVE 自动化里没有任何一条检查挂载状态。
+
+  为何用 launchd 而不是 WorkBuddy 自动化：
+    · 危险窗口在**开机/登录瞬间**，需要 RunAtLoad 立即检查 —— 平台定时任务最小粒度抓不住；
+    · 必须独立于 WorkBuddy 客户端本身（客户端也要读 ~/.workbuddy）。
+
+  ⚠️ 关键设计约束（改本文件前先读）：
+    解释器必须是 **/usr/bin/python3（内置盘）**，绝不能用
+    ~/.workbuddy/binaries/python/...（那在 SSD 上 —— SSD 一掉，守卫自己先崩）。
+    同理脚本放 ~/.local/bin/（内置盘），日志写 ~/Library/Logs/（内置盘）。
+    仅 "推飞书" 这一步依赖 SSD，且是**尽力而为**、失败静默降级。
+
+  排查：
+    launchctl print gui/$(id -u)/com.user.workbuddy-ssd-guard     # 看状态
+    /Users/guan/.local/bin/wb-ssd-guard                           # 手动跑
+    /Users/guan/.local/bin/wb-ssd-guard --selftest                # 演练失败路径
+    tail -20 ~/Library/Logs/workbuddy-ssd-guard.jsonl             # 取证日志
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.workbuddy-ssd-guard</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/guan/.local/bin/wb-ssd-guard</string>
+        <string>--quiet</string>
+    </array>
+
+    <!-- 登录/加载时立即检查 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 之后每 30 分钟复查（覆盖"运行中被 Finder 弹出"这类中途丢失） -->
+    <key>StartInterval</key>
+    <integer>1800</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONIOENCODING</key>
+        <string>utf-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/workbuddy-ssd-guard.launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/workbuddy-ssd-guard.launchd.err</string>
+</dict>
+</plist>

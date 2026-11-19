@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key><string>com.user.hub-overview-watch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+		<string>/Users/guan/.local/bin/hub-overview-watch.py</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict><key>HOME</key><string>/Users/guan</string></dict>
+	<key>StartInterval</key><integer>600</integer>
+	<key>RunAtLoad</key><false/>
+	<key>ProcessType</key><string>Background</string>
+	<key>StandardOutPath</key><string>/Users/guan/Library/Logs/hub-overview-watch.out</string>
+	<key>StandardErrorPath</key><string>/Users/guan/Library/Logs/hub-overview-watch.err</string>
+</dict>
+</plist>

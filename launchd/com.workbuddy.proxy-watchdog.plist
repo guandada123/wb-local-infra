@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.workbuddy.proxy-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+        <string>/Users/guan/.workbuddy/proxy_watchdog.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>30</integer>
+    <key>KeepAlive</key>
+    <false/>
+    <key>WorkingDirectory</key>
+    <string>/Users/guan/.workbuddy</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/proxy-watchdog.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/proxy-watchdog.stderr.log</string>
+</dict>
+</plist>

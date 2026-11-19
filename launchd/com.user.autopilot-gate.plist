@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  自动驾驶「自报 done」外部物理闸门 — launchd 模板（2026-11-06 23:2x 已安装实机）
+
+  为什么需要它
+  ------------
+  项目自动驾驶用 LLM 执行体，中台判 done 只看它返回的 summary 文本，不校验文件系统。
+  2026-11-06 21:30 轮次 #15 只返回一句「写完报告并更新了队列交接」就被判 done，
+  实际产物 / QUEUE 位移 / HANDOFF 条目三项全无；同日 #12 自认「只做到一半」也是 done。
+  写在 prompt 里的第 4/6 条硬闸门是**发给执行体的文本约束**，约束与裁决同处一侧 = 无约束。
+  本作业跑在中台外部、由 launchd 驱动，不依赖执行体自觉，是本会话第二次强调的物理拦截。
+
+  时间点为什么是 12:50 / 17:50 / 22:50
+  ------------------------------------
+  自动驾驶 cron 为本地 `30 12,17,21 * * *`；轮次可能重试/续跑很久（#14 attempts=3，
+  从 17:10 拖到 20:52），所以不贴着轮次后几分钟跑，改为固定时点 + 脚本回溯 36h：
+  漏掉的轮次会在下一个时点被抓到。三次均避开 09:25–09:40 / 15:40–16:55（±10min）
+  敏感窗口，与 17:10 日报相隔 40min。闸门不调 LLM、不耗 token，故不受夜间免费窗口约束。
+
+  边界 / 已知风险
+  --------------
+  - 脚本只读 `~/.agent-autoloop/hub.db`（mode=ro），只写 `Claw/output/autopilot-gate/`。
+    不写中台任何表、不改中台源码、不触发任务、不补跑、不改 rrule、不发外部消息。
+  - 桌面通知（`osascript`）是 **best-effort**：launchd 下可能无通知权限，脚本会把
+    failed/unavailable 如实写进 STATUS，绝不假装已送达。硬告警出口是 ALERT-<轮次>.md
+    与 STATUS.md 两个文件，通知只是加分项。
+  - Program 必须用已获 TCC/FDA 授权的 WorkBuddy python：2026-11-05 实测 `/usr/bin/python3`
+    在 launchd 子进程里读外置卷脚本会被拒（LastExitStatus 512）。该路径随 WorkBuddy
+    升级可能失效，届时需同步改本文件。
+  - WorkingDirectory 设为本机 ~，不设 Claw（工作区是外置卷软链，启动期 getcwd 可能被拒）。
+  - 脚本自身先跑 9 项正反样本自测；自检失败判 GATE_BROKEN，本次不输出任何 PASS。
+  - 退出码 0 只表示「脚本跑完」，不代表结论健康；结论看 STATUS/ALERT。别把
+    LastExitStatus=0 当成「没有假 done」。
+
+  安装（可逆）
+  ----------
+    cp <本文件去掉 .template> ~/Library/LaunchAgents/com.user.autopilot-gate.plist
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autopilot-gate.plist
+    launchctl kickstart -k gui/$(id -u)/com.user.autopilot-gate   # 立即跑一次验收
+
+  卸载 / 回滚
+  ----------
+    launchctl bootout gui/$(id -u)/com.user.autopilot-gate
+    rm ~/Library/LaunchAgents/com.user.autopilot-gate.plist
+    # 告警产物可保留：Claw/output/autopilot-gate/ 下都是只读观察记录，删掉不影响任何任务。
+
+  验收
+  ----
+    python3 scripts/autopilot_gate_check.py --self-test     # 9/9
+    python3 scripts/autopilot_gate_check.py --dry-run       # 不落盘
+    launchctl kickstart -k gui/$(id -u)/com.user.autopilot-gate
+    tail -20 ~/Library/Logs/autopilot-gate.log
+    cat Claw/output/autopilot-gate/STATUS.md
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.autopilot-gate</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+    <string>/Users/guan/WorkBuddy/Claw/scripts/autopilot_gate_check.py</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/guan</string>
+
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key><integer>12</integer>
+      <key>Minute</key><integer>50</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>17</integer>
+      <key>Minute</key><integer>50</integer>
+    </dict>
+    <dict>
+      <key>Hour</key><integer>22</integer>
+      <key>Minute</key><integer>50</integer>
+    </dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/guan/Library/Logs/autopilot-gate.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/guan/Library/Logs/autopilot-gate.err.log</string>
+</dict>
+</plist>

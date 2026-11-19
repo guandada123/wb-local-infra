@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.tencent.mac.marvis.daemon</string>
+
+	<key>AssociatedBundleIdentifiers</key>
+	<array>
+		<string>com.tencent.mac.marvis</string>
+	</array>
+
+	<key>AbandonProcessGroup</key>
+	<true/>
+
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/guan/Library/Application Support/com.tencent.mac.marvis/services/MarvisService</string>
+	</array>
+
+	<key>KeepAlive</key>
+	<true/>
+
+	<key>RunAtLoad</key>
+	<true/>
+
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>MARVIS_DAEMON_SOCKET_PATH</key>
+		<string>/Users/guan/Library/Application Support/com.tencent.mac.marvis/services/daemon.sock</string>
+		<key>MARVIS_DAEMON_DATA_DIR</key>
+		<string>/Users/guan/Library/Application Support/com.tencent.mac.marvis</string>
+	</dict>
+
+	<key>StandardOutPath</key>
+	<string>/Users/guan/Library/Logs/com.tencent.mac.marvis/daemon-stdout.log</string>
+
+	<key>StandardErrorPath</key>
+	<string>/Users/guan/Library/Logs/com.tencent.mac.marvis/daemon-stderr.log</string>
+
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+</dict>
+</plist>

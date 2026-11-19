@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/guan</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+		<key>PATH</key>
+		<string>/Users/guan/.workbuddy/binaries/node/versions/22.22.2-6/bin:/Users/guan/.workbuddy/binaries/node/cli-connector-packages/bin:/Users/guan/.workbuddy/binaries/python/envs/default/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.user.wb-event-poller</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>-c</string>
+		<string>exec /Users/guan/.workbuddy/binaries/python/envs/default/bin/python3 /Users/guan/.local/bin/wb-event-poller.py</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/guan/Library/Logs/wb-event-poller.launchd.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/guan/Library/Logs/wb-event-poller.launchd.log</string>
+	<key>StartInterval</key>
+	<integer>300</integer>
+</dict>
+</plist>

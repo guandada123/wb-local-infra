@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  自动化失败扫表（零 LLM 成本）· 每 3 小时
+
+  与 com.user.wb-liveness 分开而不是同一个 job，原因：
+    automation_failure_watchdog.py 内含 dispatch_audit()（最长 ~180s 慢路径），
+    若与存活巡检同 job，慢路径会拖住"存活"这件最该准时的事。
+
+  本体逻辑完全复用既有脚本（它自带 push），本 plist 只负责调度与环境注入。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.wb-failures</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/guan/.local/bin/wb-liveness.sh</string>
+        <string>failures</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StartInterval</key>
+    <!-- 2026-10-19：10800(3h) → 3600(1h)。**这是有意的提频，不是等价替换。**
+         原自动化「🛡️ 自动化失败扫表 watchdog（每小时）」的 RRULE 实际是
+         `FREQ=HOURLY;INTERVAL=3`（每 3 小时）—— 名字里的"每小时"是错的。
+         （我一开始按名字误判成 1h，改成 3600 后才发现原始实际就是 3h；
+           权威依据永远是 rrule 字段，不是自动化名称。）
+         提频到 1h 的理由：本任务是纯 shell、零 LLM 成本，跑得勤不产生费用；
+         而失败发现延迟从 3h 缩到 1h 是实打实的收益（2026-10-19 当天有 3 条任务
+         因积分限流失败，若更早发现可更早处置）。窗口判据仍是「近 24h」，故不影响正确性。 -->
+    <integer>3600</integer>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>LowPriorityIO</key>
+    <true/>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>HOME</key>
+        <string>/Users/guan</string>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>LANG</key>
+        <string>en_US.UTF-8</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/Library/Logs/wb-failures.launchd.out</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/Library/Logs/wb-failures.launchd.err</string>
+</dict>
+</plist>

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.user.gate-health</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+		<string>/Users/guan/.local/bin/gate-health-daily.py</string>
+	</array>
+	<key>StandardErrorPath</key>
+	<string>/Users/guan/Library/Logs/gate-health.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/guan/Library/Logs/gate-health.log</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>17</integer>
+		<key>Minute</key>
+		<integer>25</integer>
+	</dict>
+</dict>
+</plist>
