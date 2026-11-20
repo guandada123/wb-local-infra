@@ -68,8 +68,15 @@ class TestClawMirrorSync(unittest.TestCase):
         return None
 
     def test_deploy_artifacts_verbatim(self):
+        # 审计 P2-6：原实现 Claw 缺失就 skipTest —— 路径改名/卷未挂载时整类检查静默变绿，
+        # 属「失败=安静」。改为默认 fail，只有显式 SKIP_CLAW=1 才允许跳过。
         if not self.DEPLOY.is_dir():
-            self.skipTest("Claw deploy 目录不存在（跨仓检查在无 Claw 环境下跳过）")
+            if os.environ.get("SKIP_CLAW") == "1":
+                self.skipTest(f"Claw deploy 不存在且 SKIP_CLAW=1：显式跳过（{self.DEPLOY}）")
+            self.fail(
+                f"Claw deploy 目录不存在: {self.DEPLOY} —— 跨仓镜像检查无法执行。"
+                "若本机确实没有 Claw，用 SKIP_CLAW=1 显式跳过；不要让它静默变绿。"
+            )
         missing, mismatched = [], []
         for f in sorted(self.DEPLOY.iterdir()):
             if not f.is_file() or f.suffix == ".template" or f.name.startswith("test_"):
