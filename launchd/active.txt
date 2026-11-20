@@ -1,0 +1,34 @@
+# 当前活跃 launchd job 清单（2026-11-20 由 live 生成）
+# 用途：install.sh --plists 按此清单从 launchd/ 快照恢复（DR 用），只补缺失、不覆盖已有。
+# 标注 [deploy] 的由 Claw .workbuddy/deploy 部署脚本管理，本清单不负责。
+        com.user.autoloop-feishu-hub.plist
+        com.user.autoloop-feishu-push.plist
+        com.user.autopilot-gate.plist
+[deploy] com.user.claw-qts-sync.plist
+        com.user.colima-shutdown-guard.plist
+        com.user.feishu-ai-triage.plist
+        com.user.feishu-daily-digest.plist
+        com.user.feishu-event-bridge.plist
+        com.user.feishu-event-consumer.plist
+        com.user.feishu-periodic-digest.plist
+        com.user.gate-health.plist
+        com.user.hub-overview-watch.plist
+        com.user.hub-overview.plist
+        com.user.infra-sync-check.plist
+        com.user.inspection-to-queue.plist
+        com.user.lark-cli-sync.plist
+        com.user.pmf-db-drill.plist
+[deploy] com.user.pmf-db-snapshot-catchup.plist
+        com.user.pmf-db-snapshot.plist
+[deploy] com.user.portfolio-refresh.plist
+[deploy] com.user.qts-daily-backfill.plist
+        com.user.stale-card-remind.plist
+[deploy] com.user.wb-event-poller.plist
+        com.user.wb-failures.plist
+[deploy] com.user.wb-gh-watch.plist
+[deploy] com.user.wb-heartbeat.plist
+[deploy] com.user.wb-job-watch.plist
+        com.user.wb-liveness.plist
+[deploy] com.user.wb-local-review.plist
+        com.user.workbuddy-ssd-guard.plist
+        com.user.zhongtai-board.plist

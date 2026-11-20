@@ -5,15 +5,57 @@
 # 直接改 live 会让 tests/test_deploy_sync.py 变红（漂移即闸门）。
 #
 # 用法：
-#   ./install.sh                 # dry-run，只列差异
-#   ./install.sh --apply         # 实际部署
-#   DEST=/tmp/fakebin ./install.sh --apply   # 指定目标目录（演练用）
+#   ./install.sh                     # dry-run，只列差异
+#   ./install.sh --apply             # 实际部署脚本
+#   ./install.sh --plists            # dry-run：按 launchd/active.txt 补装缺失 plist
+#   ./install.sh --plists-apply      # 实际补装（只补缺失，绝不覆盖已有 plist）
+#   DEST=/tmp/fakebin ./install.sh --apply   # 指定脚本目标目录（演练用）
+#   AGENTS=/tmp/fakeagents ./install.sh --plists-apply   # 指定 plist 目标目录（演练用）
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")" && pwd)"
 DEST="${DEST:-$HOME/.local/bin}"
+AGENTS="${AGENTS:-$HOME/Library/LaunchAgents}"
 APPLY=0
-[ "${1:-}" = "--apply" ] && APPLY=1
+MODE=scripts
+case "${1:-}" in
+  --apply) APPLY=1 ;;
+  --plists) MODE=plists ;;
+  --plists-apply) MODE=plists; APPLY=1 ;;
+  "") ;;
+  *) echo "未知参数: $1（支持 --apply / --plists / --plists-apply）"; exit 2 ;;
+esac
+
+# ---- plist DR 模式：按 launchd/active.txt 只补缺失，不覆盖现有 ----
+# 场景：换机/重装后恢复 22 个无 deploy 源的 ad-hoc launchd job。
+# 安全边界：① 只处理 active.txt 列出的 job；② [deploy] 标记的归 Claw deploy 脚本管，不动；
+#          ③ 目标已存在一律跳过——绝不覆盖线上 plist。
+if [ "$MODE" = "plists" ]; then
+  LIST="$REPO/launchd/active.txt"
+  [ -f "$LIST" ] || { echo "缺少清单: $LIST"; exit 1; }
+  mkdir -p "$AGENTS"
+  installed=0; skipped=0; missing=0
+  while IFS= read -r line; do
+    case "$line" in \#*|"") continue ;; esac
+    case "$line" in "[deploy] "*) continue ;; esac
+    n="$(printf '%s' "$line" | tr -d ' ')"
+    [ -n "$n" ] || continue
+    src="$REPO/launchd/$n"; dst="$AGENTS/$n"
+    if [ ! -f "$src" ]; then echo "⚠️  快照缺失: $n"; missing=$((missing+1)); continue; fi
+    if [ -f "$dst" ]; then skipped=$((skipped+1)); continue; fi
+    if [ "$APPLY" -eq 1 ]; then
+      cp -p "$src" "$dst" && echo "✅ 补装 $n"
+    else
+      echo "[dry-run] 将补装 $n"
+    fi
+    installed=$((installed+1))
+  done < "$LIST"
+  echo "补装=$installed 已存在跳过=$skipped 快照缺失=$missing"
+  if [ "$APPLY" -eq 0 ] && [ "$installed" -gt 0 ]; then
+    echo "（dry-run；加 --plists-apply 落盘。补装后需 launchctl bootstrap 才会生效）"
+  fi
+  exit 0
+fi
 
 # 前置校验：python 脚本先过语法
 fail=0
