@@ -319,3 +319,22 @@ class TestPlistsValidation(unittest.TestCase):
             self.assertNotEqual(0, r.returncode, f"非法 plist 应导致失败\nstdout={r.stdout}")
             self.assertIn("快照非法", r.stdout)
             self.assertEqual([], list(agents.glob("*.plist")), "非法 plist 被装进目标目录了")
+
+class TestArchiveIndex(unittest.TestCase):
+    """archive-index.py 冒烟：能扫出文件、标出未分类、不写盘（--print-only）。"""
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "archive-index.py"
+
+    def test_print_only_lists_and_flags_unclassified(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "known-thing.tgz").write_bytes(b"x" * 100)
+            (d / "mystery.dat").write_bytes(b"y" * 50)
+            r = subprocess.run([os.sys.executable, str(self.SCRIPT), "--print-only", "--dir", td],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(0, r.returncode, r.stderr)
+            self.assertIn("known-thing.tgz", r.stdout)
+            self.assertIn("mystery.dat", r.stdout)
+            self.assertIn("未分类", r.stdout)
+            self.assertNotIn("INDEX.md", r.stdout, "--print-only 不该把 INDEX.md 自身列进去")
+            self.assertFalse((d / "INDEX.md").exists(), "--print-only 不得写盘")

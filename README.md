@@ -81,3 +81,18 @@
 | 生成时模板替换 | 增加一层间接，收益仅限换机场景（而换机本就需人工介入） |
 
 **换机处置**：`--plists-apply` 补装后，用 `sed -i '' "s|/Users/旧用户名|/Users/新用户名|g"` 批量替换，再 `launchctl bootstrap`。`active.txt` 头部已写此提醒。
+
+## 归档索引：`_archive` 不进资料库，进索引（2026-11-20 审计 P2-9 判断）
+
+`~/WorkBuddy/_archive`（562MB）里 86% 是不可检索的二进制（250MB cron 邮件堆 + 236MB 券商安装包）。**结论：不进云端资料库、不进 git**——大二进制会让库变垃圾场，且无法检索。正确形态是「索引进仓 + 二进制留本地」：
+
+```bash
+python3 bin/archive-index.py            # 重建 _archive/INDEX.md
+python3 bin/archive-index.py --print-only   # 只打印（零写盘）
+```
+
+- 索引产物**不手工维护**，每次由脚本重建（避免过期）；脚本里的 `VERDICT` 表登记每个归档的处置结论与「可再生性」；
+- 未登记的归档自动标「未分类/待评估」，不会静默通过；
+- 索引含 SHA256 前 16 位，可校验归档未被悄悄替换。
+
+**噪音识别**：`cron-mail-spool-20261012.mbox` 有 356,687 封，其中 99.99% 是 `openclaw_watchdog.sh` 与 `feishu_qa_bot_watchdog.sh` 的重复输出；有效 36 封已抽出为 `cron-mail-interesting-20261012.mbox`（29.5KB）。
