@@ -33,6 +33,13 @@ esac
 # 安全边界：① 只刷新 active.txt 列出的 job；② 发现 live 有而 active.txt 无的新 job → 提示补清单；
 #          ③ dry-run 默认，--snapshot-plists-apply 才落盘。
 if [ "$MODE" = "snapshot" ]; then
+  # 护栏（2026-11-20 审计 S5b，实证触发过）：AGENTS 被改成非默认目录时禁止落盘——
+  # 否则会拿临时目录内容覆盖仓内快照（反证测试时真发生过，22 个快照被写脏）。
+  if [ "$APPLY" -eq 1 ] && [ "$AGENTS" != "$HOME/Library/LaunchAgents" ] && [ "${FORCE:-0}" != "1" ]; then
+    echo "❌ 拒绝：AGENTS=$AGENTS 非默认目录，写盘会污染仓内快照。"
+    echo "   如确实要这么做：FORCE=1 ./install.sh --snapshot-plists-apply"
+    exit 3
+  fi
   LIST="$REPO/launchd/active.txt"
   [ -f "$LIST" ] || { echo "缺少清单: $LIST"; exit 1; }
   listed="$(grep -v '^#' "$LIST" | sed 's/^\[deploy\] //' | tr -d ' ' | grep -v '^$')"
