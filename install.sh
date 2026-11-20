@@ -34,6 +34,10 @@ for f in "$REPO"/bin/*; do
     continue
   fi
   if [ "$APPLY" -eq 1 ]; then
+    # 覆盖前备份 live 旧版（防手改 live 的改动被静默覆盖后无处找回）
+    if [ -f "$d" ]; then
+      cp -p "$d" "$d.bak-$(date +%Y%m%d-%H%M%S)"
+    fi
     cp -p "$f" "$d"
     echo "✅ 部署 $n"
   else
