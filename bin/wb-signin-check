@@ -1,0 +1,117 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# wb-signin-check — 加油站签到/派猫任务的外部只读检查器
+#
+# 为什么需要它（2026-09-28）：
+#   签到/派猫已改为两条 launchd 任务（com.workbuddy.auto-signin / com.workbuddy.signin-poll），
+#   零 Token、走官方接口、不依赖显示器。但它们**不经过 WorkBuddy 平台** ——
+#   平台内的自动化清单、健康快照、D1–D9 对账统统看不见它们。
+#   一旦静默死掉（腾讯改接口 / 凭据过期 / 客户端路径变化），表现只是"积分悄悄不涨"，
+#   没有任何人会知道。所以必须有一条平台之外的检查。
+#
+# 判据测**产出**，不测存活（2026-09-25 教训：💓中枢存活看门狗连跑 48 次 0 成功，
+# 而 last_run 每 2h 刷新 → 只看"跑没跑"的判据判它全场最健康）：
+#   ① 任务是否还挂在 launchd 上（被卸载 = 没人再跑）
+#   ② 日志最后一行的时刻距今多久（>30h = 已停摆；正常每天至少一行）
+#   ③ 最后一行的 result / needs_attention（凭据失效、接口变更都在这里现形）
+#
+# 退出码（与 hub_reconcile 同一套语义，便于宿主统一处理）：
+#   0  = 正常
+#   20 = 需要人处理（任务缺失 / 已停摆 / 凭据失效 / 接口报错）
+#   2  = 检查器自身输入不可用（日志不存在或读不出来）—— **绝不等于健康**
+#
+# 用法：wb-signin-check            人类可读一行
+#       wb-signin-check --json     机器可读
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+
+LOG="${WB_SIGNIN_LOG:-/Users/guan/Library/Logs/workbuddy-auto-signin.log}"   # 可用环境变量覆盖（自测/排错用）
+PY="/Users/guan/.workbuddy/binaries/python/envs/default/bin/python"
+UID_NUM="$(id -u)"
+JOBS=(com.workbuddy.auto-signin com.workbuddy.signin-poll)
+STALE_HOURS=30          # 每天至少一行（00:05 那次用 silent，ALREADY 也落盘），30h 留足余量
+JSON_MODE=0
+[ "${1:-}" = "--json" ] && JSON_MODE=1
+
+emit() {  # $1=rc  $2=code  $3=detail
+  if [ "$JSON_MODE" = 1 ]; then
+    printf '{"rc":%s,"code":"%s","detail":"%s"}\n' "$1" "$2" "$3"
+  else
+    printf '%s\n' "$3"
+  fi
+  exit "$1"
+}
+
+# ── ① 任务是否还挂着 ────────────────────────────────────────────────────────
+missing=""
+for j in "${JOBS[@]}"; do
+  launchctl print "gui/$UID_NUM/$j" >/dev/null 2>&1 || missing="${missing}${j} "
+done
+if [ -n "$missing" ]; then
+  emit 20 job_missing "签到 launchd 任务已不在（${missing% }）→ 当前无人调度签到，积分不会涨"
+fi
+
+# ── ② 日志必须存在且可读（缺失 ≠ 健康）──────────────────────────────────────
+if [ ! -f "${LOG}" ]; then
+  emit 2 no_log "签到日志不存在（${LOG}）→ 检查器无法取证，**不等于健康**；先手动跑一次 wb-signin status"
+fi
+if [ ! -r "${LOG}" ]; then
+  emit 2 log_unreadable "签到日志不可读（${LOG}，权限问题）→ 检查器无法取证，**不等于健康**"
+fi
+
+# ── ③ 判产出：最后一行的时刻 + 结果 ─────────────────────────────────────────
+JUDGE=$("$PY" - "${LOG}" "$STALE_HOURS" <<'PY' 2>/dev/null
+import datetime, json, pathlib, re, sys
+path, stale_h = sys.argv[1], float(sys.argv[2])
+try:
+    lines = [l for l in pathlib.Path(path).read_text(encoding="utf-8", errors="ignore").splitlines() if l.strip()]
+    if not lines:
+        print("empty|0||"); raise SystemExit
+    m = re.match(r"\[(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\]\s*(\{.*\})\s*$", lines[-1])
+    if not m:
+        print("unparsable|0||"); raise SystemExit
+    ts = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S")
+    d = json.loads(m.group(2))
+    age = (datetime.datetime.now() - ts).total_seconds() / 3600.0
+    # JSON 里可能含换行/引号，压平后再作为单字段传出
+    rep = str(d.get("report", ""))[:200].replace("|", "/").replace("\n", " ")
+    flag = "1" if d.get("needs_attention") else "0"
+    print(f"{d.get('result','?')}|{age:.1f}|{flag}|{rep}")
+except Exception as e:
+    print(f"error|0||{type(e).__name__}")
+PY
+)
+
+[ -z "$JUDGE" ] && emit 2 judge_failed "签到日志最后一行无法解析（python 判据执行失败）→ 检查器无法取证，**不等于健康**"
+
+RESULT="${JUDGE%%|*}"; rest="${JUDGE#*|}"
+AGE="${rest%%|*}"; rest="${rest#*|}"
+FLAG="${rest%%|*}"; REPORT="${rest#*|}"
+
+case "$RESULT" in
+  empty)
+    emit 20 empty_log "签到日志是空的（从未成功落盘过一行）→ 签到从未跑成，或日志路径写错" ;;
+  unparsable)
+    emit 20 unparsable "签到日志最后一行格式不认识（脚本可能已改版）→ 需人看一眼 ${LOG}" ;;
+  error)
+    emit 2 judge_failed "签到日志解析异常（${REPORT}）→ 检查器无法取证，**不等于健康**" ;;
+esac
+
+# 先看"是不是还在跑"，再看"跑成没有"
+STALE=$(awk -v a="$AGE" -v s="$STALE_HOURS" 'BEGIN{print (a>s)?1:0}')
+if [ "$STALE" = 1 ]; then
+  emit 20 stale "签到已停摆：日志最后一行是 ${AGE} 小时前（阈 ${STALE_HOURS}h，正常每天至少一行）→ 任务可能一直在失败，或机器长期关机"
+fi
+
+case "$RESULT" in
+  NO_AUTH|NO_SESSION|AUTH_ERROR|AUTH_REJECTED|FORBIDDEN)
+    emit 20 auth "签到凭据失效（result=${RESULT}）→ 重新登录 WorkBuddy 桌面端即可自动恢复；原文：${REPORT}" ;;
+  ERROR|UNKNOWN|NETWORK|TIMEOUT)
+    emit 20 upstream "签到脚本报错（result=${RESULT}）→ 可能是接口被改版，需更新脚本（git -C \"$HOME/Library/Application Support/workbuddy-auto-signin\" pull）；原文：${REPORT}" ;;
+esac
+
+if [ "$FLAG" = 1 ]; then
+  emit 20 attention "签到脚本自报 needs_attention=true（result=${RESULT}）→ ${REPORT}"
+fi
+
+emit 0 ok "签到正常：${AGE} 小时前 result=${RESULT} —— ${REPORT}"

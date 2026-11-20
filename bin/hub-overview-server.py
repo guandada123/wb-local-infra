@@ -33,7 +33,13 @@ PROXY_LOGS = [os.path.expanduser("~/Library/Logs/proxy-deepseek.stdout.log"),  #
               "/tmp/proxy-deepseek.stdout.log"]                                  # 切换前旧路径，过渡期合并计数
 PROXY_TAIL = 4 * 1024 * 1024   # 只读尾部 4MB（约 10 天量），避免日志无限增长后每次全量扫
 PROXY_DAILY = os.path.expanduser("~/.agent-autoloop/hub-proxy-daily.json")  # 每日计数快照（补重启丢数）
+CI_CACHE = os.path.expanduser("~/.agent-autoloop/hub-ci-cache.json")       # CI 结果后台缓存（15 分钟过期）
 _proxy_cache = {"key": None, "stats": None}
+_status_cache = {"ts": 0, "data": None}
+_ci_trigger = {"at": 0}
+_collect_cache = {"ts": 0, "data": None}
+CACHE_TTL = 5          # 主接口响应缓存（秒）：页面 5 分钟刷新，无需每次全量采集
+CI_STALE = 900         # CI 缓存 15 分钟视为过期
 TZ = timezone(timedelta(hours=8))  # Asia/Shanghai
 AA = shutil.which("agent-autoloop") or os.path.expanduser("~/.local/bin/agent-autoloop")
 AUTH_PY = os.path.expanduser("~/.workbuddy/binaries/python/versions/3.13.12/bin/python3")
@@ -144,21 +150,138 @@ def proxy_stats():
     _proxy_cache["stats"] = out
     return out
 
-def git_info(path):
-    """取 branch / 最近提交 / 未提交改动数；失败返回 None"""
+def status_snapshot():
+    """取中台权威状态（`agent-autoloop status --json`）：等你决策 / 在跑 / 排队 / 今日完成 + 待回答卡片。
+    这是唯一「需要人动手」的指标来源，30s 缓存避免频繁起进程。"""
+    t = time.time()
+    if _status_cache["data"] and t - _status_cache["ts"] < 30:
+        return _status_cache["data"]
     try:
-        br = subprocess.run(["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"],
-                            capture_output=True, text=True, timeout=5).stdout.strip()
+        p = subprocess.run([AA, "status", "--json"], capture_output=True, text=True, timeout=15)
+        d = json.loads(p.stdout or "{}")
+        tot = d.get("totals") or {}
+        cards = [{"title": (c.get("title") or "")[:60], "kind": c.get("kind") or "",
+                  "at": (c.get("createdAt") or "")[5:16]} for c in (d.get("cards") or [])[:5]]
+        out = {"ok": True, "attention": tot.get("attention", 0), "running": tot.get("running", 0),
+               "queued": tot.get("queued", 0), "retrying": tot.get("retrying", 0),
+               "done_today": tot.get("doneToday", 0), "cards": cards}
+    except Exception as e:
+        out = {"ok": False, "attention": -1, "running": -1, "queued": -1, "retrying": -1,
+               "done_today": -1, "cards": [], "note": type(e).__name__}
+    _status_cache.update({"ts": t, "data": out})
+    return out
+
+def ci_cache():
+    """CI 结果缓存：读到就立即返回（0 成本）；过期或缺失则**后台异步**刷新，不阻塞本次响应。"""
+    data, mtime = {}, 0.0
+    try:
+        mtime = os.stat(CI_CACHE).st_mtime
+        data = json.load(open(CI_CACHE, encoding="utf-8"))
+    except Exception:
+        pass
+    stale = (time.time() - mtime) > CI_STALE
+    if (stale or not data) and time.time() - _ci_trigger["at"] > 60:
+        _ci_trigger["at"] = time.time()
+        try:
+            subprocess.Popen([AUTH_PY, CI_SCRIPT, "--json", "--out", CI_CACHE],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except Exception:
+            pass
+    return data or {}
+
+def git_info(path):
+    """取 branch / 最近提交 / 未提交数：2 次 git 调用（status --branch 合并拿分支与脏文件）"""
+    try:
+        st = subprocess.run(["git", "-C", path, "status", "--porcelain=v1", "--branch"],
+                            capture_output=True, text=True, timeout=8)
+        if st.returncode != 0:
+            return None
+        lines = (st.stdout or "").splitlines()
+        head = lines[0] if lines else ""
+        m = re.match(r"^## ([^\s.]+)", head)
+        branch = m.group(1) if m else "?"
+        changed = [l for l in lines[1:] if l.strip()]
+        dirty = len(changed)
+        # 运行产物（.autopilot/ 与 work/ 下的落盘）不该被当成"代码改动"，单列出来避免误判
+        runtime = sum(1 for l in changed
+                      if re.search(r"(?:^|\s)(?:\.autopilot|work)/", l[3:] if len(l) > 3 else l))
         lg = subprocess.run(["git", "-C", path, "log", "-1", "--format=%h|%ad|%s", "--date=format:%m-%d %H:%M"],
                             capture_output=True, text=True, timeout=5).stdout.strip()
-        dirty = subprocess.run(["git", "-C", path, "status", "--porcelain"],
-                               capture_output=True, text=True, timeout=8).stdout.count("\n")
-        if not br or not lg:
+        if not lg:
             return None
-        h, t, s = (lg.split("|", 2) + ["", "", ""])[:3]
-        return {"branch": br, "hash": h, "time": t, "subject": s[:42], "dirty": dirty}
+        h, tm, s = (lg.split("|", 2) + ["", "", ""])[:3]
+        return {"branch": branch, "hash": h, "time": tm, "subject": s[:42],
+                "dirty": dirty, "runtime": runtime}
     except Exception:
         return None
+
+
+# ── 服务日志真实报错（events 表覆盖不到底层 traceback / 端点不支持 / 计费类错误）──
+SVC_LOG_DIR = os.path.expanduser("~/.agent-autoloop/logs")
+SVC_LOG_TAIL = 256 * 1024        # 每个文件只读尾部，防日志膨胀拖慢采集
+SVC_ERR_RE = re.compile(r"(traceback|exception|\berror\b|\bfailed\b|❌|rc=[1-9])", re.I)
+# 噪音：① no such file 等已知易过 ② triage 的 [JUDGE] 行是「被研判消息的标题」（标题本身常含"失败"二字），不是报错
+SVC_SKIP_RE = re.compile(r"(no such file|Cache hit|git config|\[JUDGE\])", re.I)
+# 栈体行（缩进的 File "..."/源码片段/^~）无独立信息，只留异常类型与消息那行
+_SVC_TBODY = re.compile(r"^\s+(File \"|\^+~*|response =|raise |return |self\.)")
+_SVC_BARE = re.compile(r"^traceback \(most recent call last\):?\s*$", re.I)  # 孤零零的栈头无信息
+_SVC_TS1 = re.compile(r"^\[?(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})")     # 2026-11-11 08:31:05
+_SVC_TS2 = re.compile(r"^\[?(\d{2}-\d{2})\s(\d{2}:\d{2}:\d{2})")             # 11-11 08:31:05（无年）
+_svc_cache = {"key": None, "rows": None}
+
+
+def _svc_ts(line):
+    """只认行内时间戳；没有就返回 ("", "")，绝不拿文件 mtime 冒充行时间。"""
+    m = _SVC_TS1.match(line)
+    if m:
+        return m.group(1), m.group(2)
+    m = _SVC_TS2.match(line)
+    if m:
+        return f"{datetime.now().year}-{m.group(1)}", m.group(2)
+    return "", ""
+
+
+def service_logs(per_file=3, total=30):
+    """从 ~/.agent-autoloop/logs/*.log 抽真实报错行 → 日志区可见。
+    时间只取行内时间戳；行内无时间戳则留空（不臆造）。"""
+    try:
+        files = [os.path.join(SVC_LOG_DIR, n) for n in os.listdir(SVC_LOG_DIR) if n.endswith(".log")]
+    except Exception:
+        return []
+    key = []
+    rows = []
+    for path in files:
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        key.append((path, st.st_mtime, st.st_size))
+        try:
+            with open(path, encoding="utf-8", errors="ignore") as fh:
+                if st.st_size > SVC_LOG_TAIL:
+                    fh.seek(st.st_size - SVC_LOG_TAIL)
+                    fh.readline()
+                hits = [l.strip() for l in fh
+                        if SVC_ERR_RE.search(l) and not SVC_SKIP_RE.search(l)
+                        and not _SVC_BARE.match(l.strip()) and not _SVC_TBODY.match(l.rstrip())]
+        except Exception:
+            continue
+        if not hits:
+            continue
+        for line in hits[-per_file:]:
+            d, t = _svc_ts(line)
+            lvl = "WARN" if re.search(r"\[warn\]|\bwarn(ing)?\b", line, re.I) else "ERROR"
+            rows.append({"date": d, "time": t, "lvl": lvl,
+                         "src": os.path.basename(path).replace(".log", ""),
+                         "msg": line[:160], "_k": (d, t) if d else ("", "")})
+    k = tuple(key)
+    if _svc_cache["key"] == k and _svc_cache["rows"] is not None:
+        out = _svc_cache["rows"]
+    else:
+        out = sorted(rows, key=lambda r: r["_k"], reverse=True)[:total]
+        _svc_cache.update({"key": k, "rows": out})
+    return [dict(r) for r in out]
 
 def collect():
     # 预置完整空结构：任何单源失败都返回空数组而非「缺键」，
@@ -179,6 +302,14 @@ def collect():
         todo_err = f"{type(e).__name__}: {e}"
     svc_rows, svc_err = launchd_rows()
     ps = proxy_stats()
+    st = status_snapshot()
+    ci = ci_cache()
+    old_days, old_title = (None, None)
+    if todo_blocks is not None:
+        try:
+            old_days, old_title = queue_oldest()
+        except Exception:
+            pass
 
     # ---- hub.db（只读）----
     con = None
@@ -219,6 +350,13 @@ def collect():
         # 无时序真源的 KPI 不伪造趋势条（spark=None → 前端不渲染）
         out["kpi"] = {
             "today": [
+                # 置顶：唯一需要人动手的指标
+                {"label": "等你决策", "value": st["attention"] if st["attention"] >= 0 else "—", "unit": "条",
+                 "trend": (st["cards"][0]["title"][:26] if st["cards"] else "无待回答卡片"),
+                 "cls": "bad" if st["attention"] > 0 else "ok", "spark": None},
+                {"label": "在跑轮次", "value": st["running"] if st["running"] >= 0 else "—", "unit": "轮",
+                 "trend": f"排队 {st['queued']} · 重试 {st['retrying']}",
+                 "cls": "run" if st["running"] > 0 else "", "spark": None},
                 {"label": "调度轮次(今日)", "value": len(t_runs), "unit": "轮",
                  "trend": f"7日 {sum(by_day.values())} 轮", "cls": "", "spark": [by_day[d] for d in days]},
                 {"label": "完成轮次(今日)", "value": t_done, "unit": "轮",
@@ -229,7 +367,10 @@ def collect():
                 {"label": "hub 调度规则", "value": len(scheds), "unit": "条",
                  "trend": "hub.db schedules", "cls": "", "spark": None},
                 {"label": "待办事项", "value": len(todo_blocks) if todo_blocks is not None else "—", "unit": "条",
-                 "trend": "QUEUE.md TODO 段", "cls": "warn", "spark": None},
+                 "trend": (f"最老 {old_days} 天 · {old_title[:20]}" if old_days is not None
+                           else "QUEUE.md TODO 段"),
+                 "cls": ("bad" if (old_days or 0) >= 7 else ("warn" if (old_days or 0) >= 3 else "")),
+                 "spark": None},
                 {"label": "事件(近7日)", "value": sum(1 for e in evs if local_day(e.get("received_at")) in days),
                  "unit": "条", "trend": f"取样最近 {len(evs)} 条", "cls": "", "spark": None},
                 {"label": "代理请求(今日)", "value": ps.get("today", 0), "unit": "次",
@@ -241,6 +382,10 @@ def collect():
             "week": None,  # 前端保留切换；真数据暂只出今日口径，week 复用今日
         }
         out["kpi"]["week"] = [
+            {"label": "等你决策", "value": st["attention"] if st["attention"] >= 0 else "—", "unit": "条",
+             "trend": "当前态（非 7 日累计）", "cls": "bad" if st["attention"] > 0 else "ok", "spark": None},
+            {"label": "在跑轮次", "value": st["running"] if st["running"] >= 0 else "—", "unit": "轮",
+             "trend": f"排队 {st['queued']}", "cls": "run" if st["running"] > 0 else "", "spark": None},
             {"label": "调度轮次(7日)", "value": sum(by_day.values()), "unit": "轮",
              "trend": "runs 视图", "cls": "", "spark": [by_day[d] for d in days]},
             {"label": "完成轮次(7日)", "value": sum(done_day.values()), "unit": "轮",
@@ -286,6 +431,8 @@ def collect():
             {"label": "launchd com.user.*", "val": f"{len(svc_rows)} 个", "note": "launchctl list 实时计数"},
             {"label": "代理请求(今日)", "val": f"{ps.get('today', 0)} 次 / 失败 {ps.get('fail_today', 0)}",
              "note": ps.get("note", "")},
+            {"label": "最老待办", "val": (f"{old_days} 天" if old_days is not None else "—"),
+             "note": (f"{old_title[:40]}（仅统计群消息来源条目）" if old_title else "无带原文的待办")},
         ]
 
         # 日志区 = events 事件账（结构化、有级别可判）+ 尾部日志行补充
@@ -297,6 +444,13 @@ def collect():
             logs.append({"time": (e.get("received_at") or "")[11:19], "date": local_day(e.get("received_at")) or "",
                          "lvl": lvl, "src": e.get("type") or "event",
                          "msg": msg[:120]})
+        # 补：launchd 各服务日志里的真实报错（events 表看不到底层 traceback / 计费 / 端点不支持等）
+        try:
+            svc = service_logs()
+            if svc:
+                logs = svc + logs
+        except Exception:
+            pass
         out["logs"] = logs
     except Exception as e:
         out["sources"]["hub.db"] = {"error": f"{type(e).__name__}: {e}"}
@@ -339,26 +493,39 @@ def collect():
         out["sources"]["QUEUE.md"] = {"error": todo_err}
     else:
         for b in (todo_blocks or [])[:12]:
-            first = b.lstrip("-[] ").strip()          # 去 markdown 勾选框前缀
-            title = first.split("风险")[0].strip()[:80]  # 取风险标注前的主体
-            out["todos"].append({"p": "P1", "title": title, "src": "QUEUE.md TODO 段", "due": "-", "done": False})
+            out["todos"].append({"p": "P1", "title": todo_title(b),
+                                 "src": "QUEUE.md TODO 段", "due": "-", "done": False})
         out["sources"]["QUEUE.md"] = {"todo_blocks": len(todo_blocks or [])}
 
     # ---- 应用卡：同级目录探测 git 真源（找不到就诚实标「未定位」，不伪造状态）----
     apps = []
     for name, sub, prio in PROJECTS:
         p = os.path.join(BASE_DIR, sub)
-        gi = git_info(p) if os.path.isdir(os.path.join(p, ".git")) else None
+        gi = git_info_cached(p) if os.path.isdir(os.path.join(p, ".git")) else None
+        # CI 缓存的 key 是目录名（脚本按目录扫描），显示名不同，两者都试
+        _repos = ci.get("repos") or {}
+        c = _repos.get(sub) or _repos.get(name) or {}
+        icon = {"success": "✅", "failure": "❌"}.get(c.get("conclusion"), "⏳")
+        if not ci:
+            ci_meta = "采集中…（后台首次约 9s）"
+        elif c:
+            ci_meta = f"{icon} {c.get('conclusion') or c.get('reason') or '无记录'} · {c.get('at', '')}".strip(" ·")
+        else:
+            ci_meta = "无记录"
         if gi:
             dirty = gi["dirty"]
+            runtime = gi.get("runtime", 0)
+            tag = ("工作区干净" if not dirty else
+                   (f"未提交 {dirty}（运行产物 {runtime}）" if runtime else f"未提交 {dirty}"))
             apps.append({"name": f"{name}（{prio}）",
                          "desc": f"{gi['branch']} · {gi['subject']}",
-                         "tag": f"未提交 {dirty}" if dirty else "工作区干净",
-                         "tagCls": "warn" if dirty else "done",
-                         "meta": {"最近提交": gi["time"], "hash": gi["hash"], "分支": gi["branch"]}})
+                         "tag": tag,
+                         "tagCls": "warn" if dirty - runtime > 0 else ("queue" if dirty else "done"),
+                         "meta": {"最近提交": gi["time"], "hash": gi["hash"], "CI": ci_meta}})
         else:
             apps.append({"name": f"{name}（{prio}）", "desc": "同级目录下未找到 git 仓库",
-                         "tag": "未定位", "tagCls": "queue", "meta": {"路径": "未找到"}})
+                         "tag": "未定位", "tagCls": "queue",
+                         "meta": {"路径": "未找到", "CI": ci_meta}})
     out["assets"]["apps"] = apps
     out["sources"]["git"] = {"projects": len(PROJECTS),
                              "found": sum(1 for a in apps if a["tag"] != "未定位")}
@@ -432,13 +599,73 @@ def launchd_rows():
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
 
+def todo_title(line):
+    """从 QUEUE 条目行提取可读标题：优先「要求: 复核 …」，否则去 ID 前缀的正文段。"""
+    if "要求: 复核 " in line:
+        return line.split("要求: 复核 ", 1)[1].split("；", 1)[0].strip()[:80]
+    core = line.split("风险")[0].strip()
+    m = re.match(r"^(T-[\w-]+)\s*·\s*(.+)$", core)
+    return (m.group(2) if m else core)[:80]
+
+_backlog_cache = {"ts": 0, "data": (None, None)}
+_git_cache = {}            # path -> (ts, info)
+GIT_TTL = 300              # 应用卡 git 信息 5 分钟缓存
+BACKLOG_TTL = 300          # 「最老待办」5 分钟缓存
+
+def queue_oldest():
+    """最老待办的排队天数（按 inbox 原文 mtime 估算，仅覆盖群消息来源条目）。
+    返回 (days, title)；无可用数据返回 (None, None)。
+    性能：launchd 进程访问外置卷有 TCC 开销（实测每次 stat 数十 ms），故用一次 scandir
+    取全量 mtime + 5 分钟缓存，避免每条待办各 stat 一次（10 条 = 10 次跨卷调用）。"""
+    t = time.time()
+    if _backlog_cache["data"][0] is not None and t - _backlog_cache["ts"] < BACKLOG_TTL:
+        return _backlog_cache["data"]
+    inbox = os.path.join(CLAW_REPO, ".autopilot", "inbox")
+    mtimes = {}
+    try:
+        with os.scandir(inbox) as it:
+            for e in it:
+                m = re.match(r"^chat-([0-9a-f]{12})\.md$", e.name)
+                if not m:
+                    continue
+                try:
+                    mtimes[m.group(1)] = e.stat().st_mtime
+                except OSError:
+                    pass
+    except OSError:
+        return (None, None)
+    best = None
+    todo = parse_todo()
+    for line in todo:
+        m = re.search(r"chat-([0-9a-f]{12})\.md", line)
+        if not m:
+            continue
+        mt = mtimes.get(m.group(1))
+        if mt is None:
+            continue
+        if best is None or mt < best[0]:
+            best = (mt, todo_title(line))
+    out = (None, None) if not best else (round((t - best[0]) / 86400, 1), best[1])
+    _backlog_cache.update({"ts": t, "data": out})
+    return out
+
+def git_info_cached(path):
+    """git 信息 5 分钟缓存：外置卷 subprocess 开销大，而分支/提交在分钟级不变。"""
+    t = time.time()
+    hit = _git_cache.get(path)
+    if hit and t - hit[0] < GIT_TTL:
+        return hit[1]
+    info = git_info(path)
+    _git_cache[path] = (t, info)
+    return info
+
 def parse_todo():
-    """QUEUE.md 的 TODO 段按 '---' 分块，返回非空块文本列表"""
+    """QUEUE.md TODO 段的待办条目：按 `- [ ]` 行数清点。
+    2026-11-19 修复：原按 markdown `---` 分块，多条挤一块时 KPI 少报（实测 10 条只报 4 条）。"""
     txt = open(QUEUE, encoding="utf-8").read()
     seg = txt.split("## TODO", 1)[1]
     seg = re.split(r"^## (DOING|BLOCKED|DONE|HANDOFF)\b", seg, flags=re.M)[0]
-    blocks = [b.strip().replace("\n", " ") for b in seg.split("\n---\n")]
-    return [b for b in blocks if b and b != ""]
+    return [l.strip()[6:].strip() for l in seg.splitlines() if l.strip().startswith("- [ ]")]
 
 def db_size():
     try:
@@ -456,6 +683,27 @@ def launchd_count():
         return -1
 
 BASE = os.path.realpath(os.path.join(HERE, ".."))   # 静态根默认 = 脚本上级（仓库内直接跑时）
+
+def collect_cached(force=False):
+    """主接口响应缓存：TTL 内直接复用，避免每次请求全量采集（含 8 次 git / CLI / 日志扫描）。
+    force=True 由「手动刷新」触发，跳过缓存立即重算。"""
+    t = time.time()
+    if force:                       # 手动刷新：连 git / 积压缓存一起失效，拿最新
+        _git_cache.clear()
+        _backlog_cache["ts"] = 0
+    if not force and _collect_cache["data"] and (t - _collect_cache["ts"]) < CACHE_TTL:
+        d = dict(_collect_cache["data"])
+        d["cached"] = True
+        return d
+    d = collect()
+    _collect_cache.update({"ts": t, "data": d})
+    return d
+
+def invalidate_caches():
+    """动作执行后立即失效缓存，保证点完就能看到变化"""
+    _collect_cache["data"] = None
+    _status_cache["data"] = None
+    _ci_trigger["at"] = 0
 
 class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -492,13 +740,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, json.dumps({"error": f"请求体解析失败：{e}"}, ensure_ascii=False).encode(),
                        "application/json; charset=utf-8"); return
         code, payload = run_action(str(body.get("action", "")), body.get("ack") is True)
+        if code == 200:
+            invalidate_caches()          # 动作已改变状态 → 让下次读接口立刻反映
         self._send(code, json.dumps(payload, ensure_ascii=False).encode(),
                    "application/json; charset=utf-8")
 
     def do_GET(self):
         if self.path.startswith("/api/hub/overview"):
             try:
-                body = json.dumps(collect(), ensure_ascii=False).encode()
+                force = "force=1" in self.path
+                body = json.dumps(collect_cached(force=force), ensure_ascii=False).encode()
                 self._send(200, body, "application/json; charset=utf-8")
             except Exception as e:
                 self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False).encode(),

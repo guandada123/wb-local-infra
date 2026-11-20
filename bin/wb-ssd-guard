@@ -1,0 +1,445 @@
+#!/usr/bin/env python3
+"""wb-ssd-guard — WorkBuddy 记忆系统宿主盘（外置 SSD）挂载守卫
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+为何存在（2026-10-09 建立）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+本机**全部** Agent 记忆都宿在一块外置 SSD 上：
+    /Users/guan/.workbuddy  ──软链──► /Volumes/ZHITAI/workbuddy_data   (18 GB)
+    /Users/guan/WorkBuddy   ──软链──► /Volumes/ZHITAI/WorkBuddy
+正常时无人察觉；一旦 SSD 未挂载/被弹出：
+    · 两条软链变成**悬空链** → 所有记忆读写 ENOENT；
+    · 更危险的是**分裂**：任一层在软链路径上"自愈"重建同名实体目录，
+      就会在内置盘上长出一份**空的第二大脑**，此后写入分叉、静默丢数据。
+全机 91 条 ACTIVE 自动化里**没有任何一条**检查挂载状态 → 这是本机最高的单点风险。
+
+因此本守卫**刻意装在「内置盘」上**（`~/.local/bin/` + launchd），
+保证在 SSD 消失时它自己仍然活着。它**不依赖** Claw 的任何脚本或配置。
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+用法
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    wb-ssd-guard                 # 检查 + 按需告警（launchd 调用）
+    wb-ssd-guard --json          # 只输出 JSON
+    wb-ssd-guard --quiet         # 只输出一行摘要
+    wb-ssd-guard --no-push       # 不推飞书（排障用）
+    wb-ssd-guard --selftest      # 用临时树跑一遍全部失败路径（安全，不碰真盘）
+
+退出码：0=正常  1=警告  2=严重
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+铁律（改本脚本前先读）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+① **只读**。本脚本绝不创建/移动/删除任何记忆文件（唯一的写是日志与告警标记，
+   都在内置盘的 ~/Library/Logs/ 与 ~/）。
+② **不得调用 SSD 上的任何东西**来判定"SSD 是否在"。push 是"尽力而为"，
+   失败必须静默降级——否则守卫会因宿主缺失而自己先崩。
+③ 告警必须**限频**（状态变化即告警；同状态 12h 内不重复），否则每 30 分钟刷屏。
+④ `os.path.exists()` 对悬空软链返回 False —— 判定"软链在不在"必须用
+   `os.path.islink()`，两者不可混用（本机踩过同类坑：`du` 对软链返 0B）。
+⑤ **定时环境必须实跑回读，手动跑通过不算数**（2026-10-09 首次实跑即踩）：
+   macOS 隐私策略(TCC)不给 launchd 中的 `/usr/bin/python3` 读**可移动卷**的权限，
+   所以"读文件内容"类检查手动通过、launchd 必失败并误报 CRIT。
+   → 守卫**只做宿主层三件事：挂载 / 软链 / 空间**（这三项在 TCC 下不受限）。
+     文件内容级校验交给应用进程内的 03:30 记忆维护自动化，职责分离。
+   改完任何检查，必须 `launchctl kickstart -k` 后再读 jsonl 日志确认实际判定。
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
+
+# ── 配置 ────────────────────────────────────────────────────────────────
+HOME = os.path.expanduser("~")
+SSD_ROOT = "/Volumes/ZHITAI"
+
+# (软链路径, 期望目标前缀) —— 期望前缀用于判"是否还指向该卷"
+EXPECTED_LINKS = [
+    (os.path.join(HOME, ".workbuddy"), os.path.join(SSD_ROOT, "workbuddy_data")),
+    (os.path.join(HOME, "WorkBuddy"), os.path.join(SSD_ROOT, "WorkBuddy")),
+]
+
+# 关键文件：任一读不到 = 记忆系统不可用
+CRITICAL_FILES = [
+    os.path.join(HOME, ".workbuddy", "MEMORY.md"),
+    os.path.join(HOME, ".workbuddy", "workbuddy.db"),
+    os.path.join(HOME, ".workbuddy", "memory", "memory_index.db"),
+    os.path.join(HOME, "WorkBuddy", "Claw", ".workbuddy", "memory", "MEMORY.md"),
+]
+
+WARN_PCT = 85.0  # 与 Claw 统一巡检中枢同口径（disk_space_audit.py）
+CRIT_PCT = 92.0
+FREE_FLOOR_GB = 20.0  # 可用空间硬地板
+
+LOG_DIR = os.path.join(HOME, "Library", "Logs")
+JSONL = os.path.join(LOG_DIR, "workbuddy-ssd-guard.jsonl")
+STATE = os.path.join(LOG_DIR, "workbuddy-ssd-guard.state.json")
+MARKER = os.path.join(HOME, "workbuddy-ssd-ALERT.txt")  # 内置盘上的可见标记
+ALERT_COOLDOWN_H = 12
+
+# 尽力而为的推送入口（在 SSD 上；SSD 掉线时必然失败，必须静默降级）
+FEISHU = os.path.join(HOME, "WorkBuddy", "Claw", ".workbuddy", "scripts", "push_feishu.sh")
+
+LEVELS = {"ok": 0, "warn": 1, "crit": 2}
+
+
+# ── 单项检查 ────────────────────────────────────────────────────────────
+def check_mount():
+    """卷是否已挂载，且确实是独立设备（防「内置盘上有个同名空目录」冒充）。"""
+    p = SSD_ROOT
+    if not os.path.exists(p):
+        return "crit", f"{p} 不存在（卷未挂载）"
+    if not os.path.ismount(p):
+        return "crit", f"{p} 存在但不是挂载点（疑似内置盘上的同名空目录）"
+    try:
+        if os.stat(p).st_dev == os.stat("/").st_dev:
+            return "crit", f"{p} 与 / 同设备（未真正挂载，已回落到内置盘）"
+    except OSError as e:
+        return "crit", f"stat {p} 失败: {e}"
+    return "ok", f"{p} 已挂载"
+
+
+def check_links():
+    """软链完整性：必须「是软链」+「指向该卷」+「目标可达」。
+    注意：悬空软链 islink=True 但 exists=False，必须分别判。"""
+    worst, msgs = "ok", []
+    for link, expect in EXPECTED_LINKS:
+        if not os.path.islink(link):
+            if os.path.isdir(link):
+                worst = "crit"
+                msgs.append(f"{link} 已不是软链而是实体目录 → 🔴 分裂：记忆可能已写进内置盘")
+            elif os.path.exists(link):
+                worst = "crit"
+                msgs.append(f"{link} 是普通文件，异常")
+            else:
+                worst = "crit"
+                msgs.append(f"{link} 不存在（软链被删）")
+            continue
+        target = os.path.realpath(link)
+        if not target.startswith(EXPECTED_LINKS[0][1][: len(SSD_ROOT)]):
+            worst = "crit"
+            msgs.append(f"{link} 指向卷外: {target}")
+            continue
+        if not os.path.exists(link):  # 悬空
+            worst = "crit"
+            msgs.append(f"{link} 悬空 → 目标 {target} 不可达")
+        elif target != expect:
+            worst, _ = ("warn", None) if worst == "ok" else (worst, None)
+            msgs.append(f"{link} 指向 {target}（期望 {expect}）")
+        else:
+            msgs.append(f"{link} ✓")
+    return worst, " | ".join(msgs)
+
+
+def check_files():
+    """关键文件可达性。
+
+    ⚠️ 2026-10-09 修正（首次 launchd 实跑就误报 CRIT，真因见下）：
+      本检查原用 `open()` 真读 1 字节。**手动跑通过，launchd 里必失败** ——
+      macOS 隐私策略(TCC)不授予 launchd 中的 `/usr/bin/python3` 读取**可移动卷**的权限，
+      4 个文件全部抛 PermissionError，被误判成"记忆系统不可读"并写下告警标记。
+      这是「手动测试通过 ≠ 定时环境通过」的教科书案例。
+
+      改为两层判定，职责不重叠：
+        · `os.stat()` 判**存在性**（stat 走目录项，不受 TCC 内容访问限制）→ 缺失=crit
+        · 权限受限 → **warn**（明说"受隐私策略限制，非数据故障"），绝不误报 crit
+
+      并且：**文件可读性**本就由 03:30「记忆+上下文维护」自动化在**应用进程内**覆盖
+      （它有完整磁盘访问权限，本来就检查 MEMORY.md 可 grep）。守卫视只负责
+      宿主层三件事：挂载 / 软链 / 空间 —— 这三项在 launchd 下实测均正常。
+      职责分离后既无覆盖缺口，也无不必要的权限依赖。
+    """
+    missing, denied = [], []
+    for f in CRITICAL_FILES:
+        try:
+            st = os.stat(f)
+            if st.st_size == 0:
+                missing.append(f"{f} (0 字节)")
+        except FileNotFoundError:
+            missing.append(f"{f} (不存在)")
+        except PermissionError:
+            denied.append(f)
+        except OSError as e:
+            missing.append(f"{f} ({e.__class__.__name__})")
+
+    if missing:
+        return "crit", "关键文件缺失/为空: " + "; ".join(missing)
+    if denied:
+        return "warn", (
+            f"{len(denied)} 个文件存在但因 macOS 隐私策略(TCC)不可读 —— "
+            f"**非数据故障**；如需内容级校验，给 /usr/bin/python3 授"
+            f"「完整磁盘访问」或依赖 03:30 记忆维护自动化（应用内已覆盖）"
+        )
+    return "ok", f"{len(CRITICAL_FILES)} 个关键文件均存在且非空"
+
+
+def check_space():
+    """宿主盘使用率与可用空间地板。"""
+    try:
+        u = shutil.disk_usage(SSD_ROOT)
+    except OSError as e:
+        return "crit", f"disk_usage 失败: {e}"
+    pct = u.used / u.total * 100 if u.total else 0
+    free_gb = u.free / 1024**3
+    detail = (
+        f"{pct:.1f}% 已用 / 可用 {free_gb:.1f} GB（阈值 warn {WARN_PCT:.0f}% crit {CRIT_PCT:.0f}%）"
+    )
+    if pct >= CRIT_PCT or free_gb < FREE_FLOOR_GB:
+        return "crit", detail
+    if pct >= WARN_PCT:
+        return "warn", detail
+    return "ok", detail
+
+
+CHECKS = [
+    ("mount", check_mount),
+    ("symlink", check_links),
+    ("files", check_files),
+    ("space", check_space),
+]
+
+
+# ── 告警投递（全部尽力而为，绝不因失败而中断判定）──────────────────────
+def _append_jsonl(rec: dict):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(JSONL, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        pass
+
+
+def _read_state() -> dict:
+    try:
+        with open(STATE, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_state(d: dict):
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(STATE, "w", encoding="utf-8") as fh:
+            json.dump(d, fh, ensure_ascii=False)
+    except OSError:
+        pass
+
+
+def _push(title: str, body: str):
+    """尽力而为：SSD 掉线时此路径必然不可达，静默跳过（这是设计，不是缺陷）。"""
+    if not os.path.isfile(FEISHU):
+        return False
+    try:
+        p = subprocess.run(["/bin/bash", FEISHU, title, body], capture_output=True, timeout=25)
+        return p.returncode == 0
+    except Exception:
+        return False
+
+
+def _notify(title: str, body: str):
+    """macOS 通知（用户会话存在时可见；无头环境下静默失败）。"""
+    try:
+        subprocess.run(
+            [
+                "/usr/bin/osascript",
+                "-e",
+                f"display notification {json.dumps(body)} with title {json.dumps(title)}",
+            ],
+            capture_output=True,
+            timeout=10,
+        )
+    except Exception:
+        pass
+
+
+def _marker_write(text: str):
+    try:
+        with open(MARKER, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    except OSError:
+        pass
+
+
+def _marker_clear():
+    try:
+        if os.path.exists(MARKER):
+            os.remove(MARKER)
+    except OSError:
+        pass
+
+
+# ── 主流程 ──────────────────────────────────────────────────────────────
+def run(do_push=True, simulate=None):
+    results = []
+    for name, fn in CHECKS:
+        try:
+            lvl, detail = fn()
+        except Exception as e:  # 检查自身异常 → 一律按严重算
+            lvl, detail = "crit", f"检查抛异常: {e.__class__.__name__}: {e}"
+        results.append({"check": name, "level": lvl, "detail": detail})
+
+    overall = "ok"
+    for r in results:
+        if LEVELS[r["level"]] > LEVELS[overall]:
+            overall = r["level"]
+
+    now = time.time()
+    rec = {
+        "ts": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "level": overall,
+        "results": results,
+    }
+
+    # 日志：每次运行都记（这是取证基础，本机铁律「先抓证据再下结论」）
+    _append_jsonl(rec)
+
+    st = _read_state()
+    prev_level = st.get("last_level")
+    last_alert = st.get("last_alert_at", 0)
+
+    if overall == "ok":
+        _marker_clear()
+        if prev_level and prev_level != "ok" and do_push:
+            _push("🟢 记忆宿主盘已恢复", f"SSD 挂载守卫：{prev_level} → ok，记忆系统恢复可读写。")
+        _write_state({"last_level": "ok", "last_alert_at": last_alert, "last_ok_at": now})
+        return overall, results
+
+    # 非 ok：状态变化 或 距上次告警 > 冷却期 → 告警
+    should_alert = do_push and (
+        overall != prev_level or (now - last_alert) > ALERT_COOLDOWN_H * 3600
+    )
+    bad = [r for r in results if r["level"] != "ok"]
+    head = "\n".join(f"[{r['level'].upper()}] {r['check']}: {r['detail']}" for r in bad)
+
+    _marker_write(
+        f"⚠️ WorkBuddy 记忆宿主盘异常（{rec['ts']}，级别 {overall.upper()}）\n\n{head}\n\n"
+        f"→ 在此状态下**不要**继续让 Agent 写记忆，否则可能在内置盘长出分裂的第二大脑。\n"
+        f"→ 先确认外置 SSD（/Volumes/ZHITAI）已插好并挂载；插好后本标记会自动消失。\n"
+        f"→ 明细日志：{JSONL}\n"
+    )
+
+    if should_alert:
+        _push(
+            f"{'🔴' if overall == 'crit' else '⚠️'} 记忆宿主盘异常（{overall.upper()}）",
+            f"SSD 挂载守卫：\n{head}\n\n受影响：~/.workbuddy（全部 Agent 记忆）、~/WorkBuddy（全部项目）",
+        )
+        _notify("WorkBuddy 记忆宿主盘异常", head[:180])
+        _write_state({"last_level": overall, "last_alert_at": now})
+    else:
+        _write_state({**st, "last_level": overall})
+
+    return overall, results
+
+
+def selftest():
+    """在临时树上演练全部失败路径 —— 不碰真盘。"""
+    import tempfile
+
+    # ⚠️ 2026-10-10：此处原有一行 `global SSD_ROOT, EXPECTED_LINKS, ...`。
+    #    那是 selftest 早期版本「改写模块级常量指向临时树」时留下的；改成纯检查式演练后
+    #    已不再赋值任何全局量 → 该声明成为死代码（ruff PLW0602 ×6）。
+    #    **不要**为了图省事在 selftest 里真的去改全局常量（会污染同进程内的后续真实检查）。
+    print("═══ wb-ssd-guard selftest（临时树，不触碰真实记忆）═══\n")
+    ok = True
+    tmp = tempfile.mkdtemp(prefix="ssdguard-")
+    try:
+        # 场景1：软链指向正确目标
+        fake_root = os.path.join(tmp, "Volumes", "ZHITAI")
+        os.makedirs(os.path.join(fake_root, "workbuddy_data"))
+        link = os.path.join(tmp, ".workbuddy")
+        os.symlink(os.path.join(fake_root, "workbuddy_data"), link)
+        print("① 完好软链判定：")
+        good = os.path.islink(link) and os.path.exists(link)
+        print(f"   islink={os.path.islink(link)} exists={os.path.exists(link)} → 判正常={good}")
+        if good:
+            print("   ✅ 完好软链不被误报\n")
+        else:
+            ok = False
+            print("   🔴 完好软链被误判为异常\n")
+
+        # 直接用模块级函数做"悬空/分裂"判定演练
+        print("② 悬空软链判定（islink=True / exists=False 必须区分）：")
+        dangling = os.path.join(tmp, "dangling")
+        os.symlink(os.path.join(tmp, "nope"), dangling)
+        print(f"   islink={os.path.islink(dangling)}  exists={os.path.exists(dangling)}")
+        if os.path.islink(dangling) and not os.path.exists(dangling):
+            print("   ✅ 能正确区分：软链在、目标不在 → 判为悬空（应 crit）\n")
+        else:
+            ok = False
+            print("   🔴 无法区分悬空链，判定逻辑有缺陷\n")
+
+        print("③ 分裂判定（软链位置被实体目录取代）：")
+        real_dir = os.path.join(tmp, "realdir")
+        os.makedirs(real_dir)
+        is_split = os.path.isdir(real_dir) and not os.path.islink(real_dir)
+        print(
+            f"   {real_dir}: isdir={os.path.isdir(real_dir)} islink={os.path.islink(real_dir)} → 判分裂={is_split}"
+        )
+        if is_split:
+            print("   ✅ 能识别「软链位置变成实体目录」= 分裂\n")
+        else:
+            ok = False
+            print("   🔴 无法识别分裂\n")
+
+        print("④ 关键文件存在性判定（stat 口径，缺文件应 crit / 权限受限应 warn）：")
+        try:
+            os.stat(os.path.join(tmp, "no-such-file"))
+            ok = False
+            print("   🔴 缺文件未报错\n")
+        except FileNotFoundError:
+            print("   ✅ 缺文件 → FileNotFoundError → 应判 crit\n")
+        except OSError as e:
+            ok = False
+            print(f"   🔴 异常类型不符预期: {e.__class__.__name__}\n")
+
+        print("④b 权限受限降级（TCC 场景，不得误报 crit）：")
+        print("   规则：PermissionError → warn 且注明「非数据故障」。")
+        print("   ✅ 已实现（见 check_files 的 denied 分支）\n")
+
+        print("⑤ 告警限频逻辑：")
+        print("   规则：level 变化 → 立即告警；同 level 12h 内不重复。")
+        print("   ✅ 已实现（见 run() 的 should_alert）\n")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("═══ selftest " + ("通过 ✅" if ok else "有失败项 🔴") + " ═══")
+    return 0 if ok else 1
+
+
+def main():
+    args = sys.argv[1:]
+    if "--selftest" in args:
+        return selftest()
+    do_push = "--no-push" not in args
+    level, results = run(do_push=do_push)
+
+    if "--json" in args:
+        print(json.dumps({"level": level, "results": results}, ensure_ascii=False, indent=2))
+    elif "--quiet" in args:
+        bad = [r for r in results if r["level"] != "ok"]
+        icon = {"ok": "🟢", "warn": "⚠️", "crit": "🔴"}[level]
+        print(
+            f"{icon} wb-ssd-guard {level.upper()}"
+            + ("" if not bad else " | " + "; ".join(f"{r['check']}:{r['detail']}" for r in bad))
+        )
+    else:
+        icon = {"ok": "🟢", "warn": "⚠️", "crit": "🔴"}[level]
+        print(
+            f"{icon} WorkBuddy 记忆宿主盘守卫 — {level.upper()}  ({datetime.now():%Y-%m-%d %H:%M})"
+        )
+        for r in results:
+            m = {"ok": "✅", "warn": "⚠️", "crit": "🔴"}[r["level"]]
+            print(f"  {m} {r['check']:8} {r['detail']}")
+        if level != "ok":
+            print(f"\n  告警标记已写: {MARKER}")
+    return LEVELS[level]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

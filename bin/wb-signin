@@ -1,0 +1,86 @@
+#!/bin/bash
+# ─────────────────────────────────────────────────────────────────────────────
+# WorkBuddy 自动签到 · 运行时包装器
+#   包住 88lin/workbuddy-auto-signin（MIT，https://github.com/88lin/workbuddy-auto-signin）
+#   仓库本体：/Users/guan/Library/Application Support/workbuddy-auto-signin
+#
+# 为什么需要这一层包装，而不是直接把 signin.py 塞进 launchd：
+#   ① 本机装了两份 WorkBuddy.app，而脚本自带的运行时发现只扫
+#      /Applications 与 ~/Applications：
+#         /Applications/WorkBuddy.app     5.0.5  ← 旧，没有存储绑定
+#         ~/Desktop/WorkBuddy.app         5.6.2  ← 在用
+#      → 它会挑到 5.0.5，而那份没有 electron_browser_workbuddy_storage 这个
+#        native 绑定 → 凭据解密失败，只能报 RUNTIME_UNAVAILABLE。
+#      这里改成「扫候选 .app，按 CFBundleShortVersionString 取最新」，
+#      将来客户端升级、搬目录都不会失效。
+#   ② launchd 给的环境很干净，连 LANG 都没有 → 中文汇报会撞 UnicodeEncodeError。
+#      显式钉死 UTF-8，从根上避免这一类（脚本自己也能兜，但那样 .out 会是空的）。
+#   ③ 结果日志写到 ~/Library/Logs，不落进 git 仓库目录，免得每次 pull 都是脏的。
+#
+# 用法：
+#   wb-signin                 # 默认 auto（签到 + 成长中心）
+#   wb-signin silent          # 同 auto，但结果写日志而非 stdout（给定时任务用）
+#   wb-signin silent-poll     # 轮询：补签（未签才签）+ 成长中心，空跑不写日志
+#   wb-signin status          # 只读查签到状态
+#   wb-signin runtime         # 只打印它挑中的客户端与候选版本（排错用）
+# ─────────────────────────────────────────────────────────────────────────────
+set -uo pipefail
+
+REPO="/Users/guan/Library/Application Support/workbuddy-auto-signin"
+PYTHON="/Users/guan/.workbuddy/binaries/python/envs/default/bin/python"
+LOG="/Users/guan/Library/Logs/workbuddy-auto-signin.log"
+
+APP_CANDIDATES=(
+  "/Applications/WorkBuddy.app"
+  "$HOME/Applications/WorkBuddy.app"
+  "$HOME/Desktop/WorkBuddy.app"
+)
+
+newer_than() {  # $1 是否比 $2 新
+  [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | tail -1)" = "$1" ]
+}
+
+pick_runtime() {
+  local app name ver exe best="" bestver=""
+  for app in "${APP_CANDIDATES[@]}"; do
+    [ -d "$app" ] || continue
+    name=$(/usr/bin/defaults read "$app/Contents/Info.plist" CFBundleExecutable 2>/dev/null)
+    ver=$(/usr/bin/defaults read "$app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)
+    [ -n "$name" ] && [ -n "$ver" ] || continue
+    exe="$app/Contents/MacOS/$name"
+    [ -x "$exe" ] || continue
+    if [ -z "$best" ] || newer_than "$ver" "$bestver"; then
+      best="$exe"; bestver="$ver"
+    fi
+  done
+  [ -n "$best" ] && printf '%s\n' "$best"
+}
+
+RT="$(pick_runtime)"
+
+if [ "${1:-}" = "runtime" ]; then
+  echo "候选客户端（按版本取最新）："
+  for app in "${APP_CANDIDATES[@]}"; do
+    if [ -d "$app" ]; then
+      printf '  %-42s %s\n' "$app" "$(/usr/bin/defaults read "$app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)"
+    else
+      printf '  %-42s %s\n' "$app" "(不存在)"
+    fi
+  done
+  if [ -n "$RT" ]; then echo "✓ 选中：$RT"; exit 0; fi
+  echo "✗ 未找到可用客户端"; exit 1
+fi
+
+if [ -z "$RT" ]; then
+  printf '[%s] {"result":"ERROR","report":"未找到可用的 WorkBuddy 客户端，签到无法运行","needs_attention":true}\n' \
+    "$(date '+%Y-%m-%d %H:%M:%S')" >>"$LOG" 2>/dev/null
+  exit 1
+fi
+
+export WORKBUDDY_EXE="$RT"
+export PYTHONIOENCODING=utf-8
+export LC_ALL="${LC_ALL:-en_US.UTF-8}"
+export WORKBUDDY_SIGNIN_LOG="$LOG"
+
+[ $# -eq 0 ] && set -- auto
+exec "$PYTHON" "$REPO/signin.py" "$@"

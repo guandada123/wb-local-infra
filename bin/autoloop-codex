@@ -1,0 +1,26 @@
+#!/bin/sh
+# agent-autoloop 的 codex 适配层
+# codex exec 把过程写到 stderr，agent-autoloop 的 command 插件只读 stdout，
+# 这里用 -o 取出最后一条消息，单独打到 stdout。
+
+set -u
+
+out=$(mktemp "${TMPDIR:-/tmp}/autoloop-codex.XXXXXX") || exit 1
+trap 'rm -f "$out"' EXIT INT TERM
+
+codex exec \
+  --oss \
+  --local-provider=ollama \
+  -m "${AUTOLOOP_MODEL:-qwen2.5:7b}" \
+  -c model_provider=ollama \
+  --skip-git-repo-check \
+  --sandbox "${AUTOLOOP_SANDBOX:-workspace-write}" \
+  -o "$out" \
+  "$1" >>"${HOME}/.agent-autoloop/logs/agent.log" 2>&1
+rc=$?
+
+if [ -s "$out" ]; then
+  cat "$out"
+fi
+
+exit "$rc"

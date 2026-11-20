@@ -59,8 +59,10 @@ push_card.py — 飞书 interactive 卡片推送中台
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -389,6 +391,44 @@ def _looks_like_placeholder(text: str) -> bool:
     return bare in ("title", "body", "body内容占位")
 
 
+# ── 去重锁（2026-11-19 T-019 修复）─────────────────────────────────────────
+# 两个缺陷一起修：
+#   ① 原实现 f"/tmp/feishu_card_dedupe_{key.replace(' ', '_')[:40]}" 把**完整键硬截断
+#      到 40 字**。`round-receipt-T-INS-a356da1cdd49-2026-11-19` 与 `...-2026-11-18`
+#      的前 40 字完全相同（均为 `round-receipt-T-INS-a356da1cdd49-2026-11`），
+#      两天共用一把锁 → 次日回执被误判「6h 内已发」而静默丢弃（2026-11-19 09:05 实犯）。
+#   ② 文档承诺「冷却 6h」，代码只判 os.path.exists、不看 mtime → 锁**永不过期**，
+#      跨天同键必然被拦。
+# 现在：路径 = 可读前缀（≤24 字，保留任务号便于人工辨认）+ 完整键 sha1 前 12 位，
+#       只有**真正相同**的键才共用一把锁；命中时再看 mtime，超过 6h 视为过期并清掉。
+DEDUPE_TTL_SECONDS = 6 * 3600
+DEDUPE_SLUG_MAX = 24
+
+
+def dedupe_lock_path(dedupe_key: str) -> str:
+    """去重键 → /tmp 下的锁文件路径（哈希取自完整键，无截断撞车风险）。"""
+    raw = dedupe_key or ""
+    slug = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_-]+", "_", raw.replace(" ", "_"))[:DEDUPE_SLUG_MAX]
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+    return f"/tmp/feishu_card_dedupe_{slug}_{digest}"
+
+
+def dedupe_lock_active(path: str, now: float | None = None) -> bool:
+    """锁存在且仍在 6h 冷却窗内才算「已发」；过期锁顺手清掉。"""
+    try:
+        mtime = os.stat(path).st_mtime
+    except OSError:
+        return False
+    age = (time.time() if now is None else now) - mtime
+    if age < DEDUPE_TTL_SECONDS:
+        return True
+    try:
+        os.unlink(path)
+    except OSError:  # 锁文件清理失败非致命：TTL 判定已按 mtime 兜底，仅延迟一次回收
+        pass
+    return False
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--title", required=True)
@@ -446,8 +486,8 @@ def main():
     #    告警被静默吞掉，且调用方会拿到 rc=0 的假成功。
     dedupe_file = ""
     if args.dedupe_key:
-        dedupe_file = f"/tmp/feishu_card_dedupe_{args.dedupe_key.replace(' ', '_')[:40]}"
-        if os.path.exists(dedupe_file):
+        dedupe_file = dedupe_lock_path(args.dedupe_key)
+        if dedupe_lock_active(dedupe_file):
             print(f"⚠️ 去重: {args.dedupe_key} (6h内已发)")
             return 0
 

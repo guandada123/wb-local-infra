@@ -1,0 +1,7 @@
+#!/bin/bash
+# 协同链-复核 专用执行体（2026-11-13 写审分离，Magpie/Agent-Autoloop 部署实录启示）：
+# 写代码/诊断走 deepseek-v4-flash，复核走 reasoning 模型 deepseek-v4-pro。
+# 代理 MODEL_MAP: custom-local:deepseek-reasoner -> deepseek-v4-pro（已探针验证）。
+# 其余行为（SYSTEM、工具、红线）与主执行体完全一致，仅模型不同。
+export AUTOLOOP_MODEL="custom-local:deepseek-reasoner"
+exec /Users/guan/.local/bin/autoloop-deepseek "$@"
