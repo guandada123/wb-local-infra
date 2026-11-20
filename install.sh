@@ -34,9 +34,12 @@ for f in "$REPO"/bin/*; do
     continue
   fi
   if [ "$APPLY" -eq 1 ]; then
-    # 覆盖前备份 live 旧版（防手改 live 的改动被静默覆盖后无处找回）
+    # 覆盖前备份 live 旧版到隐藏目录（不污染 PATH 目录），保留最近 5 份
     if [ -f "$d" ]; then
-      cp -p "$d" "$d.bak-$(date +%Y%m%d-%H%M%S)"
+      BK="$HOME/.local/bin/.deploy-backups"
+      mkdir -p "$BK"
+      cp -p "$d" "$BK/$n.$(date +%Y%m%d-%H%M%S)"
+      ls -t "$BK/$n".* 2>/dev/null | tail -n +6 | xargs -r rm -f
     fi
     cp -p "$f" "$d"
     echo "✅ 部署 $n"

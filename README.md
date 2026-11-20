@@ -17,3 +17,13 @@
 - **tests/test_deploy_sync.py**：逐字节同步闸门——live 漂移即红（已做三向验证：绿/漂移红/恢复绿）。
 - **原则**：改脚本改仓内 bin/，`./install.sh --apply` 部署；禁止直接改 live（会被闸门判红）。
 - launchd/ = 52 plist 快照；archive/ = 历史备份与迁移前快照（含 claw-mirror-snapshots）。
+
+## plist 三处来源的真源关系（2026-11-20 审计补充）
+
+| 位置 | 角色 | 数量 | 说明 |
+|---|---|---|---|
+| `Claw/.workbuddy/deploy/*.plist` | **真源（有部署脚本）** | 9 | 活跃 job 的 plist 源 + install-*.sh 部署器 |
+| `本仓 launchd/` | **只读快照** | 53 | 全量存档（含历史/停用），不部署、不作比较基准 |
+| `~/Library/LaunchAgents/` | 运行副本 | 31 | 由 Claw 部署脚本安装；本仓 install.sh **不碰 plist** |
+
+纪律：改 plist 改 Claw deploy/ → 跑其 install 脚本 → 本仓 launchd/ 快照按需更新（非门禁）。
