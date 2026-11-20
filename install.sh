@@ -22,9 +22,35 @@ case "${1:-}" in
   --apply) APPLY=1 ;;
   --plists) MODE=plists ;;
   --plists-apply) MODE=plists; APPLY=1 ;;
+  --snapshot-plists) MODE=snapshot ;;
+  --snapshot-plists-apply) MODE=snapshot; APPLY=1 ;;
   "") ;;
-  *) echo "未知参数: $1（支持 --apply / --plists / --plists-apply）"; exit 2 ;;
+  *) echo "未知参数: $1（支持 --apply / --plists / --plists-apply / --snapshot-plists）"; exit 2 ;;
 esac
+
+# ---- plist 快照刷新：live → 仓内 launchd/（保持 DR 基线不过期）----
+# 场景：改了线上 plist（改调度/加参数）后，快照必须跟着刷新，否则 --plists 会恢复旧配置。
+# 安全边界：① 只刷新 active.txt 列出的 job；② 发现 live 有而 active.txt 无的新 job → 提示补清单；
+#          ③ dry-run 默认，--snapshot-plists-apply 才落盘。
+if [ "$MODE" = "snapshot" ]; then
+  LIST="$REPO/launchd/active.txt"
+  [ -f "$LIST" ] || { echo "缺少清单: $LIST"; exit 1; }
+  listed="$(grep -v '^#' "$LIST" | sed 's/^\[deploy\] //' | tr -d ' ' | grep -v '^$')"
+  changed=0; fresh=0; unlisted=0
+  for n in $listed; do
+    live="$AGENTS/$n"; snap="$REPO/launchd/$n"
+    [ -f "$live" ] || { echo "⚠️  live 不存在（清单过期？）: $n"; continue; }
+    if [ -f "$snap" ] && cmp -s "$live" "$snap"; then fresh=$((fresh+1)); continue; fi
+    if [ "$APPLY" -eq 1 ]; then cp -p "$live" "$snap" && echo "✅ 刷新快照 $n"; else echo "[dry-run] 将刷新快照 $n"; fi
+    changed=$((changed+1))
+  done
+  for f in "$AGENTS"/com.user.*.plist; do
+    [ -f "$f" ] || continue; n="$(basename "$f")"
+    printf '%s\n' $listed | grep -qx "$n" || { echo "⚠️  live 有但清单无（请补 active.txt）: $n"; unlisted=$((unlisted+1)); }
+  done
+  echo "刷新=$changed 已最新=$fresh 未登记=$unlisted"
+  exit 0
+fi
 
 # ---- plist DR 模式：按 launchd/active.txt 只补缺失，不覆盖现有 ----
 # 场景：换机/重装后恢复 22 个无 deploy 源的 ad-hoc launchd job。

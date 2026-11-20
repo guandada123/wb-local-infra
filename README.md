@@ -43,3 +43,19 @@
 ## .bak 存量（2026-11-20 已归档）
 
 `~/.local/bin` 下 34 个历史 `.bak-*`（2026-08-04 ~ 11-20，共 732K）已移入 `.deploy-backups/legacy-20261120/`，附 `MANIFEST.txt` 记录原路径，可原路还原。新备份由 `install.sh` 写入 `.deploy-backups/`（保留最近 5 份/脚本），不再污染 PATH 目录。
+
+## 每日漂移检查覆盖两类（2026-11-20 扩展）
+
+`com.user.infra-sync-check`（每日 10:35）现在同时检查：
+
+| 类 | 判据 | 漂移时 |
+|---|---|---|
+| ① 脚本 | 仓内 `bin/` ↔ `~/.local/bin` 逐字节（unittest 闸门） | 推卡（含文件清单 + 修法） |
+| ② plist 快照 | `live → launchd/` 快照是否过期（`--snapshot-plists` 探测） | 推卡（提示 `--snapshot-plists-apply` 刷新） |
+
+- 全绿时只写日志（`~/.agent-autoloop/logs/infra-sync-check.log`），不刷群；
+- `DRY_RUN=1` 零副作用可测；`AGENTS=/tmp/x` 可指定 plist 目录演练；
+- 新增 job 未登记 `active.txt` 只记 INFO 日志，不推卡（属正常演进）。
+
+刷新快照：`./install.sh --snapshot-plists`（dry-run）/ `--snapshot-plists-apply`（落盘）。
+纪律：改线上 plist 后立刻刷新快照，否则 DR 会恢复旧配置。
