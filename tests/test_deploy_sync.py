@@ -110,11 +110,12 @@ class TestInstallModes(unittest.TestCase):
             names.append(line.strip())
         return set(names)
 
-    def _run(self, *flags, agents):
+    def _run(self, *flags, agents, extra=None):
+        env = {**os.environ, "AGENTS": str(agents)}
+        env.update(extra or {})
         return subprocess.run(
             ["/bin/bash", str(self.INSTALL), *flags],
-            capture_output=True, text=True, timeout=120,
-            env={**os.environ, "AGENTS": str(agents)},
+            capture_output=True, text=True, timeout=120, env=env,
         )
 
     def test_plists_install_missing_only(self):
@@ -163,6 +164,51 @@ class TestInstallModes(unittest.TestCase):
         self.assertNotEqual(0, r.returncode, f"应拒绝但成功了\nstdout={r.stdout}")
         after = {p.name: p.read_bytes() for p in self.SNAP.glob("*.plist")}
         self.assertEqual(before, after, "被拒的 apply 仍改写了仓内快照")
+
+
+    def _fake_agents(self, td):
+        """造 3 个假 job：2 个 ad-hoc + 1 个 deploy 托管。"""
+        agents = Path(td) / "agents"
+        deploy = Path(td) / "deploy"
+        agents.mkdir(); deploy.mkdir()
+        for n in ("com.user.fake-a.plist", "com.user.fake-b.plist", "com.user.wb-heartbeat.plist"):
+            (agents / n).write_bytes(b"<plist/>")
+        (deploy / "com.user.wb-heartbeat.plist").write_bytes(b"<plist/>")
+        return agents, deploy
+
+    def test_regen_active_preview_marks_deploy_and_counts(self):
+        """清单重建：deploy 项要打标、统计要与内容一致（统计口径 bug 曾使输出恒 0）。"""
+        with tempfile.TemporaryDirectory() as td:
+            agents, deploy = self._fake_agents(td)
+            r = self._run("--regen-active", agents=agents,
+                          extra={"CLAW_DEPLOY": str(deploy)})
+            self.assertEqual(0, r.returncode, r.stderr)
+            self.assertIn("[deploy] com.user.wb-heartbeat.plist", r.stdout)
+            self.assertIn("        com.user.fake-a.plist", r.stdout)
+            self.assertIn("deploy=1 ad-hoc=2", r.stdout, f"统计与内容不一致\nstdout={r.stdout}")
+
+    def test_regen_apply_refuses_nondefault_agents(self):
+        before = (self.SNAP / "active.txt").read_bytes()
+        with tempfile.TemporaryDirectory() as td:
+            agents, deploy = self._fake_agents(td)
+            r = self._run("--regen-active-apply", agents=agents,
+                          extra={"CLAW_DEPLOY": str(deploy)})
+        self.assertNotEqual(0, r.returncode, "应拒绝非默认 AGENTS 的落盘")
+        self.assertEqual(before, (self.SNAP / "active.txt").read_bytes(), "被拒的 apply 仍改了清单")
+
+    def test_regen_apply_force_writes_target_only(self):
+        """FORCE=1 + ACTIVE_OUT 指向临时文件 → 写到临时文件，仓内清单不动。"""
+        before = (self.SNAP / "active.txt").read_bytes()
+        with tempfile.TemporaryDirectory() as td:
+            agents, deploy = self._fake_agents(td)
+            out = Path(td) / "active.txt"
+            r = self._run("--regen-active-apply", agents=agents,
+                          extra={"CLAW_DEPLOY": str(deploy), "ACTIVE_OUT": str(out), "FORCE": "1"})
+            self.assertEqual(0, r.returncode, r.stderr)
+            written = out.read_text(encoding="utf-8")
+            self.assertIn("[deploy] com.user.wb-heartbeat.plist", written)
+            self.assertIn("        com.user.fake-b.plist", written)
+        self.assertEqual(before, (self.SNAP / "active.txt").read_bytes(), "仓内清单被意外改写")
 
     def test_snapshot_dry_run_does_not_write_repo(self):
         before = {p.name: p.read_bytes() for p in self.SNAP.glob("*.plist")}

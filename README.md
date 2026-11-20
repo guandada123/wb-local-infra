@@ -59,3 +59,25 @@
 
 刷新快照：`./install.sh --snapshot-plists`（dry-run）/ `--snapshot-plists-apply`（落盘）。
 纪律：改线上 plist 后立刻刷新快照，否则 DR 会恢复旧配置。
+
+## 清单重建与硬编码路径豁免（2026-11-20 审计 S6/S7）
+
+**清单重建（S6）**：`launchd/active.txt` 不再依赖一次性内联脚本，一条命令可重生：
+
+```bash
+./install.sh --regen-active           # dry-run：打印将写入的完整清单
+./install.sh --regen-active-apply     # 落盘（deploy 项自动打 [deploy] 标）
+```
+
+- 新装/卸载 launchd job 后跑一次，否则 `--plists` 恢复会漏 job；
+- 护栏同 snapshot：`AGENTS` 或 `OUT` 非默认时拒绝写盘（需 `FORCE=1`）。
+
+**硬编码路径豁免（S7）**：本机 plist 内含 `/Users/guan/...` 绝对路径 **3 处**（`com.user.infra-sync-check.plist` 的 python 解释器与两个日志路径）。这是**有意豁免**，原因是 launchd 不支持 `~` 与变量展开，`ProgramArguments` 只接受绝对路径。
+
+| 替代方案 | 为何不采用 |
+|---|---|
+| 用 `$HOME` 展开 | launchd 不做 shell 展开，写了会当字面量找不到文件 |
+| 改为相对路径 | launchd 工作目录不确定，相对路径不可靠 |
+| 生成时模板替换 | 增加一层间接，收益仅限换机场景（而换机本就需人工介入） |
+
+**换机处置**：`--plists-apply` 补装后，用 `sed -i '' "s|/Users/旧用户名|/Users/新用户名|g"` 批量替换，再 `launchctl bootstrap`。`active.txt` 头部已写此提醒。

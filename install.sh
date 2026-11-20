@@ -22,11 +22,58 @@ case "${1:-}" in
   --apply) APPLY=1 ;;
   --plists) MODE=plists ;;
   --plists-apply) MODE=plists; APPLY=1 ;;
+  --regen-active) MODE=regen ;;
+  --regen-active-apply) MODE=regen; APPLY=1 ;;
   --snapshot-plists) MODE=snapshot ;;
   --snapshot-plists-apply) MODE=snapshot; APPLY=1 ;;
   "") ;;
-  *) echo "未知参数: $1（支持 --apply / --plists / --plists-apply / --snapshot-plists）"; exit 2 ;;
+  *) echo "未知参数: $1（支持 --apply / --plists[-apply] / --snapshot-plists[-apply] / --regen-active[-apply]）"; exit 2 ;;
 esac
+
+# ---- active.txt 重建：live → 清单（DR 清单可重复生成，不靠一次性内联脚本）----
+# 背景（审计 S6）：初版 active.txt 是内联 python 一次性产物，新 job 出现时只记 INFO 日志，
+# 长期会让 DR 漏恢复。此模式把「重建清单」变成一条命令。
+# 安全边界：① 只扫 com.user.*.plist；② [deploy] 依 CLAW_DEPLOY 目录自动标注；
+#          ③ dry-run 打印完整内容，--regen-active-apply 落盘并先备份旧清单。
+if [ "$MODE" = "regen" ]; then
+  CLAW_DEPLOY="${CLAW_DEPLOY:-$HOME/WorkBuddy/Claw/.workbuddy/deploy}"
+  OUT="${ACTIVE_OUT:-$REPO/launchd/active.txt}"
+  if [ "$APPLY" -eq 1 ] && [ "${FORCE:-0}" != "1" ] \
+     && { [ "$AGENTS" != "$HOME/Library/LaunchAgents" ] || [ "$OUT" != "$REPO/launchd/active.txt" ]; }; then
+    echo "❌ 拒绝：AGENTS=$AGENTS / OUT=$OUT 非默认，写盘会覆盖仓内 active.txt。"
+    echo "   如确实要这么做：FORCE=1 ./install.sh --regen-active-apply"
+    exit 3
+  fi
+  tmp="$(mktemp)"
+  {
+    echo "# 当前活跃 launchd job 清单（$(date '+%F %H:%M') 由 live 重建）"
+    echo "# 用途：install.sh --plists 按此清单从 launchd/ 快照恢复（DR 用），只补缺失、不覆盖已有。"
+    echo "# 标注 [deploy] 的由 Claw .workbuddy/deploy 部署脚本管理，本清单不负责。"
+    echo "# 换机恢复：本机用户名硬编码在 plist 内部（launchd 不支持 ~），恢复前需替换为新用户名。"
+    echo "# 重建：./install.sh --regen-active[-apply]（新装/卸载 launchd job 后跑一次）"
+    n_deploy=0; n_adhoc=0
+    for f in "$AGENTS"/com.user.*.plist; do
+      [ -f "$f" ] || continue
+      name="$(basename "$f")"
+      if [ -f "$CLAW_DEPLOY/$name" ]; then
+        echo "[deploy] $name"; n_deploy=$((n_deploy+1))
+      else
+        echo "        $name"; n_adhoc=$((n_adhoc+1))
+      fi
+    done
+  } > "$tmp"
+  # 统计必须在移动/删除 tmp 之前算（踩过：先 mv 再 grep → 文件不存在，统计恒 0）
+  n_d="$(grep -c '^\[deploy\]' "$tmp" || true)"; n_a="$(grep -cE '^ +com\.user' "$tmp" || true)"
+  if [ "$APPLY" -eq 1 ]; then
+    # 不另存 .bak：active.txt 在 git 里，历史可回溯，本地备份只会堆垃圾
+    mv "$tmp" "$OUT"; echo "✅ 已重建 $OUT"
+  else
+    cat "$tmp"; rm -f "$tmp"
+  fi
+  echo "统计：deploy=${n_d:-0} ad-hoc=${n_a:-0}"
+  [ "$APPLY" -eq 0 ] && echo "（dry-run，上面即为将写入的内容；加 --regen-active-apply 落盘）"
+  exit 0
+fi
 
 # ---- plist 快照刷新：live → 仓内 launchd/（保持 DR 基线不过期）----
 # 场景：改了线上 plist（改调度/加参数）后，快照必须跟着刷新，否则 --plists 会恢复旧配置。

@@ -1,6 +1,8 @@
-# 当前活跃 launchd job 清单（2026-11-20 由 live 生成）
+# 当前活跃 launchd job 清单（2026-11-20 20:33 由 live 重建）
 # 用途：install.sh --plists 按此清单从 launchd/ 快照恢复（DR 用），只补缺失、不覆盖已有。
 # 标注 [deploy] 的由 Claw .workbuddy/deploy 部署脚本管理，本清单不负责。
+# 换机恢复：本机用户名硬编码在 plist 内部（launchd 不支持 ~），恢复前需替换为新用户名。
+# 重建：./install.sh --regen-active[-apply]（新装/卸载 launchd job 后跑一次）
         com.user.autoloop-feishu-hub.plist
         com.user.autoloop-feishu-push.plist
         com.user.autopilot-gate.plist
