@@ -4,8 +4,10 @@
 #   ② plist：live → 仓内 launchd/ 快照是否过期（DR 基线不过期才可恢复）
 # 全绿 → 静默（只写日志）；有漂移 → push_card 推飞书（一张卡，按类分节）。
 #
-# 为什么需要：tests 只在手动跑时生效；漂移是时间维度问题（有人手改 live ≠ 仓），
-# 必须定时发现。挂 launchd com.user.infra-sync-check（每日 10:35）。
+# 🔴 FAIL-SAFE 铁律（2026-11-20 审计 P0-1 修复）：
+#   「检查没发现问题」与「检查本身没跑成」必须区分。判定只看 **rc**，不看输出文本是否为空。
+#   历史 bug：终判用 `[ -z "$reason" ] && [ stale -eq 0 ]`——unittest 崩溃 / active.txt 丢失时
+#   两处都"空"，于是报 OK（exit 0）。删掉 tests/ 目录都能拿到 OK，比没闸门更危险。
 #
 # 注意：wb-local-infra 在 ZHITAI 外置卷 —— 后台任务读写必须用授权 python（TCC），
 # 故本脚本固定用 ~/.workbuddy/binaries 的 python，且由它派生子进程。
@@ -13,56 +15,69 @@ set -uo pipefail
 
 PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python"
 REPO="${REPO_OVERRIDE:-$HOME/WorkBuddy/wb-local-infra}"
-LOG="$HOME/.agent-autoloop/logs/infra-sync-check.log"
+LOG="${LOG_OVERRIDE:-$HOME/.agent-autoloop/logs/infra-sync-check.log}"
 AGENTS="${AGENTS:-$HOME/Library/LaunchAgents}"   # 测试可覆盖，避免动真实 LaunchAgents
 mkdir -p "$(dirname "$LOG")"
 log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
 
 if [ ! -d "$REPO" ]; then
-  log "SKIP: 仓不存在 $REPO"
-  exit 0
+  # 仓不存在也是"检查没跑成"，不能静默当没事
+  log "ERROR: 仓不存在 $REPO —— 本次未做任何校验"
+  echo "ERROR: 仓不存在 $REPO"
+  exit 1
 fi
 
-# ---------- ① 脚本漂移 ----------
-out="$(cd "$REPO" && "$PY" -m unittest discover -s tests 2>&1)"
-rc=$?
-script_reason=""
+# ---------- ① 脚本漂移（判据=rc） ----------
+script_issue=""
+out="$(cd "$REPO" && "$PY" -m unittest discover -s tests 2>&1)"; rc=$?
 if [ "$rc" -ne 0 ]; then
   printf '%s\n' "$out" | tail -20 >> "$LOG"
-  script_reason="$(printf '%s\n' "$out" | grep -E 'live 已漂移|未部署到' | head -2)"
+  reason="$(printf '%s\n' "$out" | grep -E 'live 已漂移|未部署到' | head -2)"
+  script_issue="${reason:-unittest 失败 rc=${rc}（非断言失败，详见日志 ${LOG}）}"
   log "DRIFT(script): unittest rc=$rc"
 fi
 
-# ---------- ② plist 快照过期 ----------
-snap_out="$(AGENTS="$AGENTS" "$REPO/install.sh" --snapshot-plists 2>&1)"
-plist_stale="$(printf '%s\n' "$snap_out" | grep -oE '刷新=[0-9]+' | head -1 | cut -d= -f2)"
-plist_stale="${plist_stale:-0}"
-plist_reason=""
-if [ "${plist_stale}" -gt 0 ]; then
-  plist_reason="$(printf '%s\n' "$snap_out" | grep -E '将刷新快照' | head -5)"
-  log "STALE(plist): 快照过期 ${plist_stale} 个"
+# ---------- ② plist 快照过期（判据=rc + 可解析） ----------
+plist_issue=""
+snap_out="$(AGENTS="$AGENTS" "$REPO/install.sh" --snapshot-plists 2>&1)"; snap_rc=$?
+plist_stale=""
+if [ "$snap_rc" -ne 0 ]; then
+  plist_issue="快照检查自身失败(rc=$snap_rc)：$(printf '%s\n' "$snap_out" | tail -2)"
+  log "ERROR(plist): 检查失败 rc=$snap_rc"
+else
+  plist_stale="$(printf '%s\n' "$snap_out" | grep -oE '刷新=[0-9]+' | head -1 | cut -d= -f2)"
+  if [ -z "$plist_stale" ]; then
+    # rc=0 但输出无法解析 = 契约被改，同样不能当"没问题"
+    plist_issue="快照检查输出无法解析（install.sh 契约变更？）：$(printf '%s\n' "$snap_out" | tail -2)"
+    log "ERROR(plist): 输出不可解析"
+  elif [ "$plist_stale" -gt 0 ]; then
+    plist_issue="快照过期 ${plist_stale} 个"
+    log "STALE(plist): ${plist_stale} 个"
+  fi
 fi
 # 清单未登记（live 有但 active.txt 无）：只记日志，不推卡（新 job 属正常演进）
 unlisted="$(printf '%s\n' "$snap_out" | grep -cE 'live 有但清单无')"
 [ "${unlisted:-0}" -gt 0 ] && log "INFO: 有 ${unlisted} 个 live plist 未登记 active.txt"
 
-# ---------- 汇总 ----------
-if [ -z "$script_reason" ] && [ "${plist_stale}" -eq 0 ]; then
+# ---------- 汇总（只有两类都真通过才 OK） ----------
+if [ -z "$script_issue" ] && [ -z "$plist_issue" ]; then
   n_bin="$("$PY" -c 'import pathlib,sys;print(sum(1 for f in (pathlib.Path(sys.argv[1])/"bin").iterdir() if f.is_file()))' "$REPO" 2>/dev/null || echo "?")"
   log "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
+  [ "${DRY_RUN:-0}" = "1" ] && echo "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
   exit 0
 fi
 
 # DRY_RUN=1：只打印不推送（验证失败路径用，零刷群副作用）
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  log "DRY_RUN: 将推送——脚本漂移「${script_reason:-无}」/ plist 过期 ${plist_stale} 个"
+  echo "DRY_RUN: 将推送——脚本问题「${script_issue:-无}」/ plist 问题「${plist_issue:-无}」"
+  log "DRY_RUN: 脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」"
   exit 0
 fi
 
 args=(--title "🟠 中台基础设施漂移" --level warning)
-[ -n "$script_reason" ] && args+=(--section "① 脚本漂移" "${script_reason}
+[ -n "$script_issue" ] && args+=(--section "① 脚本" "${script_issue}
 修法：把 live 改动回迁仓内 bin/ 后提交，或 ./install.sh --apply 以仓覆盖")
-[ "${plist_stale}" -gt 0 ] && args+=(--section "② plist 快照过期 ${plist_stale} 个" "${plist_reason}
+[ -n "$plist_issue" ] && args+=(--section "② plist 快照" "${plist_issue}
 修法：./install.sh --snapshot-plists-apply 刷新（DR 基线）")
 "$PY" "$HOME/.local/bin/push_card.py" "${args[@]}" 2>>"$LOG" || log "push_card 失败（见上）"
 exit 0

@@ -89,7 +89,8 @@ if [ "$MODE" = "snapshot" ]; then
   fi
   LIST="$REPO/launchd/active.txt"
   [ -f "$LIST" ] || { echo "缺少清单: $LIST"; exit 1; }
-  listed="$(grep -v '^#' "$LIST" | sed 's/^\[deploy\] //' | tr -d ' ' | grep -v '^$')"
+  # || true：空清单时 grep -v 返回 1，set -e 会让整个脚本静默退出（rc=1 无输出）
+  listed="$(grep -v '^#' "$LIST" | sed 's/^\[deploy\] //' | tr -d ' ' | grep -v '^$' || true)"
   changed=0; fresh=0; unlisted=0
   for n in $listed; do
     live="$AGENTS/$n"; snap="$REPO/launchd/$n"
@@ -114,7 +115,8 @@ if [ "$MODE" = "plists" ]; then
   LIST="$REPO/launchd/active.txt"
   [ -f "$LIST" ] || { echo "缺少清单: $LIST"; exit 1; }
   mkdir -p "$AGENTS"
-  installed=0; skipped=0; missing=0
+  installed=0; skipped=0; missing=0; invalid=0
+  NEW_PLISTS=""
   while IFS= read -r line; do
     case "$line" in \#*|"") continue ;; esac
     case "$line" in "[deploy] "*) continue ;; esac
@@ -122,18 +124,31 @@ if [ "$MODE" = "plists" ]; then
     [ -n "$n" ] || continue
     src="$REPO/launchd/$n"; dst="$AGENTS/$n"
     if [ ! -f "$src" ]; then echo "⚠️  快照缺失: $n"; missing=$((missing+1)); continue; fi
+    # P1-3：装之前必须过 plutil —— 坏 plist 装进 LaunchAgents 会被 launchd 拒载，
+    # 而且 DR 场景下用户以为已恢复，实际任务不跑（静默失效）。
+    if ! plutil -lint "$src" >/dev/null 2>&1; then
+      echo "❌ 快照非法（plutil 校验失败，未安装）: $n"
+      invalid=$((invalid+1)); continue
+    fi
     if [ -f "$dst" ]; then skipped=$((skipped+1)); continue; fi
     if [ "$APPLY" -eq 1 ]; then
-      cp -p "$src" "$dst" && echo "✅ 补装 $n"
+      cp -p "$src" "$dst" && echo "✅ 补装 $n" && NEW_PLISTS="$NEW_PLISTS $n"
     else
       echo "[dry-run] 将补装 $n"
     fi
     installed=$((installed+1))
   done < "$LIST"
-  echo "补装=$installed 已存在跳过=$skipped 快照缺失=$missing"
-  if [ "$APPLY" -eq 0 ] && [ "$installed" -gt 0 ]; then
-    echo "（dry-run；加 --plists-apply 落盘。补装后需 launchctl bootstrap 才会生效）"
+  echo "补装=$installed 已存在跳过=$skipped 快照缺失=$missing 非法跳过=$invalid"
+  # P1-4：装完不等于生效，必须 bootstrap
+  if [ "$APPLY" -eq 1 ] && [ -n "$NEW_PLISTS" ]; then
+    echo "⚠️  以上 plist 尚未加载，执行以下命令才生效："
+    for n in $NEW_PLISTS; do
+      echo "  launchctl bootstrap gui/\$(id -u) \"$AGENTS/$n\""
+    done
+  elif [ "$APPLY" -eq 0 ] && [ "$installed" -gt 0 ]; then
+    echo "（dry-run；加 --plists-apply 落盘）"
   fi
+  if [ "$invalid" -gt 0 ]; then echo "⚠️  有 $invalid 个快照非法，需先修再装"; exit 1; fi
   exit 0
 fi
 

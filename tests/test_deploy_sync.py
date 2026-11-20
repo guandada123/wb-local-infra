@@ -11,6 +11,7 @@
 """
 
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -224,3 +225,90 @@ class TestInstallModes(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+class TestCheckFailSafe(unittest.TestCase):
+    """每日检查器必须 fail-safe：检查跑不成 ≠ 没问题（审计 P0-1）。
+
+    历史 bug：终判用「reason 文本为空 + stale==0」，于是 unittest 崩溃、active.txt 丢失时
+    两处都"空" → 报 OK。删掉 tests/ 目录都能拿到 OK，比没闸门更危险。
+    这里用合成小仓（不依赖真环境）注入三种状态，负样本必须绿、故障态必须红。
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+    CHECK = REPO / "bin" / "infra-sync-check"
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="chk_fail_"))
+        repo = self.tmp / "repo"
+        for d in ("bin", "tests", "launchd"):
+            (repo / d).mkdir(parents=True)
+        shutil.copy2(self.REPO / "install.sh", repo / "install.sh")
+        (repo / "bin" / "dummy.sh").write_text("#!/bin/sh\necho hi\n", encoding="utf-8")
+        (repo / "tests" / "test_smoke.py").write_text(
+            "import unittest\n\n\nclass T(unittest.TestCase):\n    def test_ok(self):\n        self.assertTrue(True)\n",
+            encoding="utf-8")
+        (repo / "launchd" / "active.txt").write_text("# 空清单\n", encoding="utf-8")
+        self.repo = repo
+        self.live = self.tmp / "live"
+        self.live.mkdir()
+        shutil.copy2(repo / "bin" / "dummy.sh", self.live / "dummy.sh")
+        self.agents = self.tmp / "agents"
+        self.agents.mkdir()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self):
+        env = {**os.environ,
+               "REPO_OVERRIDE": str(self.repo),
+               "LOG_OVERRIDE": str(self.tmp / "chk.log"),
+               "AGENTS": str(self.agents),
+               "LIVE_BIN": str(self.live),
+               "CLAW_HOME": str(self.tmp / "no-claw"),
+               "DRY_RUN": "1"}
+        return subprocess.run(["/bin/bash", str(self.CHECK)],
+                              capture_output=True, text=True, timeout=120, env=env)
+
+    def test_normal_state_reports_ok(self):
+        """负样本（防"测试永远红"）：一切正常时必须报 OK。"""
+        r = self._run()
+        self.assertIn("OK:", r.stdout, f"正常态未报 OK\nstdout={r.stdout}\nstderr={r.stderr}")
+
+    def test_missing_active_list_is_not_ok(self):
+        """active.txt 丢失 → 快照检查失败，必须报问题而不是 OK。"""
+        (self.repo / "launchd" / "active.txt").unlink()
+        r = self._run()
+        self.assertIn("plist 问题「快照检查自身失败", r.stdout, f"未识别为检查失败\nstdout={r.stdout}")
+        self.assertNotIn("OK:", r.stdout, "检查失败却报了 OK（fail-open 回归）")
+
+    def test_missing_tests_dir_is_not_ok(self):
+        """tests 目录消失（unittest rc=5，无断言消息）→ 必须报问题而不是 OK。"""
+        shutil.rmtree(self.repo / "tests")
+        r = self._run()
+        self.assertIn("脚本问题「unittest 失败 rc=", r.stdout, f"未识别为检查失败\nstdout={r.stdout}")
+        self.assertNotIn("OK:", r.stdout, "检查失败却报了 OK（fail-open 回归）")
+
+
+class TestPlistsValidation(unittest.TestCase):
+    """--plists-apply 必须拒装非法 plist（审计 P1-3）：坏 plist 进 LaunchAgents 会被 launchd 拒载，
+    DR 场景下用户以为已恢复、实际任务不跑（静默失效）。"""
+
+    REPO = Path(__file__).resolve().parent.parent
+
+    def test_invalid_plist_is_rejected(self):
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td) / "repo"
+            for d in ("launchd", "bin"):
+                (repo / d).mkdir(parents=True)
+            shutil.copy2(self.REPO / "install.sh", repo / "install.sh")
+            (repo / "launchd" / "active.txt").write_text(
+                "# test\n        com.user.broken.plist\n", encoding="utf-8")
+            (repo / "launchd" / "com.user.broken.plist").write_text("not a plist", encoding="utf-8")
+            agents = Path(td) / "agents"
+            agents.mkdir()
+            r = subprocess.run(["/bin/bash", str(repo / "install.sh"), "--plists-apply"],
+                               capture_output=True, text=True, timeout=120,
+                               env={**os.environ, "AGENTS": str(agents)})
+            self.assertNotEqual(0, r.returncode, f"非法 plist 应导致失败\nstdout={r.stdout}")
+            self.assertIn("快照非法", r.stdout)
+            self.assertEqual([], list(agents.glob("*.plist")), "非法 plist 被装进目标目录了")
