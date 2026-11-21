@@ -187,7 +187,9 @@ for f in "$REPO"/bin/*; do
 done
 
 if [ "$changed" -eq 0 ]; then
-  echo "无差异：$DEST 已与仓内 bin/ 一致（$(ls "$REPO"/bin | wc -l | tr -d ' ') 个脚本）"
+  # 计数必须只数普通文件：ls 会把 __pycache__ 等目录也算进去（曾显示 28 vs 实际 27）
+  n_files="$(find "$REPO/bin" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+  echo "无差异：$DEST 已与仓内 bin/ 一致（${n_files} 个脚本）"
 else
   if [ "$APPLY" -eq 0 ]; then
     echo "差异 $changed 个（dry-run；加 --apply 落盘）"
