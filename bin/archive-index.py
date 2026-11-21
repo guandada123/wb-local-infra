@@ -128,16 +128,34 @@ def build(root: Path) -> tuple[str, int, int]:
     return "\n".join(lines) + "\n", len(rows), total
 
 
+def normalize(text: str) -> str:
+    """去掉「生成时间」行后比对——时间戳每次都不同，不能算漂移。"""
+    keep = [ln for ln in text.splitlines() if not (ln.startswith("> 由 ") and "生成 " in ln)]
+    return "\n".join(keep).strip()
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dir", default=str(Path.home() / "WorkBuddy" / "_archive"))
     ap.add_argument("--print-only", action="store_true", help="只打印不写盘")
+    ap.add_argument("--check", action="store_true",
+                    help="与现有 INDEX.md 比对（忽略生成时间行）：0=一致 1=过期 2=无法比对")
     a = ap.parse_args()
     root = Path(a.dir)
     if not root.is_dir():
         print(f"目录不存在: {root}")
         return 1
     text, n, total = build(root)
+    if a.check:
+        idx = root / "INDEX.md"
+        if not idx.exists():
+            print(f"无法比对：{idx} 不存在（先跑一次重建）")
+            return 2
+        if normalize(idx.read_text(encoding="utf-8")) == normalize(text):
+            print(f"索引最新：{n} 项 / {human(total)}")
+            return 0
+        print(f"索引已过期：{idx} 与当前目录不一致 —— 跑 `python3 {Path(__file__).name}` 重建")
+        return 1
     if a.print_only:
         # sys.stdout.write：print() 会多加一个换行，导致 --print-only 与文件产物差一行空行
         # （2026-11-21 审计纠正：上一轮把这条差异误判为"手工版 vs 脚本版"，其实是 print 的锅）

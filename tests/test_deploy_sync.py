@@ -286,14 +286,51 @@ class TestCheckFailSafe(unittest.TestCase):
         """active.txt 丢失 → 快照检查失败，必须报问题而不是 OK。"""
         (self.repo / "launchd" / "active.txt").unlink()
         r = self._run()
-        self.assertIn("plist 问题「快照检查自身失败", r.stdout, f"未识别为检查失败\nstdout={r.stdout}")
+        # 只断言语义片段，不锁死外层措辞（否则一改文案就假红）
+        self.assertIn("快照检查自身失败", r.stdout, f"未识别为检查失败\nstdout={r.stdout}")
         self.assertNotIn("OK:", r.stdout, "检查失败却报了 OK（fail-open 回归）")
+
+    def _install_index_script(self):
+        shutil.copy2(self.REPO / "bin" / "archive-index.py", self.repo / "bin" / "archive-index.py")
+
+    def test_stale_archive_index_is_not_ok(self):
+        """_archive 变动后索引过期 → 必须报问题（审计建议的第三类检查）。"""
+        arc = self.tmp / "archive"
+        arc.mkdir()
+        (arc / "a.tgz").write_bytes(b"x")
+        self._install_index_script()
+        env_extra = {"ARCHIVE_DIR": str(arc)}
+        # 先建索引（一致状态）
+        subprocess.run([sys.executable, str(self.repo / "bin" / "archive-index.py"), "--dir", str(arc)],
+                       capture_output=True, text=True, timeout=60)
+        r0 = self._run()
+        self.assertIn("OK:", r0.stdout, f"一致时应 OK\nstdout={r0.stdout}")
+        # 新增文件 → 索引过期
+        (arc / "b.tgz").write_bytes(b"y")
+        env = {**os.environ, "REPO_OVERRIDE": str(self.repo), "LOG_OVERRIDE": str(self.tmp / "chk.log"),
+               "AGENTS": str(self.agents), "LIVE_BIN": str(self.live),
+               "CLAW_HOME": str(self.tmp / "no-claw"), "DRY_RUN": "1", **env_extra}
+        r1 = subprocess.run(["/bin/bash", str(self.CHECK)], capture_output=True, text=True, timeout=120, env=env)
+        self.assertIn("与 _archive 不一致", r1.stdout, f"未识别索引过期\nstdout={r1.stdout}")
+        self.assertNotIn("OK:", r1.stdout, "索引过期却报 OK")
+
+    def test_missing_archive_index_is_skipped(self):
+        """索引不存在（rc=2）→ 跳过而非报错（新机/未生成过不应天天告警）。"""
+        arc = self.tmp / "archive-noidx"
+        arc.mkdir()
+        (arc / "a.tgz").write_bytes(b"x")
+        self._install_index_script()
+        env = {**os.environ, "REPO_OVERRIDE": str(self.repo), "LOG_OVERRIDE": str(self.tmp / "chk.log"),
+               "AGENTS": str(self.agents), "LIVE_BIN": str(self.live),
+               "CLAW_HOME": str(self.tmp / "no-claw"), "DRY_RUN": "1", "ARCHIVE_DIR": str(arc)}
+        r = subprocess.run(["/bin/bash", str(self.CHECK)], capture_output=True, text=True, timeout=120, env=env)
+        self.assertIn("OK:", r.stdout, f"无索引时应跳过并 OK\nstdout={r.stdout}")
 
     def test_missing_tests_dir_is_not_ok(self):
         """tests 目录消失（unittest rc=5，无断言消息）→ 必须报问题而不是 OK。"""
         shutil.rmtree(self.repo / "tests")
         r = self._run()
-        self.assertIn("脚本问题「unittest 失败 rc=", r.stdout, f"未识别为检查失败\nstdout={r.stdout}")
+        self.assertIn("unittest 失败 rc=", r.stdout, f"未识别为检查失败\nstdout={r.stdout}")
         self.assertNotIn("OK:", r.stdout, "检查失败却报了 OK（fail-open 回归）")
 
 

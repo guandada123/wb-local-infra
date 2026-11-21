@@ -55,12 +55,27 @@ else
     log "STALE(plist): ${plist_stale} 个"
   fi
 fi
+# ---------- ③ 归档索引是否过期（_archive 变动后 INDEX.md 会过期） ----------
+idx_issue=""
+IDX_SCRIPT="$REPO/bin/archive-index.py"
+if [ -f "$IDX_SCRIPT" ]; then
+  idx_out="$("$PY" "$IDX_SCRIPT" --check --dir "${ARCHIVE_DIR:-$HOME/WorkBuddy/_archive}" 2>&1)"; idx_rc=$?
+  case "$idx_rc" in
+    0) : ;;
+    1) idx_issue="与 _archive 不一致（跑 archive-index.py 重建）"
+       log "STALE(index): $(printf '%s\n' "$idx_out" | tail -1)" ;;
+    2) log "INFO(index): 索引不存在或不适用，跳过" ;;
+    *) idx_issue="索引检查失败(rc=$idx_rc)：$(printf '%s\n' "$idx_out" | tail -2)"
+       log "ERROR(index): 检查失败 rc=$idx_rc" ;;
+  esac
+fi
+
 # 清单未登记（live 有但 active.txt 无）：只记日志，不推卡（新 job 属正常演进）
 unlisted="$(printf '%s\n' "$snap_out" | grep -cE 'live 有但清单无')"
 [ "${unlisted:-0}" -gt 0 ] && log "INFO: 有 ${unlisted} 个 live plist 未登记 active.txt"
 
 # ---------- 汇总（只有两类都真通过才 OK） ----------
-if [ -z "$script_issue" ] && [ -z "$plist_issue" ]; then
+if [ -z "$script_issue" ] && [ -z "$plist_issue" ] && [ -z "$idx_issue" ]; then
   n_bin="$("$PY" -c 'import pathlib,sys;print(sum(1 for f in (pathlib.Path(sys.argv[1])/"bin").iterdir() if f.is_file()))' "$REPO" 2>/dev/null || echo "?")"
   log "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
   [ "${DRY_RUN:-0}" = "1" ] && echo "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
@@ -69,8 +84,8 @@ fi
 
 # DRY_RUN=1：只打印不推送（验证失败路径用，零刷群副作用）
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "DRY_RUN: 将推送——脚本问题「${script_issue:-无}」/ plist 问题「${plist_issue:-无}」"
-  log "DRY_RUN: 脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」"
+  echo "DRY_RUN: 将推送——脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」/ 索引「${idx_issue:-无}」"
+  log "DRY_RUN: 脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」/ 索引「${idx_issue:-无}」"
   exit 0
 fi
 
@@ -79,5 +94,7 @@ args=(--title "🟠 中台基础设施漂移" --level warning)
 修法：把 live 改动回迁仓内 bin/ 后提交，或 ./install.sh --apply 以仓覆盖")
 [ -n "$plist_issue" ] && args+=(--section "② plist 快照" "${plist_issue}
 修法：./install.sh --snapshot-plists-apply 刷新（DR 基线）")
+[ -n "$idx_issue" ] && args+=(--section "③ 归档索引" "${idx_issue}
+修法：python3 ~/WorkBuddy/wb-local-infra/bin/archive-index.py（重建 _archive/INDEX.md）")
 "$PY" "$HOME/.local/bin/push_card.py" "${args[@]}" 2>>"$LOG" || log "push_card 失败（见上）"
 exit 0
