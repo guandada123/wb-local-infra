@@ -2,17 +2,37 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>Label</key><string>com.user.infra-sync-check</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/Users/guan/.workbuddy/binaries/python/envs/default/bin/python</string>
-    <string>-c</string>
-    <string>import subprocess,sys,os; sys.exit(subprocess.call(["/bin/bash", os.path.expanduser("~/.local/bin/infra-sync-check")]))</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>10</integer><key>Minute</key><integer>35</integer></dict>
-  <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>/Users/guan/.agent-autoloop/logs/infra-sync-check.launchd.out</string>
-  <key>StandardErrorPath</key><string>/Users/guan/.agent-autoloop/logs/infra-sync-check.launchd.err</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/guan</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+		<key>LC_ALL</key>
+		<string>en_US.UTF-8</string>
+		<key>PATH</key>
+		<string>/Users/guan/.local/bin:/Users/guan/.workbuddy/binaries/node/versions/22.22.2-6/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>Label</key>
+	<string>com.user.infra-sync-check</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/guan/.workbuddy/binaries/python/envs/default/bin/python</string>
+		<string>-c</string>
+		<string>import subprocess,sys,os; sys.exit(subprocess.call(["/bin/bash", os.path.expanduser("~/.local/bin/infra-sync-check")]))</string>
+	</array>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>StandardErrorPath</key>
+	<string>/Users/guan/.agent-autoloop/logs/infra-sync-check.launchd.err</string>
+	<key>StandardOutPath</key>
+	<string>/Users/guan/.agent-autoloop/logs/infra-sync-check.launchd.out</string>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>10</integer>
+		<key>Minute</key>
+		<integer>35</integer>
+	</dict>
 </dict>
 </plist>

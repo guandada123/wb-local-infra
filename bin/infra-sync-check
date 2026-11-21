@@ -13,6 +13,19 @@
 # 故本脚本固定用 ~/.workbuddy/binaries 的 python，且由它派生子进程。
 set -uo pipefail
 
+# launchd 空环境下 HOME 可能未设置（实测：set -u 直接死于 "HOME: unbound variable"，
+# 于是每日检查从未真正执行、也不报错）。这里先兜底取 passwd 里的家目录。
+if [ -z "${HOME:-}" ]; then
+  HOME="$(cd ~ 2>/dev/null && pwd)" || HOME="$(eval echo "~$(id -un)")"
+  export HOME
+fi
+
+# push_card → lark-cli → node：launchd 的默认 PATH 里没有 node（实测报
+# "exec: node: not found"），卡片静默发不出去。node 只有版本目录、没有稳定入口，
+# 这里每次运行动态解析（抗升级），并补上 PATH。
+_NODE_BIN="$(ls -d "$HOME"/.workbuddy/binaries/node/versions/*/bin 2>/dev/null | head -1)"
+export PATH="$HOME/.local/bin:${_NODE_BIN:+$_NODE_BIN:}/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 PY="$HOME/.workbuddy/binaries/python/envs/default/bin/python"
 REPO="${REPO_OVERRIDE:-$HOME/WorkBuddy/wb-local-infra}"
 LOG="${LOG_OVERRIDE:-$HOME/.agent-autoloop/logs/infra-sync-check.log}"

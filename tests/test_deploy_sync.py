@@ -326,6 +326,22 @@ class TestCheckFailSafe(unittest.TestCase):
         r = subprocess.run(["/bin/bash", str(self.CHECK)], capture_output=True, text=True, timeout=120, env=env)
         self.assertIn("OK:", r.stdout, f"无索引时应跳过并 OK\nstdout={r.stdout}")
 
+
+    def test_runs_with_empty_environment(self):
+        """launchd 的空环境（无 HOME、PATH 只有系统目录）下必须能跑完。
+
+        实测事故：launchd 下 HOME 未设置 → `set -u` 直接死于 "HOME: unbound variable"，
+        每日检查从未真正执行也不报错；node 不在 PATH → 卡片发送失败、告警静默丢失。
+        """
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",   # 故意不继承 os.environ
+               "REPO_OVERRIDE": str(self.repo), "LOG_OVERRIDE": str(self.tmp / "chk.log"),
+               "AGENTS": str(self.agents), "LIVE_BIN": str(self.live),
+               "CLAW_HOME": str(self.tmp / "no-claw"), "DRY_RUN": "1"}
+        r = subprocess.run(["/bin/bash", str(self.CHECK)], capture_output=True, text=True,
+                           timeout=180, env=env)
+        self.assertNotIn("unbound variable", r.stderr, f"环境变量缺失导致崩溃\nstderr={r.stderr}")
+        self.assertIn("OK:", r.stdout, f"空环境下未完成检查\nstdout={r.stdout}\nstderr={r.stderr}")
+
     def test_missing_tests_dir_is_not_ok(self):
         """tests 目录消失（unittest rc=5，无断言消息）→ 必须报问题而不是 OK。"""
         shutil.rmtree(self.repo / "tests")
