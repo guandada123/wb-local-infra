@@ -15,20 +15,54 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import sys
 import time
 from pathlib import Path
 
-# 处置结论（按文件名前缀/全名匹配）。新增归档时在此登记，否则落「未分类/待评估」。
-VERDICT = {
-    "cron-mail-spool-": ("噪音归档", "**建议删**：356,687 封中 99.99% 是两个 watchdog 的重复输出；有效 36 封已单列", "不可再生"),
-    "cron-mail-interesting-": ("邮件存档", "保留：从噪音 mbox 抽出的有效 cron 输出", "不可再生"),
-    "XtItClient_": ("安装包", "**建议删**：券商官网可重下", "可再生"),
-    "workspace-session-dirs-": ("会话归档", "保留：历史会话目录，逐目录 diff 验过", "不可再生"),
+# 处置结论分两张表（2026-11-21 审计 P1-2）：
+#   EXACT  —— 精确文件名 → 可以写「这一份的取证事实」（如 356,687 封）；
+#   PREFIX —— 前缀 → 只能给通用处置，**不能继承某一份文件的事实**。
+# 历史 bug：前缀表里写了「356,687 封中 99.99% 是噪音」，于是任何新建的同类文件
+# 都被套上这份事实并建议删除 —— 结论与证据错配，会误导未来的删除决策。
+EXACT = {
+    "cron-mail-spool-20261012.mbox": (
+        "噪音归档",
+        "**建议删**：已核实 356,687 封中 99.99% 是两个 watchdog 的重复输出；有效 36 封已抽出",
+        "不可再生",
+    ),
+    "cron-mail-interesting-20261012.mbox": (
+        "邮件存档", "保留：从上述噪音 mbox 抽出的 36 封有效 cron 输出", "不可再生",
+    ),
+    "XtItClient_x64_国金证券QMT模拟_模拟_2.1.19.0.exe": (
+        "安装包", "**建议删**：国金证券官网可重下", "可再生",
+    ),
+    "workspace-session-dirs-20261120.tgz": (
+        "会话归档", "保留：148 个历史会话目录，逐目录 diff 验过", "不可再生",
+    ),
+}
+
+PREFIX = {
+    "cron-mail-spool-": (
+        "噪音归档", "同类历史为 watchdog 噪音；**本文件未核实**，删前先抽样统计", "不可再生",
+    ),
+    "cron-mail-interesting-": ("邮件存档", "保留：抽出的有效 cron 输出", "不可再生"),
+    "XtItClient_": ("安装包", "同类可从券商官网重下；**本文件未核实版本**", "可再生"),
+    "workspace-session-dirs-": ("会话归档", "保留：历史会话目录归档", "不可再生"),
     "marvis-bridge-final": ("项目归档", "保留：收尾快照（仓已 archived）", "不可再生"),
     "MarvisBridge-runtime": ("运行时归档", "保留", "不可再生"),
     "wechat-download-api.STALE": ("项目归档", "保留：标 STALE，待确认后处理", "不可再生"),
     "MANIFEST-": ("文档", "保留：归档说明", "可再生"),
 }
+
+
+def classify(name: str) -> tuple[str, str, str]:
+    """精确名优先（可带事实），其次前缀（只给通用处置），否则待评估。"""
+    if name in EXACT:
+        return EXACT[name]
+    for prefix, verdict in PREFIX.items():
+        if name.startswith(prefix):
+            return verdict
+    return ("未分类", "**待评估**：未在 EXACT/PREFIX 登记", "未知")
 
 
 def human(n: float) -> str:
@@ -45,13 +79,6 @@ def sha16(p: Path) -> str:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()[:16]
-
-
-def classify(name: str) -> tuple[str, str, str]:
-    for prefix, verdict in VERDICT.items():
-        if name.startswith(prefix):
-            return verdict
-    return ("未分类", "**待评估**：未在 VERDICT 登记", "未知")
 
 
 def build(root: Path) -> tuple[str, int, int]:
@@ -112,7 +139,9 @@ def main() -> int:
         return 1
     text, n, total = build(root)
     if a.print_only:
-        print(text)
+        # sys.stdout.write：print() 会多加一个换行，导致 --print-only 与文件产物差一行空行
+        # （2026-11-21 审计纠正：上一轮把这条差异误判为"手工版 vs 脚本版"，其实是 print 的锅）
+        sys.stdout.write(text)
         return 0
     (root / "INDEX.md").write_text(text, encoding="utf-8")
     print(f"已重建 {root / 'INDEX.md'}：{n} 项 / {human(total)}")

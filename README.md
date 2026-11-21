@@ -72,7 +72,7 @@
 - 新装/卸载 launchd job 后跑一次，否则 `--plists` 恢复会漏 job；
 - 护栏同 snapshot：`AGENTS` 或 `OUT` 非默认时拒绝写盘（需 `FORCE=1`）。
 
-**硬编码路径豁免（S7）**：本机 plist 内含 `/Users/guan/...` 绝对路径 **3 处**（`com.user.infra-sync-check.plist` 的 python 解释器与两个日志路径）。这是**有意豁免**，原因是 launchd 不支持 `~` 与变量展开，`ProgramArguments` 只接受绝对路径。
+**硬编码路径豁免（S7）**：本机 plist 内含 `~` 展开后的绝对路径 **3 处**（形如 `/Users/<用户名>/...`）（`com.user.infra-sync-check.plist` 的 python 解释器与两个日志路径）。这是**有意豁免**，原因是 launchd 不支持 `~` 与变量展开，`ProgramArguments` 只接受绝对路径。
 
 | 替代方案 | 为何不采用 |
 |---|---|

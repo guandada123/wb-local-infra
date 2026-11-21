@@ -13,6 +13,7 @@
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -325,12 +326,35 @@ class TestArchiveIndex(unittest.TestCase):
 
     SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "archive-index.py"
 
+
+    def test_same_prefix_new_file_does_not_inherit_facts(self):
+        """审计 P1-2：前缀类不能继承某一份文件的取证事实（否则凭错误证据建议删）。"""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "cron-mail-spool-20270101.mbox").write_bytes(b"x")
+            r = subprocess.run([sys.executable, str(self.SCRIPT), "--print-only", "--dir", td],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(0, r.returncode, r.stderr)
+            row = [ln for ln in r.stdout.splitlines() if "20270101" in ln][0]
+            self.assertIn("本文件未核实", row, f"新文件未标未核实\n{row}")
+            self.assertNotIn("356,687", row, f"新文件继承了另一份的事实\n{row}")
+            self.assertNotIn("建议删", row, f"未核实的文件给出删除建议\n{row}")
+
+    def test_exact_file_keeps_verified_fact(self):
+        """对照：已核实的那一份必须保留事实（别把修复做成"全体失忆"）。"""
+        with tempfile.TemporaryDirectory() as td:
+            (Path(td) / "cron-mail-spool-20261012.mbox").write_bytes(b"x")
+            r = subprocess.run([sys.executable, str(self.SCRIPT), "--print-only", "--dir", td],
+                               capture_output=True, text=True, timeout=60)
+            row = [ln for ln in r.stdout.splitlines() if "cron-mail-spool-20261012" in ln][0]
+            self.assertIn("356,687", row)
+            self.assertIn("已核实", row)
+
     def test_print_only_lists_and_flags_unclassified(self):
         with tempfile.TemporaryDirectory() as td:
             d = Path(td)
             (d / "known-thing.tgz").write_bytes(b"x" * 100)
             (d / "mystery.dat").write_bytes(b"y" * 50)
-            r = subprocess.run([os.sys.executable, str(self.SCRIPT), "--print-only", "--dir", td],
+            r = subprocess.run([sys.executable, str(self.SCRIPT), "--print-only", "--dir", td],
                                capture_output=True, text=True, timeout=60)
             self.assertEqual(0, r.returncode, r.stderr)
             self.assertIn("known-thing.tgz", r.stdout)
