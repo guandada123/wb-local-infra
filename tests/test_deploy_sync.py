@@ -342,6 +342,22 @@ class TestCheckFailSafe(unittest.TestCase):
         self.assertNotIn("unbound variable", r.stderr, f"环境变量缺失导致崩溃\nstderr={r.stderr}")
         self.assertIn("OK:", r.stdout, f"空环境下未完成检查\nstdout={r.stdout}\nstderr={r.stderr}")
 
+
+    def test_missing_cwd_anchor_is_not_ok(self):
+        """cwd 锚点目录被删 → 必须报（对应 12 条自动化会失联，2026-11-20 踩过）。"""
+        anchors = self.repo / "launchd" / "cwd-anchors.txt"
+        anchors.write_text("# test\n/tmp/no-such-anchor-dir-xyz  # 测试\n", encoding="utf-8")
+        r = self._run()
+        self.assertIn("cwd 锚点缺失", r.stdout, f"未识别锚点缺失\nstdout={r.stdout}")
+        self.assertNotIn("OK:", r.stdout, "锚点缺失却报 OK")
+
+    def test_present_cwd_anchor_keeps_ok(self):
+        """锚点存在 → 不误报（避免天天告警）。"""
+        anchors = self.repo / "launchd" / "cwd-anchors.txt"
+        anchors.write_text("# test\n" + str(self.tmp) + "  # 存在的目录\n", encoding="utf-8")
+        r = self._run()
+        self.assertIn("OK:", r.stdout, f"锚点存在却报问题\nstdout={r.stdout}")
+
     def test_missing_tests_dir_is_not_ok(self):
         """tests 目录消失（unittest rc=5，无断言消息）→ 必须报问题而不是 OK。"""
         shutil.rmtree(self.repo / "tests")

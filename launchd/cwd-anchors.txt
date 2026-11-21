@@ -1,0 +1,22 @@
+# 自动化 cwd 锚点清单（2026-11-21 建立）
+#
+# 为什么存在：12 条 ACTIVE 自动化的 `cwds` 指向下列历史会话目录。这些目录本身是会话残留，
+# 但**不能删**——删了 12 条自动化会因 "cwd 不存在" 全部失效（2026-11-20 移废纸篓时踩过一次，
+# 由 Claw 的 test_ops_center_redteam 抓到，已从废纸篓恢复）。
+#
+# 为什么不去重指：automation_update 拒绝把 Claw（及 /Volumes 下的真实路径）作为 cwd，
+# 报 "workspace ... cannot host automations. Please choose a regular project workspace instead."
+# 即平台只接受它认可的 workspace（现存的会话目录 / automation-* 目录）。
+#
+# 处置：把下列目录当**锚点**长期保留（合计约 21MB），本清单纳入每日检查；
+# 将来若平台允许把 cwd 改到项目目录，再逐条迁移并删除本清单。
+#
+# 格式：<路径>  # <引用的自动化数> <说明>
+
+/Users/guan/WorkBuddy/2026-08-12-05-10-40   # 3 条：做T尾盘决策 / 做T早盘自检 / Alpha因子清单刷新
+/Users/guan/WorkBuddy/2026-09-23-21-55-37   # 1 条：积分零成本调度审计（prompt 内也硬写了该路径）
+/Users/guan/WorkBuddy/2026-10-18-16-42-39   # 2 条：资料库日报增量同步 / 止损模拟周更跟踪
+/Users/guan/WorkBuddy/2026-10-20-20-30-16   # 3 条：Claw→理财工作台同步 / 理财工作台每日巡检 / 每日复盘落库
+/Users/guan/WorkBuddy/2026-10-20-21-34-16   # 1 条：鱼盆双源健康哨兵（prompt 内也硬写了该路径）
+/Users/guan/WorkBuddy/2026-10-20-17-20-49   # 1 条：记忆快照 + 漂移检测
+/Users/guan/WorkBuddy/2026-10-29-18-13-58   # 1 条：资料库周度轻整理（prompt 内也硬写了该路径）

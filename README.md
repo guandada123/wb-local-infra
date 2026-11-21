@@ -96,3 +96,17 @@ python3 bin/archive-index.py --print-only   # 只打印（零写盘）
 - 索引含 SHA256 前 16 位，可校验归档未被悄悄替换。
 
 **噪音识别**：`cron-mail-spool-20261012.mbox` 有 356,687 封，其中 99.99% 是 `openclaw_watchdog.sh` 与 `feishu_qa_bot_watchdog.sh` 的重复输出；有效 36 封已抽出为 `cron-mail-interesting-20261012.mbox`（29.5KB）。
+
+## 每日检查的四类（2026-11-21 扩到 4 类）
+
+| # | 类 | 判据 | 修复 |
+|---|---|---|---|
+| ① | 脚本漂移 | 仓 `bin/` ↔ `~/.local/bin` 逐字节（unittest） | 回迁或 `./install.sh --apply` |
+| ② | plist 快照 | `launchd/` 是否过期（`--snapshot-plists`） | `--snapshot-plists-apply` |
+| ③ | 归档索引 | `_archive/INDEX.md` 是否与目录一致（`archive-index.py --check`） | 跑 `archive-index.py` |
+| ④ | **cwd 锚点** | `launchd/cwd-anchors.txt` 列出的目录是否还在 | 从废纸篓恢复 |
+
+第 ④ 类的由来：12 条自动化（做T/Alpha/资料库/理财工作台/鱼盆/记忆快照等）的 `cwds` 指向历史会话目录，
+删了就会全部失联。`automation_update` **拒绝**把 Claw 或 `/Volumes/...` 真实路径作为 cwd
+（报 `workspace ... cannot host automations`），所以只能把这些目录当锚点长期保留（合计约 21MB），
+清单纳管、每日校验。详见 `launchd/cwd-anchors.txt` 的说明。
