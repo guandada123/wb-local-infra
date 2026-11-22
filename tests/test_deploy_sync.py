@@ -431,3 +431,85 @@ class TestArchiveIndex(unittest.TestCase):
             self.assertIn("未分类", r.stdout)
             self.assertNotIn("INDEX.md", r.stdout, "--print-only 不该把 INDEX.md 自身列进去")
             self.assertFalse((d / "INDEX.md").exists(), "--print-only 不得写盘")
+
+class TestMajiuArchiveIndex(unittest.TestCase):
+    """majiu-archive-index.py：总册生成器的核心判据。
+
+    重点不是"能跑"，而是三点：① 数字现算（不写死）；② 归档索引读不到时
+    显示"未读到"而不是假的"0 项"；③ --check 三态可区分。
+    """
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "majiu-archive-index.py"
+
+    def _make_home(self, td: Path, ledger_rows: int = 2, with_index: bool = True) -> Path:
+        home = td / "WorkBuddy"
+        claw = home / "Claw"
+        (claw / ".workbuddy").mkdir(parents=True)
+        rows = "\n".join(
+            f"| {i} | 任务{i} | task | 出栏 | 2026-11-0{i} | 2026-11-0{i} | 产物 | 备注 |"
+            for i in range(1, ledger_rows + 1)
+        )
+        (claw / "STALL_LOG.md").write_text(
+            "# 台账\n\n## 栏位记录\n\n| # | 名称 | kind | 状态 | 开始 | 结束 | 产物 | 备注 |\n"
+            "|---|---|---|---|---|---|---|---|\n" + rows + "\n\n## 出栏索引\n\n- x\n",
+            encoding="utf-8")
+        d = claw / ".workbuddy" / "archive" / "2026-11-22-conversation"
+        d.mkdir(parents=True)
+        (d / "成果档案.md").write_text("# 成果\n", encoding="utf-8")
+        if with_index:
+            arc = home / "_archive"
+            arc.mkdir()
+            (arc / "INDEX.md").write_text(
+                "# 归档索引\n\n> 由 x 生成 2026-11-22 13:31｜7 项 / **123.5MB**\n", encoding="utf-8")
+        return home
+
+    def _run(self, *args, home):
+        return subprocess.run([sys.executable, str(self.SCRIPT), "--workbuddy-home", str(home), *args],
+                              capture_output=True, text=True, timeout=120)
+
+    def test_counts_come_from_data(self):
+        """台账 3 行 → 标题必须是 3；本机档案 1 份 → 3 节写 1 份。"""
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td), ledger_rows=3)
+            r = self._run(home=home)
+            self.assertEqual(0, r.returncode, r.stderr)
+            self.assertIn("台账（3 个栏位）", r.stdout)
+            self.assertIn("本机原件（1 份）", r.stdout)
+            self.assertNotIn("台账（0 个栏位）", r.stdout)
+
+    def test_archive_index_read_from_file(self):
+        """归档索引存在 → 条目数与大小须来自文件（7 项 / 124MB 四舍五入）。"""
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td))
+            r = self._run(home=home)
+            self.assertIn("归档区（7 项 / 124MB）", r.stdout, f"stdout={r.stdout}")
+
+    def test_missing_archive_index_is_not_reported_as_zero(self):
+        """索引缺失 → 必须写"未读到索引"，不能出现 0 项（假事实）。"""
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td), with_index=False)
+            r = self._run(home=home)
+            self.assertIn("未读到索引", r.stdout, f"stdout={r.stdout}")
+            self.assertNotIn("归档区（0 项", r.stdout, "把读不到当成 0 项 = 假事实")
+
+    def test_library_not_requested_is_stated(self):
+        """未加 --with-library → 云端小节必须明说未实读，不能静默空表。"""
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td))
+            r = self._run(home=home)
+            self.assertIn("未实读", r.stdout)
+
+    def test_check_three_states(self):
+        """--check：文件不存在 2 / 一致 0 / 改一字节 1。"""
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td))
+            out = Path(td) / "总册.md"
+            missing = self._run("--check", str(out), home=home)
+            self.assertEqual(2, missing.returncode)
+            gen = self._run("--out", str(out), home=home)
+            self.assertEqual(0, gen.returncode, gen.stderr)
+            same = self._run("--check", str(out), home=home)
+            self.assertEqual(0, same.returncode, same.stdout)
+            out.write_text(out.read_text(encoding="utf-8") + "\n补一行\n", encoding="utf-8")
+            stale = self._run("--check", str(out), home=home)
+            self.assertEqual(1, stale.returncode, stale.stdout)

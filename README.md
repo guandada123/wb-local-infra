@@ -110,3 +110,25 @@ python3 bin/archive-index.py --print-only   # 只打印（零写盘）
 删了就会全部失联。`automation_update` **拒绝**把 Claw 或 `/Volumes/...` 真实路径作为 cwd
 （报 `workspace ... cannot host automations`），所以只能把这些目录当锚点长期保留（合计约 21MB），
 清单纳管、每日校验。详见 `launchd/cwd-anchors.txt` 的说明。
+
+## 马厩重打总册（`bin/majiu-archive-index.py`）
+
+马厩归纳分散在三层：台账 `Claw/STALL_LOG.md`、归档区 `~/WorkBuddy/_archive/`、成果档案 `archive/<日期>-conversation/`。
+本脚本把三层汇成一份可直接上传资料库的《马厩归档总册》，**不手工维护**。
+
+```bash
+python3 bin/majiu-archive-index.py                      # 打印
+python3 bin/majiu-archive-index.py --with-library       # 额外实读资料库「00 对话成果档案」清单
+python3 bin/majiu-archive-index.py --with-library --out 总册.md
+python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 / 2 文件不存在
+```
+
+三条硬约束（都有用例守着）：
+
+| 约束 | 原因 |
+|---|---|
+| 数字全部现算 | 写死会在档案增减后失真（总册曾写 25 份而实际 41 份） |
+| 归档索引读不到 → 显示「未读到索引」 | **不返回 0 项**：那会在总册里造出「0 项 / 0MB」的假事实 |
+| 未加 `--with-library` → 明说「未实读」 | 不静默输出空清单 |
+
+`--with-library` 依赖 WorkBuddy 桌面端的 `space_api.py`，非桌面环境下该节自动降级为「未取」，其余照常生成。
