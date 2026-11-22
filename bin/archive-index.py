@@ -55,6 +55,21 @@ PREFIX = {
 }
 
 
+# 目录级登记（目录不逐个文件列，只给处置结论；未登记的一律"见目录内文件"）
+DIR_NOTE = {
+    "知识库/": (
+        "弃用知识库",
+        "**已处置 2026-11-22**：2026-06 建的 LLM Wiki，只跑过初始化即停摆（log 仅 1 条）；"
+        "5 页中 3 页是他处活文档的旧摘要或已被取代、1 页严重过时，"
+        "仅「LLM Wiki 规格」与「Karpathy 模式笔记」为独有资产 → "
+        "已抽出到 Claw `.workbuddy/docs/knowledge-wiki/`，原件留此作为历史快照",
+        "不可再生",
+    ),
+    "old_experiments/": ("实验草稿", "保留：2026-07 实验会话目录", "不可再生"),
+    "session-backups-20260711/": ("文档归档", "保留：阶段性完成报告", "不可再生"),
+}
+
+
 def classify(name: str) -> tuple[str, str, str]:
     """精确名优先（可带事实），其次前缀（只给通用处置），否则待评估。"""
     if name in EXACT:
@@ -88,7 +103,9 @@ def build(root: Path) -> tuple[str, int, int]:
             continue
         if p.is_dir():
             size = sum(f.stat().st_size for f in p.rglob("*") if f.is_file())
-            rows.append((p.name + "/", size, p.stat().st_mtime, "目录", "见目录内文件", "—", "—"))
+            key = p.name + "/"
+            kind, verdict, rege = DIR_NOTE.get(key, ("目录", "见目录内文件", "—"))
+            rows.append((key, size, p.stat().st_mtime, kind, verdict, rege, "—"))
             continue
         kind, verdict, regen = classify(p.name)
         rows.append((p.name, p.stat().st_size, p.stat().st_mtime, kind, verdict, regen, sha16(p)))
