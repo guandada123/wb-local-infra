@@ -133,8 +133,9 @@ fi
 # ---------- 汇总（五类都真通过才 OK） ----------
 if [ -z "$script_issue" ] && [ -z "$plist_issue" ] && [ -z "$idx_issue" ] && [ -z "$anchor_issue" ] && [ -z "$majiu_issue" ]; then
   n_bin="$("$PY" -c 'import pathlib,sys;print(sum(1 for f in (pathlib.Path(sys.argv[1])/"bin").iterdir() if f.is_file()))' "$REPO" 2>/dev/null || echo "?")"
-  log "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
-  [ "${DRY_RUN:-0}" = "1" ] && echo "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
+  ok_line="OK: 五类通过（脚本一致 ${n_bin} 个 / plist 快照 / 归档索引 / cwd 锚点 / 马厩总册）"
+  log "$ok_line"
+  [ "${DRY_RUN:-0}" = "1" ] && echo "$ok_line"
   exit 0
 fi
 

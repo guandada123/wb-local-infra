@@ -281,6 +281,8 @@ class TestCheckFailSafe(unittest.TestCase):
         """负样本（防"测试永远红"）：一切正常时必须报 OK。"""
         r = self._run()
         self.assertIn("OK:", r.stdout, f"正常态未报 OK\nstdout={r.stdout}\nstderr={r.stderr}")
+        # OK 行要自己证明五类都跑过：否则谁把某类检查删了，日志照样一片 OK（静默弱化）
+        self.assertIn("五类通过", r.stdout, f"OK 行未体现检查类数\nstdout={r.stdout}")
 
     def test_missing_active_list_is_not_ok(self):
         """active.txt 丢失 → 快照检查失败，必须报问题而不是 OK。"""
