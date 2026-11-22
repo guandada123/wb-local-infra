@@ -157,7 +157,8 @@ def build(workbuddy: Path, with_library: bool) -> str:
         out += [f"未实读（{cloud_err}）。运行加 `--with-library` 可拉取实际清单。"]
 
     out += ["", f"## 三、本机原件（{len(local)} 份）", "",
-            "与云端互为副本；本机路径便于脚本读取，云端便于跨设备查看。", ""]
+            "**本机是云端的子集，不是互为副本**：本机只保留仍有 `archive/<日期>-conversation/` 目录的那批，"
+            "其余档案随会话工作区清理后**仅云端留存**。找历史档案以云端为准，本机路径只便于脚本读取。", ""]
     if local:
         out += ["| 日期 | 本机路径 |", "|---|---|"]
         out += [f"| {d} | `{p.replace(str(HOME) + '/', '~/')}` |" for d, p in sorted(local)]
