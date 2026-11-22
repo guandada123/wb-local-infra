@@ -415,8 +415,11 @@ class TestArchiveIndex(unittest.TestCase):
             r = subprocess.run([sys.executable, str(self.SCRIPT), "--print-only", "--dir", td],
                                capture_output=True, text=True, timeout=60)
             row = [ln for ln in r.stdout.splitlines() if "cron-mail-spool-20261012" in ln][0]
-            self.assertIn("356,687", row)
-            self.assertIn("已核实", row)
+            self.assertIn("356,687", row, f"精确名条目丢了取证事实\n{row}")
+            self.assertIn("99.99%", row)
+            # 只验事实，不锁「已核实/已处置」这类措辞：措辞会随处置进展变化，
+            # 锁死会让文案调整变成假红（2026-11-22 踩过）
+            self.assertTrue("移入废纸篓" in row or "已核实" in row, f"缺少处置结论\n{row}")
 
     def test_print_only_lists_and_flags_unclassified(self):
         with tempfile.TemporaryDirectory() as td:
