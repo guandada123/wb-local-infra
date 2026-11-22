@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# infra-sync-check：每日校验中台基础设施的两类漂移
+# infra-sync-check：每日校验中台基础设施的五类漂移
 #   ① 脚本：仓内 bin/ ↔ 已部署 ~/.local/bin 逐字节一致（tests/test_deploy_sync.py）
 #   ② plist：live → 仓内 launchd/ 快照是否过期（DR 基线不过期才可恢复）
+#   ③ 归档索引：_archive 变动后 INDEX.md 是否过期
+#   ④ cwd 锚点：自动化工作目录是否还在（删了会让自动化失联）
+#   ⑤ 马厩归档总册：台账/档案/归档区变了而总册没重跑（云端那份即过期）
 # 全绿 → 静默（只写日志）；有漂移 → push_card 推飞书（一张卡，按类分节）。
 #
 # 🔴 FAIL-SAFE 铁律（2026-11-20 审计 P0-1 修复）：
@@ -83,6 +86,29 @@ if [ -f "$IDX_SCRIPT" ]; then
   esac
 fi
 
+# ---------- ⑤ 马厩归档总册是否过期（台账/档案/归档区变了而总册没重跑） ----------
+majiu_issue=""
+MAJIU_SCRIPT="$REPO/bin/majiu-archive-index.py"
+MAJIU_FILE="${MAJIU_FILE:-${MAJIU_HOME:-$HOME/WorkBuddy}/马厩归档总册.md}"
+if [ -f "$MAJIU_SCRIPT" ]; then
+  # 总册自己声明生成模式（本机 / 资料库实读），--check 按该模式重建再比对
+  mj_args=(--check "$MAJIU_FILE")
+  [ -n "${MAJIU_HOME:-}" ] && mj_args+=(--workbuddy-home "$MAJIU_HOME")
+  mj_out="$("$PY" "$MAJIU_SCRIPT" "${mj_args[@]}" 2>&1)"; mj_rc=$?
+  case "$mj_rc" in
+    0) : ;;
+    1) majiu_issue="总册已过期（台账/档案/归档区有变动）"
+       log "STALE(majiu): $(printf '%s\n' "$mj_out" | tail -1)" ;;
+    2) majiu_issue="总册不存在：$MAJIU_FILE"
+       log "MISSING(majiu): $MAJIU_FILE" ;;
+    3) # 读不到云端清单 = 比对没做成，不能当过期，更不能当 OK
+       majiu_issue="总册检查未能完成（资料库未实读）：$(printf '%s\n' "$mj_out" | tail -1)"
+       log "ERROR(majiu): 无法比对（资料库不可达）" ;;
+    *) majiu_issue="总册检查失败(rc=$mj_rc)：$(printf '%s\n' "$mj_out" | tail -2)"
+       log "ERROR(majiu): 检查失败 rc=$mj_rc" ;;
+  esac
+fi
+
 # 清单未登记（live 有但 active.txt 无）：只记日志，不推卡（新 job 属正常演进）
 unlisted="$(printf '%s\n' "$snap_out" | grep -cE 'live 有但清单无')"
 [ "${unlisted:-0}" -gt 0 ] && log "INFO: 有 ${unlisted} 个 live plist 未登记 active.txt"
@@ -104,8 +130,8 @@ if [ -f "$ANCHORS" ]; then
   fi
 fi
 
-# ---------- 汇总（只有两类都真通过才 OK） ----------
-if [ -z "$script_issue" ] && [ -z "$plist_issue" ] && [ -z "$idx_issue" ] && [ -z "$anchor_issue" ]; then
+# ---------- 汇总（五类都真通过才 OK） ----------
+if [ -z "$script_issue" ] && [ -z "$plist_issue" ] && [ -z "$idx_issue" ] && [ -z "$anchor_issue" ] && [ -z "$majiu_issue" ]; then
   n_bin="$("$PY" -c 'import pathlib,sys;print(sum(1 for f in (pathlib.Path(sys.argv[1])/"bin").iterdir() if f.is_file()))' "$REPO" 2>/dev/null || echo "?")"
   log "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
   [ "${DRY_RUN:-0}" = "1" ] && echo "OK: 脚本一致（${n_bin} 个）+ plist 快照最新"
@@ -114,8 +140,8 @@ fi
 
 # DRY_RUN=1：只打印不推送（验证失败路径用，零刷群副作用）
 if [ "${DRY_RUN:-0}" = "1" ]; then
-  echo "DRY_RUN: 将推送——脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」/ 索引「${idx_issue:-无}」/ 锚点「${anchor_issue:-无}」"
-  log "DRY_RUN: 脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」/ 索引「${idx_issue:-无}」/ 锚点「${anchor_issue:-无}」"
+  echo "DRY_RUN: 将推送——脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」/ 索引「${idx_issue:-无}」/ 锚点「${anchor_issue:-无}」/ 总册「${majiu_issue:-无}」"
+  log "DRY_RUN: 脚本「${script_issue:-无}」/ plist「${plist_issue:-无}」/ 索引「${idx_issue:-无}」/ 锚点「${anchor_issue:-无}」/ 总册「${majiu_issue:-无}」"
   exit 0
 fi
 
@@ -128,5 +154,7 @@ args=(--title "🟠 中台基础设施漂移" --level warning)
 修法：从废纸篓恢复该目录，或按 launchd/cwd-anchors.txt 里的说明处理")
 [ -n "$idx_issue" ] && args+=(--section "③ 归档索引" "${idx_issue}
 修法：python3 ~/WorkBuddy/wb-local-infra/bin/archive-index.py（重建 _archive/INDEX.md）")
+[ -n "$majiu_issue" ] && args+=(--section "⑤ 马厩归档总册" "${majiu_issue}
+修法：python3 ~/WorkBuddy/wb-local-infra/bin/majiu-archive-index.py --with-library --out ~/WorkBuddy/马厩归档总册.md（重建后覆盖资料库那份）")
 "$PY" "$HOME/.local/bin/push_card.py" "${args[@]}" 2>>"$LOG" || log "push_card 失败（见上）"
 exit 0

@@ -8,8 +8,12 @@
 用法：
     python3 majiu-archive-index.py                        # 打印到 stdout
     python3 majiu-archive-index.py --out 总册.md          # 落盘
-    python3 majiu-archive-index.py --check 总册.md        # 比对（0 一致 / 1 过期 / 2 文件不存在）
+    python3 majiu-archive-index.py --check 总册.md        # 比对（0 一致 / 1 过期 / 2 文件不存在 / 3 无法比对）
     python3 majiu-archive-index.py --with-library         # 额外实读资料库「00 对话成果档案」清单
+
+生成模式自描述：总册头部写 `> 生成模式：…`，`--check` 按**文件自己声明的模式**重建再比对。
+（2026-11-22 修：此前 --check 恒按本机模式重建，对 --with-library 生成的总册必然判「过期」——
+一个刚生成的文件被判过期，闸门就等于永远假红，挂到每日检查只会制造噪音。）
 
 设计约束：
 - 只读，不改任何源数据；台账/档案/归档区都只读。
@@ -22,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -42,13 +47,17 @@ TODO_ROWS = [
     ("L1", "3 条 prompt 耦合自动化", "已裁定不动"),
     ("L2", "`_archive` 清理", "**已执行 2026-11-22**：mbox 251MB + exe 237MB 移废纸篓；562MB → 75MB"),
     ("L3", "废纸篓 3.8GB", "待手动清倒"),
-    ("L4", "StockInsight 公开仓跟踪持仓明细", "**部分已执行**：`模拟盘.json` 已 rm --cached；`全链路精选组合.json`（5 只）仍跟踪，待定"),
+    ("L4", "StockInsight 公开仓跟踪持仓明细", "**已执行 2026-11-22**：`模拟盘.json`、`全链路精选组合.json` 均 `git rm --cached`（本地文件保留，程序产物）"),
     ("L5", "QTS 模块拆分", "暂缓（缺模块级 tests）"),
     ("L6", "`_archive/知识库/` 原件", "保留"),
-    ("L7", "每日检查四类（脚本 / plist / 索引 / 锚点）", "运行中"),
+    ("L7", "每日检查五类（脚本 / plist / 索引 / 锚点 / 总册）", "运行中"),
     ("L8", "`STALL_LOG.md` 不入 git（.gitignore:210）", "现状接受（资料库有云端副本）"),
     ("L9", "云端档案分两处", "已汇总：主库 41 份；腾讯文档旁支 4 份（历史未迁）"),
 ]
+
+# 生成模式标记（自描述）：--check 按文件这一行决定用什么模式重建
+MODE_LIB = "--with-library"
+MODE_LOCAL = "本机三层"
 
 
 def parse_stall_log(path: Path) -> list[list[str]]:
@@ -106,7 +115,22 @@ def archive_summary(workbuddy: Path) -> tuple[int, float] | None:
 
 
 def library_docs() -> tuple[list[str], str]:
-    """实读资料库「00 对话成果档案」。返回 (标题列表, 错误说明)。"""
+    """实读资料库「00 对话成果档案」。返回 (标题列表, 错误说明)。
+
+    MAJIU_LIB_DOCS_FILE 指向一个 JSON（标题数组或 {"titles": [...]}）时走该文件当替身，
+    用于离线测试与排障——真实调用要网络+登录，测试里跑不了。
+    """
+    stub = os.environ.get("MAJIU_LIB_DOCS_FILE")
+    if stub:
+        try:
+            data = json.loads(Path(stub).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            return [], f"替身文件不可读（{type(exc).__name__}）"
+        titles = data.get("titles", []) if isinstance(data, dict) else data
+        if not isinstance(titles, list):
+            return [], "替身文件格式不对（需标题数组）"
+        return sorted(str(t) for t in titles), ""
+
     py = HOME / ".workbuddy/binaries/python/envs/default/bin/python"
     exe = str(py) if py.exists() else sys.executable
     if not Path(LIB_SKILL).exists():
@@ -124,16 +148,19 @@ def library_docs() -> tuple[list[str], str]:
     return sorted(n["title"] for n in data if n.get("kind") == "doc"), ""
 
 
-def build(workbuddy: Path, with_library: bool) -> str:
+def build(workbuddy: Path, with_library: bool) -> tuple[str, str]:
+    """生成总册正文。返回 (正文, 云端实读错误说明为空即成功)。"""
     claw = workbuddy / "Claw"
     ledger = parse_stall_log(claw / "STALL_LOG.md")
     local = find_local_archives(workbuddy)
     arc = archive_summary(workbuddy)
     cloud, cloud_err = library_docs() if with_library else ([], "未启用 --with-library")
 
+    mode = MODE_LIB if with_library else MODE_LOCAL
     out: list[str] = [
         "# 马厩归档总册", "",
         "> 本册由 `wb-local-infra/bin/majiu-archive-index.py` 生成，**不手工维护**。",
+        f"> 生成模式：{mode}（`--check` 按此行选择重建口径）",
         "> 马厩（工作空间治理）把归纳分三层存放，本册是资料库侧的汇总入口。", "",
         "| 层 | 内容 | 位置 |", "|---|---|---|",
         "| ① 台账 | 任务生命周期：出栏日期、产物落点、失败模式 | `Claw/STALL_LOG.md`（本机）+ 资料库 `马厩台账_STALL_LOG` |",
@@ -153,6 +180,8 @@ def build(workbuddy: Path, with_library: bool) -> str:
     if cloud:
         out += [f"实读 **{len(cloud)} 份**：", "", "| # | 档案 |", "|---|---|"]
         out += [f"| {i} | {t} |" for i, t in enumerate(cloud, 1)]
+        out += ["", "> 2026-11-22 归位动作：13 份此前散落在资料库根目录的档案已全部移入本文件夹"
+                    "（`move-node` 13/13），根目录 doc 归零。"]
     else:
         out += [f"未实读（{cloud_err}）。运行加 `--with-library` 可拉取实际清单。"]
 
@@ -188,7 +217,13 @@ def build(workbuddy: Path, with_library: bool) -> str:
             "4. **新收尾后** → 本机写完 `archive/<日期>-conversation/` → 上传资料库 → 重跑本脚本更新总册。", "",
             "## 七、一句话", "",
             "台账记「谁出栏了」，归档区存「栏位本体」，成果档案记「这次做成了什么」——本册把三层在云端汇到一处。", ""]
-    return "\n".join(out)
+    return "\n".join(out), cloud_err
+
+
+def detect_mode(text: str) -> str:
+    """读总册自己声明的生成模式；无标记（旧版手写总册）→ 按本机模式。"""
+    m = re.search(r"^> 生成模式：(.+?)（", text, re.M)
+    return m.group(1).strip() if m else MODE_LOCAL
 
 
 def normalize(text: str) -> str:
@@ -200,23 +235,30 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="生成马厩归档总册")
     ap.add_argument("--workbuddy-home", default=str(HOME / "WorkBuddy"))
     ap.add_argument("--out", help="写入该路径")
-    ap.add_argument("--check", metavar="PATH", help="与既有文件比对：0 一致 / 1 过期 / 2 不存在")
+    ap.add_argument("--check", metavar="PATH", help="与既有文件比对：0 一致 / 1 过期 / 2 不存在 / 3 无法比对")
     ap.add_argument("--with-library", action="store_true", help="实读资料库「00 对话成果档案」清单")
     a = ap.parse_args()
-
-    text = build(Path(a.workbuddy_home), a.with_library)
 
     if a.check:
         p = Path(a.check)
         if not p.exists():
             print(f"无法比对：{p} 不存在")
             return 2
-        if normalize(p.read_text(encoding="utf-8")) == normalize(text):
+        old = p.read_text(encoding="utf-8")
+        # 按文件声明的模式重建，否则 --with-library 生成的总册永远被判过期（假红）
+        with_lib = detect_mode(old) == MODE_LIB
+        text, cloud_err = build(Path(a.workbuddy_home), with_lib)
+        if with_lib and cloud_err:
+            # 读不到云端清单 ≠ 总册过期：这是"比对没做成"，必须与 1 区分开
+            print(f"无法比对：{p} 声明了资料库实读，但本次未读到（{cloud_err}）")
+            return 3
+        if normalize(old) == normalize(text):
             print(f"总册最新：{p}")
             return 0
         print(f"总册已过期：{p} 与当前台账/档案不一致 —— 重跑本脚本并加 --out {p}")
         return 1
 
+    text, _ = build(Path(a.workbuddy_home), a.with_library)
     if a.out:
         Path(a.out).write_text(text, encoding="utf-8")
         print(f"已写入 {a.out}（{len(text)} 字符）")

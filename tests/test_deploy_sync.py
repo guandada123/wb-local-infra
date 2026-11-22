@@ -365,6 +365,76 @@ class TestCheckFailSafe(unittest.TestCase):
         self.assertIn("unittest 失败 rc=", r.stdout, f"未识别为检查失败\nstdout={r.stdout}")
         self.assertNotIn("OK:", r.stdout, "检查失败却报了 OK（fail-open 回归）")
 
+    # ---- ⑤ 马厩归档总册（2026-11-22 接入的第五类检查） ----
+    def _majiu_setup(self):
+        """装总册生成器 + 造一个最小 WorkBuddy 家目录，返回 (env_extra, home)。"""
+        shutil.copy2(self.REPO / "bin" / "majiu-archive-index.py",
+                     self.repo / "bin" / "majiu-archive-index.py")
+        home = self.tmp / "wbhome"
+        d = home / "Claw" / ".workbuddy" / "archive" / "2026-11-22-conversation"
+        d.mkdir(parents=True)
+        (d / "成果档案.md").write_text("# 成果\n", encoding="utf-8")
+        (home / "Claw" / "STALL_LOG.md").write_text(
+            "# 台账\n\n## 栏位记录\n\n| # | 名称 | kind | 状态 | 开始 | 结束 |\n"
+            "|---|---|---|---|---|---|\n| 1 | 任务 | task | 出栏 | 2026-11-22 | 2026-11-22 |\n", encoding="utf-8")
+        return {"MAJIU_HOME": str(home), "MAJIU_FILE": str(self.tmp / "总册.md")}, home
+
+    def _run_with(self, extra: dict):
+        env = {**os.environ,
+               "REPO_OVERRIDE": str(self.repo), "LOG_OVERRIDE": str(self.tmp / "chk.log"),
+               "AGENTS": str(self.agents), "LIVE_BIN": str(self.live),
+               "CLAW_HOME": str(self.tmp / "no-claw"), "DRY_RUN": "1", **extra}
+        return subprocess.run(["/bin/bash", str(self.CHECK)], capture_output=True, text=True,
+                              timeout=180, env=env)
+
+    def test_stale_majiu_index_is_not_ok(self):
+        """档案新增而总册没重跑 → 必须报「总册已过期」，且不能同时报 OK。"""
+        extra, home = self._majiu_setup()
+        gen = subprocess.run([sys.executable, str(self.repo / "bin" / "majiu-archive-index.py"),
+                              "--workbuddy-home", str(home), "--out", extra["MAJIU_FILE"]],
+                             capture_output=True, text=True, timeout=120)
+        self.assertEqual(0, gen.returncode, gen.stderr)
+        fresh = self._run_with(extra)
+        self.assertIn("OK:", fresh.stdout, f"总册最新时应 OK\nstdout={fresh.stdout}")
+        # 新收尾一份档案 → 总册过期
+        nd = home / "Claw" / ".workbuddy" / "archive" / "2026-11-23-conversation"
+        nd.mkdir()
+        (nd / "成果档案.md").write_text("# 新成果\n", encoding="utf-8")
+        stale = self._run_with(extra)
+        self.assertIn("总册已过期", stale.stdout, f"未识别总册过期\nstdout={stale.stdout}")
+        self.assertNotIn("OK:", stale.stdout, "总册过期却报 OK（fail-open 回归）")
+
+    def test_missing_majiu_index_is_not_ok(self):
+        """总册文件被删 → 必须报（否则删掉文件就静默关掉了第五类检查）。"""
+        extra, _ = self._majiu_setup()
+        r = self._run_with(extra)
+        self.assertIn("总册不存在", r.stdout, f"未识别总册缺失\nstdout={r.stdout}")
+        self.assertNotIn("OK:", r.stdout, "总册缺失却报 OK（no-op 回归）")
+
+    def test_unreadable_library_does_not_pass_majiu_check(self):
+        """总册声明资料库实读但读不到 → 报「未能完成」，既不能当 OK 也不能当过期。"""
+        extra, home = self._majiu_setup()
+        bad = self.tmp / "broken.json"
+        bad.write_text("not json", encoding="utf-8")
+        gen = subprocess.run([sys.executable, str(self.repo / "bin" / "majiu-archive-index.py"),
+                              "--workbuddy-home", str(home), "--with-library",
+                              "--out", extra["MAJIU_FILE"]],
+                             capture_output=True, text=True, timeout=120,
+                             env={**os.environ, "MAJIU_LIB_DOCS_FILE": str(bad)})
+        # 替身坏掉时生成也能跑（write 空清单失败态），但总册里会写「未实读」
+        self.assertEqual(0, gen.returncode, gen.stderr)
+        st = self.tmp / "ok.json"
+        st.write_text('["档案A"]', encoding="utf-8")
+        gen2 = subprocess.run([sys.executable, str(self.repo / "bin" / "majiu-archive-index.py"),
+                               "--workbuddy-home", str(home), "--with-library",
+                               "--out", extra["MAJIU_FILE"]],
+                              capture_output=True, text=True, timeout=120,
+                              env={**os.environ, "MAJIU_LIB_DOCS_FILE": str(st)})
+        self.assertEqual(0, gen2.returncode, gen2.stderr)
+        r = self._run_with({**extra, "MAJIU_LIB_DOCS_FILE": str(bad)})
+        self.assertIn("未能完成", r.stdout, f"读不到云端却没报「未能完成」\nstdout={r.stdout}")
+        self.assertNotIn("OK:", r.stdout, "比对没做成却报 OK（fail-open 回归）")
+
 
 class TestPlistsValidation(unittest.TestCase):
     """--plists-apply 必须拒装非法 plist（审计 P1-3）：坏 plist 进 LaunchAgents 会被 launchd 拒载，
@@ -466,9 +536,10 @@ class TestMajiuArchiveIndex(unittest.TestCase):
                 "# 归档索引\n\n> 由 x 生成 2026-11-22 13:31｜7 项 / **123.5MB**\n", encoding="utf-8")
         return home
 
-    def _run(self, *args, home):
+    def _run(self, *args, home, env=None):
         return subprocess.run([sys.executable, str(self.SCRIPT), "--workbuddy-home", str(home), *args],
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=120,
+                              env={**os.environ, **(env or {})})
 
     def test_counts_come_from_data(self):
         """台账 3 行 → 标题必须是 3；本机档案 1 份 → 3 节写 1 份。"""
@@ -516,3 +587,50 @@ class TestMajiuArchiveIndex(unittest.TestCase):
             out.write_text(out.read_text(encoding="utf-8") + "\n补一行\n", encoding="utf-8")
             stale = self._run("--check", str(out), home=home)
             self.assertEqual(1, stale.returncode, stale.stdout)
+
+    # ---- 生成模式自描述（2026-11-22 接每日第 5 类检查时修的真实假红） ----
+    def _lib_stub(self, td: Path, titles: list[str]) -> dict:
+        p = td / "lib.json"
+        p.write_text(__import__("json").dumps(titles, ensure_ascii=False), encoding="utf-8")
+        return {"MAJIU_LIB_DOCS_FILE": str(p)}
+
+    def test_check_uses_mode_declared_in_file(self):
+        """--with-library 生成的总册，不带该参数做 --check 也必须判「最新」。
+
+        历史缺陷：--check 恒按本机模式重建，于是**刚生成的文件立刻被判过期**（实测 rc=1）。
+        这种闸门挂到每日检查只会天天假红。
+        """
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td))
+            env = self._lib_stub(Path(td), ["档案A", "档案B"])
+            out = Path(td) / "总册.md"
+            gen = self._run("--with-library", "--out", str(out), home=home, env=env)
+            self.assertEqual(0, gen.returncode, gen.stderr)
+            self.assertIn("生成模式：--with-library", out.read_text(encoding="utf-8"))
+            same = self._run("--check", str(out), home=home, env=env)   # 故意不带 --with-library
+            self.assertEqual(0, same.returncode, same.stdout)
+            self.assertIn("最新", same.stdout)
+
+    def test_check_detects_new_cloud_doc(self):
+        """云端新增档案 → 总册须判过期（否则第 5 类检查形同虚设）。"""
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td))
+            out = Path(td) / "总册.md"
+            env = self._lib_stub(Path(td), ["档案A"])
+            self.assertEqual(0, self._run("--with-library", "--out", str(out), home=home, env=env).returncode)
+            env2 = self._lib_stub(Path(td), ["档案A", "档案B"])
+            stale = self._run("--check", str(out), home=home, env=env2)
+            self.assertEqual(1, stale.returncode, stale.stdout)
+
+    def test_unreadable_library_is_3_not_ok(self):
+        """云端读不到 → rc=3「无法比对」，既不能报 0（假绿）也不能报 1（假过期）。"""
+        with tempfile.TemporaryDirectory() as td:
+            home = self._make_home(Path(td))
+            out = Path(td) / "总册.md"
+            self.assertEqual(0, self._run("--with-library", "--out", str(out), home=home,
+                                          env=self._lib_stub(Path(td), ["档案A"])).returncode)
+            bad = Path(td) / "broken.json"
+            bad.write_text("not json", encoding="utf-8")
+            r = self._run("--check", str(out), home=home, env={"MAJIU_LIB_DOCS_FILE": str(bad)})
+            self.assertEqual(3, r.returncode, r.stdout)
+            self.assertIn("无法比对", r.stdout)
