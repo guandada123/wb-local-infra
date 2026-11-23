@@ -97,7 +97,7 @@ python3 bin/archive-index.py --print-only   # 只打印（零写盘）
 
 **噪音识别**：`cron-mail-spool-20261012.mbox` 有 356,687 封，其中 99.99% 是 `openclaw_watchdog.sh` 与 `feishu_qa_bot_watchdog.sh` 的重复输出；有效 36 封已抽出为 `cron-mail-interesting-20261012.mbox`（29.5KB）。
 
-## 每日检查的四类（2026-11-21 扩到 4 类）
+## 每日检查的五类（2026-11-21 扩到 4 类，11-22 扩到 5 类）
 
 | # | 类 | 判据 | 修复 |
 |---|---|---|---|
@@ -105,11 +105,52 @@ python3 bin/archive-index.py --print-only   # 只打印（零写盘）
 | ② | plist 快照 | `launchd/` 是否过期（`--snapshot-plists`） | `--snapshot-plists-apply` |
 | ③ | 归档索引 | `_archive/INDEX.md` 是否与目录一致（`archive-index.py --check`） | 跑 `archive-index.py` |
 | ④ | **cwd 锚点** | `launchd/cwd-anchors.txt` 列出的目录是否还在 | 从废纸篓恢复 |
+| ⑤ | **马厩总册** | `~/WorkBuddy/马厩归档总册.md` 与台账/档案/归档区/云端清单是否一致（rc=1 过期 / rc=3 判不了） | `bin/majiu-archive-index.py --with-library --out …` |
+
+全绿时日志写 `OK: 五类通过（…）` 并把五类逐项列出 —— 删掉某一类时日志立刻可见，
+不靠"少一行也算绿"蒙过去。第 ⑤ 类的 rc 分三态：0 最新 / 1 过期 / 3 无法比对（云端读不到），
+**判不了不许压成过期**，否则上游一抖就是一片假红。
 
 第 ④ 类的由来：12 条自动化（做T/Alpha/资料库/理财工作台/鱼盆/记忆快照等）的 `cwds` 指向历史会话目录，
 删了就会全部失联。`automation_update` **拒绝**把 Claw 或 `/Volumes/...` 真实路径作为 cwd
 （报 `workspace ... cannot host automations`），所以只能把这些目录当锚点长期保留（合计约 21MB），
 清单纳管、每日校验。详见 `launchd/cwd-anchors.txt` 的说明。
+
+## 自托管 runner（不进 active.txt，换机需单独恢复）
+
+两个 GitHub Actions runner 跑在本机（launchd 服务名 `actions.runner.<owner>-<repo>.<name>`）：
+
+| 仓库 | runner 名 | 标签 | 用途 |
+|---|---|---|---|
+| Claw | `guandeMac-mini` | `self-hosted, macOS, ARM64, mac-local` | Claw CI / Shell Deletion Guard |
+| ai-autonomy-team | `guandeMac-mini-autonomy` | 同上 | selftest（私有仓 hosted 分钟有计费墙，曾 4 次 steps=0 从未执行） |
+
+**为什么不在 `active.txt` 里**：`--regen-active` 只扫 `com.user.*.plist`，runner 是 `actions.runner.*`、
+由 `./svc.sh` 自管，恢复方式与普通 plist 不同（要重新向 GitHub 注册）。所以它不会出现在每日检查的
+「未登记」提示里 —— 也就是说**没有任何自动检查会提醒你它丢了**，只能靠这份文档。
+
+换机重建（每个仓库各做一次）：
+
+```bash
+mkdir -p ~/actions-runner-<repo> && cd ~/actions-runner-<repo>
+# ① 取 runner 包（版本随意，与另一台一致更好）；从旧机复制时排除 _work/_diag/.runner*
+TOKEN=$(gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token --jq .token)
+./config.sh --unattended --url https://github.com/<owner>/<repo> --token "$TOKEN" \
+            --name guandeMac-mini[-autonomy] --labels mac-local --work _work
+./svc.sh install "$(id -un)" && ./svc.sh start
+gh api repos/<owner>/<repo>/actions/runners --jq '.runners[]|"\(.name) \(.status)"'   # 应为 online
+```
+
+三个坑（都踩过）：
+
+1. **从旧机复制 runner 目录会带 `.runner_migrated`** → `config.sh` 报 "already configured"，
+   删掉该文件再注册。
+2. **重启服务后报 "A session for this runner already exists"** → 旧会话未过期，
+   监听器每 30s 重试，约 4–5 分钟后自愈；期间 runner 显示 offline、`busy=true`。
+3. **工具缓存必须预热**：`~/.env` 写 `RUNNER_TOOL_CACHE=<已装过 Python 的 _work/_tool>`（两个 runner
+   共用 Claw 那份）。缓存空时 `setup-python` 会现场装 Python，在 self-hosted macOS 上报
+   `sudo: a password is required` 直接失败。注意 workflow 里**不能**写死该路径，也**不能**
+   在 job 级 env 用 `${{ runner.tool_cache }}`（runner 上下文在 job env 不合法，job 会零创建）。
 
 ## 马厩重打总册（`bin/majiu-archive-index.py`）
 
