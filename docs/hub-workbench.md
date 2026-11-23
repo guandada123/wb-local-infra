@@ -67,8 +67,8 @@
 - [x] 日志区接服务日志真实报错（v1.9.2）
 - [x] **Token KPI 修 0**（v1.10.0，见变更记录）
 - [x] **页面纳入版本控制**（v1.10.0，`wb-local-infra/share/hub-overview/index.html`）
-- [ ] **源码持久化未闭环**：工作台源码（server/ 与 deploy/）目前仍在会话工作区，会被平台生命周期清理；三个脚本已在 `wb-local-infra/bin/`，但 `deploy/install-hub-overview.sh` 与本档案没有。下一步应整体入仓
-- [ ] `share/` 目录未加同步闸门（`tests/test_deploy_sync.py` 只覆盖 `bin/` 与 `launchd/`）
+- [x] 源码持久化闭环（v1.10.1：部署器 → `wb-local-infra/workbench/install-hub-overview.sh`、档案 → `docs/hub-workbench.md`、页面 → `share/hub-overview/index.html`、服务端与探活 → `bin/`；**空机验证**：git clone 一份即可重建，7 个文件齐、服务端可编译、页面 JS 可解析）
+- [x] `share/` 同步闸门（v1.10.1：`tests/test_share_sync.py`，逐字节 + 负控——只改 live 一字节必须报红、恢复必须变绿、文件缺失必须报红）
 - [ ] 交互未验证项（L12/L15/L17）：资产卡按钮、日志翻页、级别筛选需人工点一次
 - [ ] 代理日志无自动轮转（约 0.5MB/天，靠只读尾部 4MB 保性能）
 - [ ] 「打开 QUEUE 台账」**不接**：后台服务执行 `open` 无 GUI 上下文，纯摆设
@@ -77,6 +77,7 @@
 
 | 版本 | 日期 | 摘要 |
 |---|---|---|
+| v1.10.1 | 2026-11-23 | **持久化闭环 + 部署器/闸门入仓**：① 部署器从「工作区 → live」改为「**仓 → live**」（`workbench/install-hub-overview.sh`，默认 dry-run、`--apply` 才落盘 + kickstart + 探活非 200 即失败）；② 档案入仓 `docs/hub-workbench.md`、补 `workbench/README.md`（三处文件关系/部署/回滚/两道闸门/边界）；③ 新增 `tests/test_share_sync.py`（share ↔ live 逐字节 + 三项负控）；④ 实测：`--apply` 端到端新 pid 起、页面/API 200、Token 仍 77809.7k；全量闸门 **41 tests OK**；⑤ 空机重建验证——clone 一份即 7 文件齐备、可编译可解析。提交 `cf01d02` 已推远端 |
 | v1.10.0 | 2026-11-23 | **源码恢复 + Token 假数字修复 + 页面入仓**：① 会话工作区被平台清理后，从内盘部署副本恢复 server/index/deploy 四文件，与部署副本逐字节一致；② 修 `LLM Token(今日)` 长期显示 0 —— `runs.usage` 在库里是 JSON **文本**，代码只判 `isinstance(dict)` 恒假，改为先 `json.loads`，实测今日 **77,809.7k（=7781 万，与中台口径一致）**、7 日 337,226k；③ 页面纳入 `wb-local-infra/share/hub-overview/index.html`（此前是唯一无 git 的产物），两笔提交已推送远端；④ 重建本档案（原档随工作区丢失）。 |
 | v1.9.2 | 2026-11-20 | 日志区接 launchd 服务日志真实报错（8 条真错，含 feishu-hub-launchd 502、feishu-events TCC EPERM）；时间只认行内时间戳；滤 JUDGE 与栈体行 |
 
