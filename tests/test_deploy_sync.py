@@ -10,6 +10,7 @@
     LIVE_BIN=/tmp/fakebin python3 -m unittest discover -s tests -v
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -639,3 +640,49 @@ class TestMajiuArchiveIndex(unittest.TestCase):
             r = self._run("--check", str(out), home=home, env={"MAJIU_LIB_DOCS_FILE": str(bad)})
             self.assertEqual(3, r.returncode, r.stdout)
             self.assertIn("无法比对", r.stdout)
+
+
+class TestRulesSnapshot(unittest.TestCase):
+    """autoloop 规则真源快照（2026-11-23 纳管，审计发现）。
+
+    `~/.agent-autoloop/rules.json`（20,697 字节 / 规则 6 条 + 拍板清单 7 条 + agent 2 个 +
+    通道 1 个）是自主调度唯一的手写真源；
+    `chflags uchg` 只防改写，**不防磁盘故障**，而它此前不在任何 git 仓
+    （本仓 bin/ 只覆盖脚本，`autoloop-deepseek` 除外）。故存 `autoloop/rules.json`。
+
+    纪律与 bin/ 一致：live 是运行真源，改完规则要回迁本仓，否则本测试红。
+
+    `config.json` **有意不纳管** —— 内含 43 字符 hub 密钥（worker.key / source.key /
+    owner / channels），属凭据，不能进远端。丢了需重新 init 并重绑通道，属已知代价。
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+    SNAP = REPO / "autoloop" / "rules.json"
+    LIVE = Path(os.environ.get("RULES_LIVE", str(Path.home() / ".agent-autoloop" / "rules.json")))
+
+    def test_snapshot_parses_and_names_unique(self):
+        self.assertTrue(self.SNAP.is_file(), f"缺规则快照: {self.SNAP}")
+        data = json.loads(self.SNAP.read_text(encoding="utf-8"))
+        rules = data.get("rules")
+        self.assertIsInstance(rules, list, "快照结构异常：没有 rules 数组")
+        self.assertGreater(len(rules), 0, "快照里 0 条规则 = 用空文件冒充备份")
+        for r in rules:
+            self.assertIsInstance(r, dict, f"规则项不是对象: {r!r}")
+            self.assertTrue(r.get("name"), f"规则缺 name（恢复时无法定位）: {list(r)}")
+            self.assertTrue(r.get("prompt"), f"规则 {r.get('name')} 缺 prompt")
+        names = [r["name"] for r in rules]
+        self.assertEqual(len(names), len(set(names)), "规则 name 有重复，快照不可用于恢复")
+        # 拍板闸门是安全边界，丢了等于 askFirst 失效，必须一起备份
+        self.assertTrue(data.get("askFirst"), "快照缺 askFirst（拍板清单），恢复后等于放开红线")
+
+    def test_live_verbatim(self):
+        # 与 Claw 镜像同款纪律：路径不在就 fail，不 skip。否则卷未挂载时整类检查静默变绿。
+        if not self.LIVE.is_file():
+            if os.environ.get("SKIP_RULES") == "1":
+                self.skipTest(f"rules.json 不存在且 SKIP_RULES=1：显式跳过（{self.LIVE}）")
+            self.fail(f"live 规则不存在: {self.LIVE} —— 快照无法校验，别让它静默变绿")
+        self.assertEqual(
+            self.SNAP.read_bytes(),
+            self.LIVE.read_bytes(),
+            "rules.json 已漂移(live≠快照)：改完规则要回迁 autoloop/rules.json 并提交",
+        )

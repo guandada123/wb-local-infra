@@ -2,8 +2,9 @@
 
 ~/.local/bin 与 LaunchAgents 的版本化快照仓（2026-11-19 建仓，审计 P0 修复）。
 
-- bin/: ~/.local/bin 非 autoloop- 前缀脚本快照（cp -p，含 mtime）
+- bin/: ~/.local/bin 脚本快照 / 活源（cp -p，含 mtime）
 - launchd/: ~/Library/LaunchAgents plist 快照（只读留痕，原位不动）
+- autoloop/: `~/.agent-autoloop/rules.json` 规则真源快照 **+ 漂移闸门**（2026-11-23 加）
 - archive/: 各处 .bak 收敛留痕
 - docs/: plist-live-map 等台账
 
@@ -11,12 +12,30 @@
 
 ## 结构升级（2026-11-20：从「快照仓」升级为「中台基础设施源仓」）
 
-- **bin/ = 25 个中台脚本的唯一源**（活源；已剔除 14 个「有 Claw 镜像」的重复快照，移至 archive/claw-mirror-snapshots/）：
-  无版本控制的 25 个脚本（autoloop-*/feishu-*/hub-*/lark-*/wb-*/push_card/gate-health-daily/zhongtai-board 等）全部纳管。
+- **bin/ = 30 个中台脚本的唯一源**（活源；已剔除 14 个「有 Claw 镜像」的重复快照，移至 archive/claw-mirror-snapshots/）：
+  无版本控制的 30 个脚本（autoloop-*/feishu-*/hub-*/lark-*/wb-*/push_card/gate-health-daily/zhongtai-board 等）全部纳管。
+  **2026-11-23 补两个审计漏网**：`autoloop-deepseek`（1,101 行，整个自主系统的执行内核）与
+  `autoloop-result-stats.py` —— 二者当时只存在于 `~/.local/bin` 一份，无 git、无远端、无 Claw 镜像，
+  与 mem-search 当初「902 行唯一副本」同型。现已纳管，`install.sh` 已确认 30 个零差异。
 - **install.sh**：仓 → ~/.local/bin 单向部署（默认 dry-run，`--apply` 落盘；部署前 py_compile 校验）。
 - **tests/test_deploy_sync.py**：逐字节同步闸门——live 漂移即红（已做三向验证：绿/漂移红/恢复绿）。
 - **原则**：改脚本改仓内 bin/，`./install.sh --apply` 部署；禁止直接改 live（会被闸门判红）。
 - launchd/ = 52 plist 快照；archive/ = 历史备份与迁移前快照（含 claw-mirror-snapshots）。
+
+## autoloop 规则真源快照（2026-11-23 加）
+
+`autoloop/rules.json` = `~/.agent-autoloop/rules.json` 的逐字节快照，由
+`tests/test_deploy_sync.py::TestRulesSnapshot` 守门（漂移即红；live 路径不在则 fail 不 skip）。
+
+- **为什么需要**：该文件是自主调度的唯一手写真源，`chflags uchg` 只防改写、**不防磁盘故障**，
+  而它此前不在任何 git 仓（本仓 bin/ 只覆盖脚本）。
+- **实测规模**（`python3 -c` 数出来的，不凭记忆）：规则 **6 条** + 拍板清单 `askFirst` **7 条**
+  + agent 2 个 + 通道 1 个 + 源 1 个，20,697 字节。
+- **改规则流程**：`chflags nouchg` → 改 → `cp -p` 回本仓 `autoloop/rules.json` → 跑测试 → 提交 → `chflags uchg`。
+- **有意不纳管**：`config.json`（内含 43 字符 hub 密钥 `worker.key`/`source.key`/`owner`/`channels`）、
+  `feishu.json`、`*.state.json` —— 凭据与运行态不进远端。丢了要重新 init 并重绑通道，属已知代价。
+- **`app/`（引擎本体）不纳入也无需纳入**：它是上游 `KKKKhazix/agent-autoloop` 的干净克隆
+  （`v1.8.4-8-gd3a44ca`，`git status` 0 改动），恢复 = clone 后切到 `d3a44ca`；本机无本地补丁。
 
 ## plist 三处来源的真源关系（2026-11-20 审计补充）
 
