@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  发现面信号快照每日心跳（2026-11-23 新增）
+
+  为什么需要独立 job：signal_triage --refresh 是「采集 + 对账」的唯一入口，
+  但它没有任何调度承载者 —— 2026-11-22 交付当天验证：次日 08:07 快照目录里
+  仍只有前一天那份，也就是说「每日生成」这件事当时并不成立（配置里有没有调度是两件事）。
+
+  为什么用授权 python 而不是系统 python3：
+  Claw 在外置卷 /Volumes/ZHITAI，launchd 下的系统二进制读外置卷会被静默 EPERM
+  （TCC 按二进制授权、子进程继承）。见 .learnings/2026-10-30-tcc-eperm-zhitai-background-jobs.md
+
+  安装前已核对**无等价作业**（2026-11-23 08:0x）：
+  遍历 ~/Library/LaunchAgents/*.plist 的 ProgramArguments **内容**（不是 label 关键词 ——
+  com.user.automation-failure-watchdog 的模板注释记过一次教训：按 label 关键词 grep 太窄，
+  误判「缺失」并重复安装，当日卸载），grep signal_triage|project_signal_collect 只命中本文件；
+  另查 ~/.local/bin/*.sh（wb-liveness / wb-failures 链路）亦无相关调用。
+
+  为什么 08:20：避开 09:25-09:40 开盘时段；不与 17:15(inspection-to-queue)、
+  22:00(feishu-digest)、23:10(periodic-digest) 撞点。
+
+  验收：~/Library/Logs 与 ~/.agent-autoloop/logs/discovery-signal-refresh.log
+        出现「[triage] 快照 signals_<今天>.json」，且 signals/ 目录多出当天文件。
+
+  回滚：launchctl bootout gui/$(id -u)/com.user.discovery-signal-refresh
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.discovery-signal-refresh</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+    <!-- -u：不加时 Python 输出重定向到文件是块缓冲，日志会一直是空的 ——
+         而「日志空」既可能是没跑，也可能是缓冲没落盘，失败时就无法诊断。 -->
+    <string>-u</string>
+    <string>/Volumes/ZHITAI/WorkBuddy/Claw/.workbuddy/scripts/signal_triage.py</string>
+    <string>--refresh</string>
+    <string>--sweep</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Volumes/ZHITAI/WorkBuddy/Claw</string>
+  <key>StartCalendarInterval</key>
+  <array>
+    <dict>
+      <key>Hour</key>
+      <integer>8</integer>
+      <key>Minute</key>
+      <integer>20</integer>
+    </dict>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <!-- 2026-11-23 实测：带 LowPriorityIO + ProcessType=Background 时，
+       同一条采集后台跑 22 秒仍未结束，前台只要 1.28 秒（慢 20 倍）——
+       IO 限速把「每日一次、只跑几十秒」的小任务拖成了分钟级。
+       每日 08:20 机器空闲，不需要限速，故移除这两项。 -->
+  <key>ProcessType</key>
+  <string>Adaptive</string>
+  <key>StandardOutPath</key>
+  <string>/Users/guan/.agent-autoloop/logs/discovery-signal-refresh.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/guan/.agent-autoloop/logs/discovery-signal-refresh.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/guan</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>LANG</key>
+    <string>en_US.UTF-8</string>
+  </dict>
+</dict>
+</plist>

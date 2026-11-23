@@ -8,6 +8,7 @@
         com.user.autopilot-gate.plist
 [deploy] com.user.claw-qts-sync.plist
         com.user.colima-shutdown-guard.plist
+[deploy] com.user.discovery-signal-refresh.plist
         com.user.feishu-ai-triage.plist
         com.user.feishu-daily-digest.plist
         com.user.feishu-event-bridge.plist
