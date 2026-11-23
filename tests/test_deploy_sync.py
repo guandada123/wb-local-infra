@@ -726,3 +726,42 @@ class TestBackupGate(unittest.TestCase):
             if os.environ.get("SKIP_RULES") == "1":
                 self.skipTest(f"授权 python 不在且 SKIP_RULES=1：{py}")
             self.fail(f"plist 指向的授权 python 不存在：{py} —— 作业会静默不跑，需更新 plist")
+
+
+class TestBackupPing(unittest.TestCase):
+    """外部打卡（healthchecks.io）：未配置必须明说，不能静默当成功。
+
+    这类「打不出去」的分支最容易写成 `except: pass`，然后 check 永远红、没人知道为什么。
+    """
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "wb-autoloop-backup.py"
+
+    def _load(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("wb_autoloop_backup", self.SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_conf_parsed_with_quotes_and_comments(self):
+        mod = self._load()
+        with tempfile.TemporaryDirectory() as td:
+            c = Path(td) / "x.conf"
+            c.write_text('# 注释\nHC_BACKUP_PING_URL="https://hc-ping.com/abc-123"\n')
+            mod.PING_CONF = c
+            self.assertEqual("https://hc-ping.com/abc-123", mod._ping_url())
+
+    def test_missing_conf_says_so(self):
+        mod = self._load()
+        mod.PING_CONF = Path("/nonexistent/wb-autoloop-backup.conf")
+        self.assertIn("未配置", mod._ping("/start"))
+
+    def test_unreachable_never_raises(self):
+        mod = self._load()
+        with tempfile.TemporaryDirectory() as td:
+            c = Path(td) / "x.conf"
+            c.write_text("HC_BACKUP_PING_URL=http://127.0.0.1:9/ping\n")
+            mod.PING_CONF = c
+            out = mod._ping("", timeout=2)
+        self.assertIsInstance(out, str)
+        self.assertIn("打卡失败", out)

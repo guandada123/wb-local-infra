@@ -51,6 +51,7 @@ import sys
 import tempfile
 import time
 import urllib.parse
+import urllib.request
 from pathlib import Path
 
 HOME_DIR = Path(os.path.expanduser(os.environ.get("AGENT_AUTOLOOP_HOME") or "~/.agent-autoloop"))
@@ -521,7 +522,48 @@ def cmd_self_test() -> int:
 
 # ---------------------------------------------------------------- daily
 STATE_FILE = Path(os.path.expanduser("~/.local/etc/wb-autoloop-backup.state.json"))
+PING_CONF = Path(os.path.expanduser("~/.local/etc/wb-autoloop-backup.conf"))
 REMIND_DAYS = 7
+
+
+def _ping_url() -> str:
+    """healthchecks.io 独立 check 的 ping 地址。
+
+    为什么必须有它：本作业无法自证「自己没跑」——plist 里的授权 python 路径一旦失效，
+    launchd 只会静默不跑，本地任何闸门都看不见。只有「外部按周期等打卡、收不到就报警」
+    能覆盖这一类。ping 地址等同凭据（谁拿到都能伪造打卡），只进 ~/.local/etc（0600），不进 git。
+    """
+    if not PING_CONF.exists():
+        return ""
+    try:
+        for line in PING_CONF.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            if k.strip() == "HC_BACKUP_PING_URL":
+                return v.strip().strip('"').strip("'")
+    except OSError:
+        return ""
+    return ""
+
+
+def _ping(suffix: str = "", timeout: int = 10) -> str:
+    """best-effort 打卡：绝不抛异常、绝不影响备份结论。
+
+    suffix: ""=成功 / "/start"=开始 / "/fail"=失败。healthchecks 语义是「收不到就报警」，
+    所以「打不出去」本身也是信息，必须落日志说清，不能静默当成功。
+    """
+    url = _ping_url()
+    if not url:
+        return "未配置 HC_BACKUP_PING_URL —— 外部收不到打卡，check 会一直红"
+    try:
+        req = urllib.request.Request(url.rstrip("/") + suffix,
+                                     headers={"User-Agent": "wb-autoloop-backup/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return f"HTTP {r.status}"
+    except Exception as e:                                     # noqa: BLE001
+        return f"打卡失败：{type(e).__name__}: {e}"
 
 
 def _push(text: str) -> str:
@@ -564,7 +606,8 @@ def _should_push(state: dict, ok: bool) -> tuple[bool, dict]:
 
 
 def cmd_daily(vault: Path, home: Path) -> int:
-    """launchd 入口：备份 → 校验 → 只在出问题时推飞书。"""
+    """launchd 入口：备份 → 校验 → 只在出问题时推飞书 → 向外部 check 打卡。"""
+    _log(f"  打卡[开始] {_ping('/start')}")
     rc = cmd_backup(vault, home)
     if rc == 0:
         items = []
@@ -599,6 +642,7 @@ def cmd_daily(vault: Path, home: Path) -> int:
         STATE_FILE.write_text(json.dumps(new_state, ensure_ascii=False))
     except OSError as e:
         _log(f"  ⚠️ 状态写入失败：{e}")
+    _log(f"  打卡[结束] {_ping('' if ok else '/fail')}")
     _log(("✅ 每日备份通过" if ok else "❌ 每日备份失败（已按状态变化/7天节奏推送）"))
     return 0 if ok else 1
 

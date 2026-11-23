@@ -102,9 +102,42 @@ python3 ~/.local/bin/wb-autoloop-backup.py drill
    单一修复口是给卷或整机加密。脚本不加密备份 —— 加密就要口令，口令落盘就等于没加密，
    落纸/密码管理器又不归脚本管，做成「自动加密」只会得到安全剧场。
 3. **作业无法自证「自己没跑」**：plist 里硬编码授权 python 路径（`3.13.12`），WorkBuddy 升级
-   若移除该版本，作业静默不跑且无人知道。缓解：`tests/test_deploy_sync.py::TestBackupGate::
+   若移除该版本，作业静默不跑且无人知道。缓解①：`tests/test_deploy_sync.py::TestBackupGate::
    test_plist_points_at_existing_python` 会在路径失效时变红（前提是有人跑测试）。
-   彻底解法是接 healthchecks.io 独立 UUID（外部观测），需要用户建 check。
+   缓解②（外部观测，已接线待填 URL）：见下节。
+
+## 外部观测：healthchecks.io 独立 check
+
+**为什么不复用 Mac Alive（`com.user.wb-heartbeat` 那条）**：两者回答的问题不同。
+Mac Alive 回答「机器还活着吗」（10min 一拍）；本 check 回答「昨晚的 hub.db 备份跑了吗」。
+合并的话，机器活着就会盖住「备份静默停摆」——正是要抓的那一类。
+
+**为什么必须是外部**：本地任何闸门都跑在这台机器上，作业静默不跑时它们一起不跑。
+只有「另一台机器按周期等打卡、收不到就报警」能覆盖这种情况。
+
+**语义（脚本已实现，`cmd_daily`）**：
+
+| 阶段 | 请求 | healthchecks 侧 |
+|---|---|---|
+| 开始 | `GET <url>/start` | 记为 running |
+| 通过 | `GET <url>` | 记成功、重置计时 |
+| 失败 | `GET <url>/fail` | **立即**告警，不等周期 |
+
+**配置**：`~/.local/etc/wb-autoloop-backup.conf`（0600，不进 git）
+
+```
+HC_BACKUP_PING_URL=https://hc-ping.com/<uuid>
+```
+
+未配置时脚本**明说**「外部收不到打卡，check 会一直红」，不静默当成功 ——
+`_ping()` 永不抛异常、永不影响备份结论，`tests/test_deploy_sync.py::TestBackupPing` 守这三条。
+
+**check 侧要设的四个值**：Name=`Autoloop 数据备份`、Period=`1 day`、Grace=`2 hours`、
+Integrations=勾上与 Mac Alive 相同的通知集成（不勾 = check 是哑的，红了也没人知道）。
+
+⚠️ 现状：**check 尚未创建**。建 check 需要在 healthchecks.io 账号内操作，本机没有 API key
+（keychain、`~/.local/etc` 三个 conf、zsh/bash 历史都查过，零命中）。历史记录显示上一套
+心跳（2026-10-20）是「用户重建的 Mac Alive」，即 ping 地址由人在网页建好后提供 —— 同样路径。
 
 ## 轮转与删除
 
