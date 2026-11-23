@@ -33,7 +33,10 @@
   + agent 2 个 + 通道 1 个 + 源 1 个，20,697 字节。
 - **改规则流程**：`chflags nouchg` → 改 → `cp -p` 回本仓 `autoloop/rules.json` → 跑测试 → 提交 → `chflags uchg`。
 - **有意不纳管**：`config.json`（内含 43 字符 hub 密钥 `worker.key`/`source.key`/`owner`/`channels`）、
-  `feishu.json`、`*.state.json` —— 凭据与运行态不进远端。丢了要重新 init 并重绑通道，属已知代价。
+  `feishu.json`、`*.state.json` —— 凭据与运行态不进远端。
+  **2026-11-23 更正**：光「不进远端」等于没有第二副本。现由 `wb-autoloop-backup.py` 每日把这些
+  连同 `hub.db`（26MB，57,990 行 facts）、`master.key` 备份到**外置卷**并逐项校验，见
+  `docs/backup-hub-db.md`。
 - **`app/`（引擎本体）不纳入也无需纳入**：它是上游 `KKKKhazix/agent-autoloop` 的干净克隆
   （`v1.8.4-8-gd3a44ca`，`git status` 0 改动），恢复 = clone 后切到 `d3a44ca`；本机无本地补丁。
 
@@ -192,3 +195,13 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
 | 未加 `--with-library` → 明说「未实读」 | 不静默输出空清单 |
 
 `--with-library` 依赖 WorkBuddy 桌面端的 `space_api.py`，非桌面环境下该节自动降级为「未取」，其余照常生成。
+
+## hub.db 异地备份（2026-11-23 加）
+
+`~/.agent-autoloop/hub.db` + `master.key` + `config.json` + `rules.json` + `feishu.json`
+每日 23:40 备份到 `/Volumes/ZHITAI/backups/agent-autoloop/<时间戳>`（异卷、0700/0600、保留 8 份）。
+
+- 脚本 `bin/wb-autoloop-backup.py`：`backup / check / drill / daily / self-test`
+- 定时 `launchd/com.user.autoloop-backup.plist`（必须先跑 `install.sh --apply` 部署脚本）
+- 11 项校验 + 12 项故障注入；恢复演练真恢复到临时 `AGENT_AUTOLOOP_HOME` 后逐表比对
+- **完整说明与残余风险**（整机无 TM/FileVault、落点卷未加密、作业无法自证未跑）：`docs/backup-hub-db.md`

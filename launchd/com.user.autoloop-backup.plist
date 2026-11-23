@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  中台数据异地备份 — launchd 作业（2026-11-23 建立）
+
+  为什么要有它
+  ============
+  `~/.agent-autoloop/hub.db`（26MB，57,987 条 facts + 12,600 条 projection_refs）与
+  `master.key`（43 字符，签卡片链接）此前**零备份**：没有任何 launchd/cron 在备份它，
+  `~/.agent-autoloop/backup/` 里两份是 11-13/11-14 升级前的手工快照。
+  2026-11-23 审计才发现——上一轮盯的是 490B 的 config.json，漏了 26MB 的库。
+
+  时间点为什么是 23:40
+  ============
+  避开：09:25–09:40 / 15:40–16:55（敏感窗口）、22:00 群日报、23:10 周期报告、
+  12:30/17:30/21:30 自动驾驶轮次。备份开销约 0.3s 拷贝 + 0.3s 校验，不调 LLM、不耗积分。
+
+  为什么 Program 必须是 ~/.workbuddy/binaries 的 python
+  ============
+  本作业写外置卷 /Volumes/ZHITAI（TCC 保护卷）。2026-10-30 实测：系统 git/ls/cat//
+  /usr/bin/python3 在 launchd 子进程里读写该卷会被静默 EPERM（stat 能过 = 假绿灯），
+  必须由已获 FDA 的 WorkBuddy python 派生，子进程才继承授权。
+  ⚠️ 该路径带版本号（3.13.12），WorkBuddy 升级后可能失效 → 失效表现为作业静默不跑。
+     已知代价：备份作业无法自证「自己没跑」，见 docs/backup-hub-db.md 的残余风险一节。
+
+  边界
+  ============
+  - 只读 ~/.agent-autoloop（官方 backup 走 SQLite 在线页拷贝，不锁库、不停中台）；
+  - 只写 /Volumes/ZHITAI/backups/agent-autoloop/<时间戳>（0700/0600）与一个状态文件；
+  - 失败/校验不过才推飞书（状态变化即推，持续失败每 7 天提醒一次），不刷群；
+  - 不删源、不改 rules.json、不碰实盘。轮转只保留最近 8 份（≈216MB）。
+
+  安装 / 回滚
+  ============
+    cp launchd/com.user.autoloop-backup.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.autoloop-backup.plist
+    launchctl kickstart -k gui/$(id -u)/com.user.autoloop-backup     # 立即验一次
+  回滚：launchctl bootout gui/$(id -u)/com.user.autoloop-backup
+        （已产生的备份目录可保留，删除前先 chflags -R nouchg）
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>com.user.autoloop-backup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+		<string>/Users/guan/.local/bin/wb-autoloop-backup.py</string>
+		<string>daily</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>HOME</key>
+		<string>/Users/guan</string>
+		<key>LANG</key>
+		<string>en_US.UTF-8</string>
+		<key>LC_ALL</key>
+		<string>en_US.UTF-8</string>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
+	<key>StartCalendarInterval</key>
+	<dict>
+		<key>Hour</key>
+		<integer>23</integer>
+		<key>Minute</key>
+		<integer>40</integer>
+	</dict>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>LowPriorityIO</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/Users/guan/Library/Logs/wb-autoloop-backup.log</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/guan/Library/Logs/wb-autoloop-backup.log</string>
+</dict>
+</plist>

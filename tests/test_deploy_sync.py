@@ -686,3 +686,43 @@ class TestRulesSnapshot(unittest.TestCase):
             self.LIVE.read_bytes(),
             "rules.json 已漂移(live≠快照)：改完规则要回迁 autoloop/rules.json 并提交",
         )
+
+
+class TestBackupGate(unittest.TestCase):
+    """hub.db 异地备份闸门（2026-11-23 建立）。
+
+    为什么要在测试里跑它：`wb-autoloop-backup.py` 的核心是「能变红」——11 项故障注入
+    每项只破坏一个维度、断言恰好那一项红。这层自证如果不进 CI，闸门退化成装饰。
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+    SCRIPT = REPO / "bin" / "wb-autoloop-backup.py"
+    PLIST = REPO / "launchd" / "com.user.autoloop-backup.plist"
+
+    def test_script_compiles(self):
+        subprocess.run([sys.executable, "-m", "py_compile", str(self.SCRIPT)], check=True)
+
+    def test_fault_injection_all_red(self):
+        """12 项故障注入必须全绿（即：每项都恰好按预期变红）。"""
+        p = subprocess.run([sys.executable, str(self.SCRIPT), "self-test"],
+                           capture_output=True, text=True, timeout=180)
+        out = p.stdout + p.stderr
+        self.assertEqual(0, p.returncode, f"故障注入未全通过:\n{out}")
+        self.assertIn("12/12 通过", out)
+
+    def test_plist_points_at_existing_python(self):
+        """plist 里硬编码的授权 python 一旦因 WorkBuddy 升级消失，作业会静默不跑。
+
+        这条是本类唯一能提前发现的残余风险（备份作业无法自证「自己没跑」）。
+        """
+        import plistlib
+        with open(self.PLIST, "rb") as f:
+            data = plistlib.load(f)
+        args = data["ProgramArguments"]
+        self.assertEqual("daily", args[-1], "plist 应调用 daily 子命令")
+        self.assertTrue(Path(args[1]).is_file(), f"备份脚本不存在: {args[1]}")
+        py = Path(args[0])
+        if not py.exists():
+            if os.environ.get("SKIP_RULES") == "1":
+                self.skipTest(f"授权 python 不在且 SKIP_RULES=1：{py}")
+            self.fail(f"plist 指向的授权 python 不存在：{py} —— 作业会静默不跑，需更新 plist")
