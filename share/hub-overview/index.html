@@ -1,0 +1,746 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 中台工作台 · Agent Hub</title>
+<style>
+:root{
+  --bg:#f4f6fa; --panel:#ffffff; --border:#e3e8f0; --text:#1f2733; --text-2:#5b6b82;
+  --primary:#2563eb; --primary-soft:#eaf1fe;
+  --green:#16a34a; --green-soft:#e8f7ee;
+  --orange:#d97706; --orange-soft:#fdf3e3;
+  --red:#dc2626; --red-soft:#fdeaea;
+  --purple:#7c3aed; --purple-soft:#f1ebfd;
+  --radius:12px; --shadow:0 1px 3px rgba(31,39,51,.06),0 4px 14px rgba(31,39,51,.05);
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--text);font-size:14px}
+.layout{max-width:1440px;margin:0 auto;padding:20px 24px 40px}
+
+/* ===== 顶栏 ===== */
+.topbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.brand{display:flex;align-items:center;gap:10px}
+.logo{width:36px;height:36px;border-radius:9px;background:linear-gradient(135deg,#2563eb,#7c3aed);display:flex;align-items:center;justify-content:center;color:#fff;font-weight:700;font-size:16px}
+.brand h1{font-size:18px}
+.brand .sub{font-size:12px;color:var(--text-2)}
+.topbar .spacer{flex:1}
+.status-pill{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;border-radius:99px;background:var(--green-soft);color:var(--green);font-size:12px;font-weight:600}
+.status-pill .dot{width:7px;height:7px;border-radius:50%;background:var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.clock{color:var(--text-2);font-size:12px;font-variant-numeric:tabular-nums}
+.btn{border:1px solid var(--border);background:var(--panel);border-radius:8px;padding:7px 14px;font-size:13px;cursor:pointer;color:var(--text);transition:.15s}
+.btn:hover{border-color:var(--primary);color:var(--primary)}
+.btn.primary{background:var(--primary);border-color:var(--primary);color:#fff}
+.btn.primary:hover{opacity:.9;color:#fff}
+.btn.small{padding:4px 10px;font-size:12px;border-radius:6px}
+.btn.danger{color:var(--red);border-color:#f3c2c2}
+.btn.danger:hover{background:var(--red-soft)}
+
+/* ===== 区块通用 ===== */
+section{margin-bottom:20px}
+.sec-head{display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap}
+.sec-head h2{font-size:15px;display:flex;align-items:center;gap:8px}
+.sec-head h2 .bar{width:4px;height:16px;border-radius:2px;background:var(--primary);display:inline-block}
+.sec-head .hint{font-size:12px;color:var(--text-2)}
+.sec-head .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);box-shadow:var(--shadow)}
+
+/* ===== KPI ===== */
+.kpi-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+.kpi{padding:16px 18px}
+.kpi .label{font-size:12px;color:var(--text-2);display:flex;justify-content:space-between;align-items:center}
+.kpi .label .trend{font-size:11px;font-weight:600}
+.kpi .value{font-size:26px;font-weight:700;margin:6px 0 8px;font-variant-numeric:tabular-nums}
+.kpi .spark{display:flex;align-items:flex-end;gap:2px;height:26px}
+.kpi .spark i{flex:1;background:var(--primary-soft);border-radius:2px;min-height:2px}
+.kpi.ok .value{color:var(--green)} .kpi.ok .spark i{background:#cdebdb}
+.kpi.warn .value{color:var(--orange)} .kpi.warn .spark i{background:#f9e3c3}
+.kpi.bad .value{color:var(--red)} .kpi.bad .spark i{background:#f6caca}
+.kpi.purple .value{color:var(--purple)} .kpi.purple .spark i{background:#e3d6fa}
+.kpi.run .value{color:var(--primary)} .kpi.run .spark i{background:var(--primary-soft)}
+
+/* ===== 双栏 ===== */
+.grid-2{display:grid;grid-template-columns:1.2fr 1fr;gap:16px}
+@media(max-width:960px){.grid-2{grid-template-columns:1fr}}
+.pad{padding:16px 18px}
+
+/* ===== 任务进度 ===== */
+.task-item{display:flex;align-items:center;gap:12px;padding:11px 0;border-bottom:1px dashed var(--border)}
+.task-item:last-child{border-bottom:none}
+.task-item .name{flex:1;min-width:0}
+.task-item .name b{display:block;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.task-item .name span{font-size:11px;color:var(--text-2)}
+.task-item .track{width:130px;height:7px;background:#eef1f6;border-radius:99px;overflow:hidden;flex-shrink:0}
+.task-item .track i{display:block;height:100%;border-radius:99px;background:var(--primary);transition:width .4s}
+.task-item .track i.done{background:var(--green)} .task-item .track i.fail{background:var(--red)} .task-item .track i.run{background:var(--primary)}
+.task-item .pct{width:38px;text-align:right;font-size:12px;color:var(--text-2);font-variant-numeric:tabular-nums}
+.tag{display:inline-flex;align-items:center;padding:2px 9px;border-radius:99px;font-size:11px;font-weight:600;flex-shrink:0}
+.tag.run{background:var(--primary-soft);color:var(--primary)}
+.tag.done{background:var(--green-soft);color:var(--green)}
+.tag.fail{background:var(--red-soft);color:var(--red)}
+.tag.queue{background:#eef1f6;color:var(--text-2)}
+
+/* ===== 监控图表 ===== */
+.chart-wrap{margin-bottom:14px}
+.chart-wrap .cap{font-size:12px;color:var(--text-2);margin-bottom:8px;display:flex;justify-content:space-between}
+.metric-rows{display:grid;gap:10px}
+.metric-row{display:flex;align-items:center;gap:10px;font-size:12px}
+.metric-row .m-label{width:88px;color:var(--text-2);flex-shrink:0}
+.metric-row .m-track{flex:1;height:8px;background:#eef1f6;border-radius:99px;overflow:hidden}
+.metric-row .m-track i{display:block;height:100%;border-radius:99px}
+.metric-row .m-val{width:86px;text-align:right;font-variant-numeric:tabular-nums;color:var(--text)}
+.legend{display:flex;gap:14px;font-size:11px;color:var(--text-2)}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:4px;vertical-align:middle}
+
+/* ===== Tabs 资产管理 ===== */
+.tabs{display:flex;gap:6px}
+.tab{padding:6px 16px;border-radius:8px;font-size:13px;cursor:pointer;border:1px solid transparent;color:var(--text-2)}
+.tab.active{background:var(--primary-soft);color:var(--primary);font-weight:600;border-color:#cfe0fb}
+.asset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.asset{padding:14px 16px;display:flex;flex-direction:column;gap:8px}
+.asset .a-head{display:flex;align-items:center;gap:8px}
+.asset .a-head b{font-size:14px}
+.asset .a-head .tag{margin-left:auto}
+.asset .desc{font-size:12px;color:var(--text-2);line-height:1.5;min-height:36px}
+.asset .meta{display:flex;gap:12px;font-size:11px;color:var(--text-2)}
+.asset .meta b{color:var(--text);font-weight:600}
+.asset .a-actions{display:flex;gap:6px;margin-top:2px}
+
+/* ===== 日志 ===== */
+.log-filter{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.chip{padding:4px 12px;border-radius:99px;font-size:12px;cursor:pointer;border:1px solid var(--border);background:var(--panel);color:var(--text-2)}
+.chip.active{background:var(--text);color:#fff;border-color:var(--text)}
+.chip .n{font-weight:700;margin-left:3px}
+.search{border:1px solid var(--border);border-radius:8px;padding:6px 12px;font-size:12px;width:170px;outline:none}
+.search:focus{border-color:var(--primary)}
+.log-table{width:100%;border-collapse:collapse;font-size:12px}
+.log-table th{text-align:left;padding:8px 10px;color:var(--text-2);font-weight:500;border-bottom:1px solid var(--border);white-space:nowrap}
+.log-table td{padding:8px 10px;border-bottom:1px dashed #eef1f6;vertical-align:top}
+.log-table td.msg{word-break:break-all;color:var(--text)}
+.log-table td.time{color:var(--text-2);white-space:nowrap;font-variant-numeric:tabular-nums}
+.lvl{font-weight:700;font-size:11px}
+.lvl.INFO{color:var(--primary)} .lvl.WARN{color:var(--orange)} .lvl.ERROR{color:var(--red)}
+.log-body{max-height:300px;overflow-y:auto}
+
+/* ===== 待办 ===== */
+.todo-filter{display:flex;gap:6px}
+.todo-list{display:flex;flex-direction:column}
+.todo{display:flex;gap:10px;align-items:flex-start;padding:10px 0;border-bottom:1px dashed var(--border)}
+.todo:last-child{border-bottom:none}
+.todo input[type=checkbox]{margin-top:3px;accent-color:var(--green);width:15px;height:15px;cursor:pointer}
+.todo.checked .t-title{text-decoration:line-through;color:var(--text-2)}
+.todo .t-body{flex:1;min-width:0}
+.todo .t-title{font-size:13px}
+.todo .t-meta{font-size:11px;color:var(--text-2);margin-top:3px;display:flex;gap:10px;flex-wrap:wrap}
+.tag.p0{background:var(--red-soft);color:var(--red)}
+.tag.p1{background:var(--orange-soft);color:var(--orange)}
+.tag.p2{background:#eef1f6;color:var(--text-2)}
+
+/* ===== 快捷操作 ===== */
+.quick-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
+.quick{padding:14px;text-align:left;cursor:pointer;border:1px solid var(--border);background:var(--panel);border-radius:var(--radius);transition:.15s;font-family:inherit}
+.quick:hover{border-color:var(--primary);transform:translateY(-1px);box-shadow:var(--shadow)}
+.quick .q-icon{font-size:20px;margin-bottom:6px}
+.quick b{font-size:13px;display:block}
+.quick span{font-size:11px;color:var(--text-2);display:block;margin-top:3px}
+
+/* ===== 数据接入说明 ===== */
+.hook-note{padding:14px 18px;font-size:12px;color:var(--text-2);line-height:1.8}
+.hook-note code{background:#eef1f6;padding:1px 6px;border-radius:4px;font-size:11px;color:var(--primary)}
+
+.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--text);color:#fff;padding:10px 20px;border-radius:10px;font-size:13px;opacity:0;transition:.3s;pointer-events:none;z-index:99}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+@media(max-width:640px){.layout{padding:14px 12px 30px}.task-item .track{width:70px}.search{width:120px}}
+
+/* ===== 深色主题（跟随系统 + 手动切换，localStorage 记忆）===== */
+:root{--track:#eef1f6;--pre:#f7f9fc}
+html[data-theme="dark"]{
+  --bg:#0f141b; --panel:#161d27; --border:#26303d; --text:#e6ebf2; --text-2:#94a3b8;
+  --primary:#60a5fa; --primary-soft:#1b2a40;
+  --green:#34d399; --green-soft:#12291f;
+  --orange:#fbbf24; --orange-soft:#2a2110;
+  --red:#f87171; --red-soft:#2c1414;
+  --purple:#a78bfa; --purple-soft:#241a3d;
+  --track:#1e2733; --pre:#111721;
+  --shadow:0 1px 3px rgba(0,0,0,.4),0 4px 14px rgba(0,0,0,.3);
+}
+html[data-theme="dark"] .search{background:var(--panel);color:var(--text)}
+html[data-theme="dark"] .toast{background:#e6ebf2;color:#0f141b}
+html[data-theme="dark"] .kpi.ok .spark i{background:#1e4d38}
+html[data-theme="dark"] .kpi.warn .spark i{background:#4a3410}
+html[data-theme="dark"] .kpi.bad .spark i{background:#4a1717}
+html[data-theme="dark"] .kpi.purple .spark i{background:#3a2a5e}
+html[data-theme="dark"] .task-item .track,
+html[data-theme="dark"] .metric-row .m-track,
+html[data-theme="dark"] .tag.queue{background:var(--track)}
+html[data-theme="dark"] .log-table td{border-bottom-color:#1e2733}
+html[data-theme="dark"] pre{background:var(--pre)!important}
+.theme-btn{border:1px solid var(--border);background:var(--panel);border-radius:8px;padding:6px 10px;cursor:pointer;font-size:13px;line-height:1}
+.log-pager{display:flex;gap:6px;align-items:center;justify-content:flex-end;padding:10px 12px;font-size:12px;color:var(--text-2)}
+.log-pager button{border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:6px;padding:3px 9px;cursor:pointer;font-size:12px}
+.log-pager button:disabled{opacity:.4;cursor:default}
+</style>
+</head>
+<body>
+<div class="layout">
+
+  <!-- 顶栏 -->
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">台</div>
+      <div>
+        <h1>AI 中台工作台</h1>
+        <div class="sub">agent-autoloop · 调度 / 模型 / 监控 / 待办 一站式视图</div>
+      </div>
+    </div>
+    <div class="spacer"></div>
+    <span class="status-pill" id="srcState"><span class="dot"></span>检测数据源…</span>
+    <span class="clock" id="clock">--</span>
+    <button class="theme-btn" id="themeBtn" onclick="toggleTheme()" title="切换深浅主题">🌙</button>
+    <button class="btn primary" onclick="refreshAll(true)">⟳ 刷新数据</button>
+  </header>
+
+  <!-- ① 关键指标概览 -->
+  <section>
+    <div class="sec-head"><h2><span class="bar"></span>关键指标概览</h2><span class="hint">数据粒度：今日 / 近 7 日</span>
+      <div class="right"><select class="search" id="kpiRange" style="width:auto" onchange="renderKPIs()"><option value="today">今日</option><option value="week">近 7 日</option></select></div>
+    </div>
+    <div class="kpi-grid" id="kpiGrid"></div>
+  </section>
+
+  <!-- ② 任务与流程进度 + ③ 资源与调用监控 -->
+  <section class="grid-2">
+    <div>
+      <div class="sec-head"><h2><span class="bar"></span>任务与流程进度</h2><span class="hint">自动驾驶轮次 + 定时流水线</span>
+        <div class="right"><select class="search" id="taskFilter" style="width:auto" onchange="renderTasks()"><option value="all">全部状态</option><option value="run">运行中</option><option value="queue">排队中</option><option value="done">已完成</option><option value="fail">失败</option></select></div>
+      </div>
+      <div class="panel pad" id="taskList"></div>
+    </div>
+    <div>
+      <div class="sec-head"><h2><span class="bar"></span>资源与调用监控</h2><span class="hint">LLM 网关 · 代理 · 限流</span></div>
+      <div class="panel pad">
+        <div class="chart-wrap">
+          <div class="cap"><span id="chartCap">近 7 日轮次（完成/取消）</span>
+            <span class="legend"><span><i style="background:#2563eb"></i>成功</span><span><i style="background:#dc2626"></i>失败</span></span>
+          </div>
+          <svg id="callChart" viewBox="0 0 480 140" width="100%" height="140"></svg>
+        </div>
+        <div class="metric-rows" id="metricRows"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ④ 模型 / 服务 / 应用管理 -->
+  <section>
+    <div class="sec-head"><h2><span class="bar"></span>模型 / 服务 / 应用管理</h2>
+      <div class="right tabs" id="assetTabs">
+        <span class="tab active" data-k="models" onclick="switchTab('models')">模型</span>
+        <span class="tab" data-k="services" onclick="switchTab('services')">服务</span>
+        <span class="tab" data-k="apps" onclick="switchTab('apps')">应用</span>
+      </div>
+    </div>
+    <div class="asset-grid" id="assetGrid"></div>
+  </section>
+
+  <!-- ⑤ 日志告警 + ⑥ 待办事项 -->
+  <section class="grid-2">
+    <div>
+      <div class="sec-head"><h2><span class="bar"></span>日志与告警</h2><span class="hint">来源：hub.db events（服务端取最近 300 条）</span>
+        <div class="right log-filter">
+          <span class="chip active" data-l="all" onclick="filterLog('all',this)">全部<span class="n" id="cnt-all"></span></span>
+          <span class="chip" data-l="ERROR" onclick="filterLog('ERROR',this)">错误<span class="n" id="cnt-ERROR"></span></span>
+          <span class="chip" data-l="WARN" onclick="filterLog('WARN',this)">告警<span class="n" id="cnt-WARN"></span></span>
+          <span class="chip" data-l="INFO" onclick="filterLog('INFO',this)">信息<span class="n" id="cnt-INFO"></span></span>
+          <select class="search" id="logRange" style="width:auto" onchange="changeRange(this.value)">
+            <option value="all">全部时间</option>
+            <option value="today">今天</option>
+            <option value="3d">近 3 天</option>
+            <option value="7d">近 7 天</option>
+          </select>
+          <input class="search" id="logSearch" placeholder="搜索关键字…" oninput="renderLogs()">
+        </div>
+      </div>
+      <div class="panel">
+        <div class="log-body"><table class="log-table">
+          <thead><tr><th>时间</th><th>级别</th><th>来源</th><th>消息</th></tr></thead>
+          <tbody id="logBody"></tbody>
+        </table></div>
+        <div class="log-pager" id="logPager"></div>
+      </div>
+    </div>
+    <div>
+      <div class="sec-head"><h2><span class="bar"></span>待办事项</h2><span class="hint">真源：QUEUE 台账</span>
+        <div class="right todo-filter">
+          <span class="chip active" data-p="all" onclick="filterTodo('all',this)">全部</span>
+          <span class="chip" data-p="P0" onclick="filterTodo('P0',this)">P0</span>
+          <span class="chip" data-p="P1" onclick="filterTodo('P1',this)">P1</span>
+          <span class="chip" data-p="P2" onclick="filterTodo('P2',this)">P2</span>
+        </div>
+      </div>
+      <div class="panel pad todo-list" id="todoList"></div>
+    </div>
+  </section>
+
+  <!-- ⑦ 快捷操作 -->
+  <section>
+    <div class="sec-head"><h2><span class="bar"></span>快捷操作</h2><span class="hint">服务端白名单执行 · 有副作用需确认 · 全程审计</span></div>
+    <div class="quick-grid" id="quickGrid"></div>
+    <div id="actionResult" class="panel pad" style="display:none;margin-top:12px"></div>
+  </section>
+
+  <!-- 数据接入预留说明 -->
+  <section>
+    <div class="panel hook-note">
+      <b style="color:var(--text)">🔌 数据接入现状</b>（已常驻：<code>com.user.hub-overview</code>；API 不可达时自动降级示例数据，顶栏状态条会标明）：
+      <br><b style="color:var(--green)">✅ 已接通</b>：① KPI/轮次/token ← <code>hub.db</code>（只读）
+      ② 任务进度 ← <code>runs</code> 视图
+      ③ 模型卡 ← <code>rules.json</code>
+      ④ 服务卡 ← <code>launchctl com.user.*</code>
+      ⑤ 待办 ← <code>QUEUE.md</code>
+      ⑥ 日志区 ← <code>events</code>（最近 300 条，支持按级别/时间筛选与分页）
+      ⑦ 快捷操作 ← <code>POST /api/hub/action</code>（白名单 6 动作，服务端固定 argv）
+      ⑧ 应用卡 ← 各项目 <code>git</code>（分支/最近提交/未提交改动，未找到仓库标「未定位」）
+      ⑨ 代理请求数 ← <code>/tmp/proxy-deepseek.stdout.log</code>（<b>机器重启即丢</b>，仅作参考口径）
+      <br><b style="color:var(--orange)">⬜ 未接</b>：应用卡的 CI 结果（需 <code>gh</code> 逐仓调用，较慢，暂用动作按需查）
+    </div>
+  </section>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* =====================================================================
+ * 数据注入层（预留真实数据接入位）
+ * 接真实数据时：把 DATA 各字段替换为 fetch() 结果，渲染层无需改动。
+ * 建议在中台侧加一个只读聚合 API（例：GET /api/hub/overview），
+ * 返回结构与下方 DATA 一致即可无缝切换。禁止把密钥写进前端。
+ * ===================================================================== */
+const DATA = {
+  kpi: {
+    today: [
+      {label:"调度轮次",   value:14,  unit:"轮", trend:"+3 较昨日", cls:"",      spark:[8,10,9,12,11,14,14]},
+      {label:"轮次成功率", value:"92.9%", trend:"13/14", cls:"ok",    spark:[80,85,90,88,91,93,93]},
+      {label:"LLM 调用",   value:"2,318", unit:"次", trend:"+12%",   cls:"purple",spark:[1.5,1.8,1.7,2.0,2.1,2.3,2.3]},
+      {label:"自动化在线", value:23,  unit:"个", trend:"1 个降级",  cls:"warn",  spark:[22,23,23,22,23,23,23]},
+      {label:"待办事项",   value:11,  unit:"条", trend:"P0 × 2",   cls:"warn",  spark:[15,14,13,12,12,11,11]},
+      {label:"未处理告警", value:3,   unit:"条", trend:"1 条 ERROR",cls:"bad",  spark:[5,4,6,3,4,3,3]},
+    ],
+    week: [
+      {label:"调度轮次",   value:96,  unit:"轮", trend:"+8%",       cls:"",      spark:[12,13,11,14,15,16,15]},
+      {label:"轮次成功率", value:"90.6%", trend:"87/96", cls:"ok",    spark:[82,84,86,85,89,91,91]},
+      {label:"LLM 调用",   value:"14.2k", unit:"次", trend:"+18%",    cls:"purple",spark:[1.6,1.9,1.8,2.1,2.2,2.4,2.3]},
+      {label:"自动化在线", value:23,  unit:"个", trend:"稳定",       cls:"ok",    spark:[22,22,23,23,23,23,23]},
+      {label:"待办事项",   value:11,  unit:"条", trend:"-4 较上周",  cls:"",      spark:[15,14,13,12,12,11,11]},
+      {label:"未处理告警", value:3,   unit:"条", trend:"-2 较上周",  cls:"warn",  spark:[6,5,5,4,4,3,3]},
+    ],
+  },
+  tasks: [
+    {name:"自动驾驶轮次 #73（全权限实做）", desc:"群消息 AI 研判触发 · 查明 07:45 巡检中断真因", status:"done", pct:100, time:"19:04"},
+    {name:"巡检日报推送",  desc:"autoloop-feishu-push · 幂等推送主群",      status:"done", pct:100, time:"17:40"},
+    {name:"inspection_to_queue 落账", desc:"巡检 JSON → inbox/QUEUE TODO",   status:"run",  pct:60,  time:"17:15 触发"},
+    {name:"飞书日报聚合",  desc:"feishu_daily_digest · 22:00 调度",         status:"queue",pct:0,   time:"计划 22:00"},
+    {name:"QTS regime 同步", desc:"Signal-trace v10.0 · QTS/consensus/weights", status:"queue", pct:0, time:"计划 05:05"},
+    {name:"CI 门禁核验（StockInsight）", desc:"7-job Pro CI · pre-push 扫描",  status:"fail", pct:70,  time:"昨天 23:10"},
+  ],
+  assets: {
+    models: [
+      {name:"deepseek-v4-flash", desc:"主力模型 · 走 CatRouter 代理 9999（直连 401）", tag:"运行中", tagCls:"done", meta:{延迟:"1.9s", 今日调用:"1,842", 费用:"¥0"}},
+      {name:"Tier1/2 免费模型",  desc:"调度窗口 23:00–08:00 免费额度优先使用",          tag:"运行中", tagCls:"done", meta:{延迟:"2.3s", 今日调用:"476",  费用:"¥0"}},
+      {name:"Tier3（备用）",     desc:"deepseek-v4-flash 降级链路，高峰期限流时切换",   tag:"待机",   tagCls:"queue",meta:{延迟:"—",   今日调用:"0",    费用:"¥0"}},
+    ],
+    services: [
+      {name:"飞书中台工作台", desc:"自建应用 cli_a936… · 群指令白名单 + 值班简报（launchd 120s）", tag:"运行中", tagCls:"done", meta:{方式:"launchd", 成功率:"99%", 今日触发:"720"}},
+      {name:"飞书事件桥接",   desc:"群 @ → 中台秒级回复 · 20s 轮询 · 只处理真人消息",     tag:"运行中", tagCls:"done", meta:{方式:"launchd", 成功率:"98%", 今日触发:"4,320"}},
+      {name:"AI 研判入队",    desc:"feishu_ai_triage · 10:15/13:15/18:20/20:15",        tag:"运行中", tagCls:"done", meta:{方式:"launchd", 成功率:"100%",今日触发:"4"}},
+      {name:"巡检中枢",       desc:"统一巡检 + liveness/failures 扫表 · 每 1–2h",        tag:"降级",   tagCls:"run",  meta:{方式:"launchd", 成功率:"87%", 今日触发:"9"}},
+      {name:"外部心跳",       desc:"wb-heartbeat · 10min 打卡 healthchecks.io + 飞书告警", tag:"运行中", tagCls:"done", meta:{方式:"launchd", 成功率:"100%",今日触发:"144"}},
+    ],
+    apps: [
+      {name:"Claw（A股投顾）",    desc:"80+ 自动化 · 早晚报/周报/体检/选股/风控",            tag:"运行中", tagCls:"done", meta:{P0:"★", 自动化:"80+", 今日产出:"12"}},
+      {name:"QTS（Docker量化栈）", desc:"regime/consensus/weights · Signal-trace v10.0",     tag:"运行中", tagCls:"done", meta:{P1:"—", 自动化:"8",  今日产出:"3"}},
+      {name:"StockInsight（桌面）", desc:"严格 7-job Pro CI 门禁 · SSD 部署",               tag:"CI 红",  tagCls:"fail", meta:{P1:"—", 自动化:"5",  今日产出:"0"}},
+      {name:"PMF（8088）",        desc:"project-monitor-fusion 聚合监控",                   tag:"运行中", tagCls:"done", meta:{P1:"—", 自动化:"6",  今日产出:"2"}},
+      {name:"EAK 审计工具包",     desc:"engineering-audit-kit · 跨仓库质量门禁",             tag:"待机",   tagCls:"queue",meta:{P2:"—", 自动化:"2",  今日产出:"0"}},
+    ],
+  },
+  logs: [
+    {time:"19:04:12", lvl:"INFO",  src:"autopilot",  msg:"轮次 #73 完成：归因链路修复 + 5 个回归测试通过，群内回执已发送"},
+    {time:"18:20:41", lvl:"ERROR", src:"feishu-ai-triage", msg:"模型网关空流（stream 返回空 content），已重试 1 次后成功；建议核对 proxy-deepseek thinking 双写"},
+    {time:"17:15:03", lvl:"WARN",  src:"inspection",  msg:"巡检发现 1 项 rate_limited：腾讯行情接口 429，队列超限（非时长），已降级到 qt.gtimg 备源"},
+    {time:"15:05:19", lvl:"INFO",  src:"signal-trace",msg:"v10.0 单脚本运行完成，耗时 4m51s，QTS regime/consensus/weights 全部刷新"},
+    {time:"13:12:55", lvl:"WARN",  src:"ci-watch",    msg:"StockInsight Pro CI job#5 (lint) 失败，疑似 pre-commit hook 缺失模式复现，待人工核验"},
+    {time:"11:40:22", lvl:"INFO",  src:"digest",      msg:"飞书日报聚合快照回填：近 90 天缺 2 天，已自动 API 补齐"},
+    {time:"09:20:14", lvl:"INFO",  src:"lark-sync",   msg:"lark-cli 一致性巡检：结果一致（rc=0）"},
+    {time:"08:52:07", lvl:"ERROR", src:"scheduler",   msg:"一次性自动化僵尸任务残留 2 条（目标已过期），已按互斥规则跳过，建议清理"},
+    {time:"07:45:31", lvl:"WARN",  src:"agent.log",   msg:"codex provider 配置告警：wire_api=chat 不再支持，需改为 responses"},
+  ],
+  todos: [
+    {p:"P0", title:"处置半导体仓位超限（77% > 50% 上限）", src:"风控 · human-only", due:"待你决策", done:false},
+    {p:"P0", title:"StockInsight CI 红：核验 pre-commit hook 缺失根因", src:"CI 巡检", due:"今日", done:false},
+    {p:"P1", title:"清理 2 条僵尸一次性自动化", src:"调度巡检", due:"本周", done:false},
+    {p:"P1", title:"proxy-deepseek thinking 双写回归测试补齐", src:"轮次 #73", due:"本周", done:true},
+    {p:"P1", title:"腾讯行情 429 限流：评估 Wind 付费源必要性", src:"数据源", due:"本周", done:false},
+    {p:"P2", title:"北向资金脚本端到端 dry-run + 状态回读", src:"Q-清单", due:"下周", done:false},
+    {p:"P2", title:"事件文件轮转方案（feishu-events 累积）", src:"桥接维护", due:"下周", done:false},
+    {p:"P2", title:"codex provider wire_api 配置升级 responses", src:"日志告警", due:"下周", done:false},
+  ],
+  metrics: [
+    {label:"LLM 日调用额度", val:"2,318 / 5,000", pct:46, color:"#7c3aed"},
+    {label:"代理 9999 延迟 p50", val:"1.9s（阈值 3s）", pct:63, color:"#2563eb"},
+    {label:"失败重试队列", val:"3 / 20", pct:15, color:"#16a34a"},
+    {label:"限流触发（今日）", val:"429 × 2 次", pct:20, color:"#d97706"},
+    {label:"hub.db 磁盘占用", val:"182MB / 2GB", pct:9, color:"#16a34a"},
+  ],
+  actions: [
+    {key:"status",       name:"查中台状态", desc:"只读 · agent-autoloop status", mode:"safe"},
+    {key:"doctor",       name:"检查配置",   desc:"只读 · 已知 2 项告诫（Node<24 / 未接原生通道）", mode:"safe"},
+    {key:"diagnose",     name:"触发一轮诊断", desc:"emit chain.start → 诊断/复核双角色", mode:"confirm"},
+    {key:"repush_daily", name:"重推今日日报", desc:"幂等 · 已有则 SKIP", mode:"confirm"},
+    {key:"inspection",   name:"立即巡检",   desc:"只读 · inspection_report.py --print（不写盘、不推送）", mode:"safe"},
+    {key:"digest_dry",   name:"群总结预览", desc:"dry-run · 只输出摘要，不推群", mode:"safe"},
+    {key:"ci_status",    name:"查 CI 状态", desc:"只读 · gh 逐仓取最近 3 次（约 8s）", mode:"safe"},
+  ],
+  callChart: { days:["周四","周五","周六","周日","周一","周二","周三"], ok:[1.4,1.6,1.2,1.1,1.8,2.0,2.3], fail:[0.05,0.08,0.02,0.01,0.1,0.06,0.04] },
+};
+
+/* 示例数据快照：API 不可达时整体回退到这份，保证「真数据/示例数据」二态不混用 */
+const MOCK_SEED = JSON.parse(JSON.stringify(DATA));
+
+/* ======================= 渲染层（接真数据时无需改动） ======================= */
+const $ = s => document.querySelector(s);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function renderKPIs(){
+  const range = $('#kpiRange').value;
+  const arr = (DATA.kpi && Array.isArray(DATA.kpi[range])) ? DATA.kpi[range] : [];
+  if(!arr.length){
+    $('#kpiGrid').innerHTML = '<div class="panel pad" style="color:var(--text-2);text-align:center">指标数据不可用（hub.db 读取失败，详见顶栏降级提示）</div>';
+    return;
+  }
+  $('#kpiGrid').innerHTML = arr.map(k => `
+    <div class="panel kpi ${k.cls}">
+      <div class="label"><span>${esc(k.label)}</span><span class="trend">${esc(k.trend)}</span></div>
+      <div class="value">${esc(k.value)}<small style="font-size:12px;color:var(--text-2);font-weight:400"> ${esc(k.unit||'')}</small></div>
+      <div class="spark">${Array.isArray(k.spark) ? k.spark.map((v,i,arr)=>`<i style="height:${Math.max(8, v/Math.max(...arr,1)*100)}%"></i>`).join('') : '<i style="height:4px;opacity:.35" title="无时序真源，不画趋势"></i>'}</div>
+    </div>`).join('');
+}
+
+function renderTasks(){
+  const f = $('#taskFilter').value;
+  const list = DATA.tasks.filter(t => f==='all' || t.status===f);
+  const tagTxt = {run:'运行中', done:'已完成', fail:'失败', queue:'排队中'};
+  $('#taskList').innerHTML = list.length ? list.map(t => `
+    <div class="task-item">
+      <div class="name"><b>${esc(t.name)}</b><span>${esc(t.desc)} · ${esc(t.time)}</span></div>
+      <span class="tag ${t.status}">${esc(t.statusText || tagTxt[t.status])}</span>
+      <div class="track"><i class="${t.status}" style="width:${t.pct}%"></i></div>
+      <span class="pct">${t.pct}%</span>
+    </div>`).join('') : '<div style="color:var(--text-2);padding:20px;text-align:center">该状态下暂无任务</div>';
+}
+
+function renderChart(){
+  const c = DATA.callChart;
+  const cap0 = $('#chartCap');
+  if(!c || !Array.isArray(c.days) || !c.days.length){
+    $('#callChart').innerHTML = '';
+    if(cap0) cap0.textContent = '图表数据不可用（hub.db 读取失败）';
+    return;
+  }
+  const W=480, H=140, pad=28;
+  const max = Math.max(1, ...c.ok, ...c.fail) * 1.15;   // 量程随真实数据自适应
+  const bw=(W-pad*2)/c.days.length;
+  let s='';
+  c.days.forEach((d,i)=>{
+    const ho=(c.ok[i]/max)*(H-pad-14), hf=(c.fail[i]/max)*(H-pad-14);
+    const x=pad+i*bw+bw*0.18, w=bw*0.64;
+    s+=`<rect x="${x}" y="${H-pad-ho}" width="${w}" height="${ho}" rx="3" fill="#2563eb" opacity="${i===c.days.length-1?1:.75}"><title>${d} 成功 ${c.ok[i]}k</title></rect>`;
+    s+=`<rect x="${x}" y="${H-pad-ho-hf-2}" width="${w}" height="${Math.max(2,hf)}" rx="2" fill="#dc2626"><title>${d} 失败 ${c.fail[i]}k</title></rect>`;
+    s+=`<text x="${x+w/2}" y="${H-8}" text-anchor="middle" font-size="10" fill="#5b6b82">${d}</text>`;
+  });
+  const cap = $('#chartCap');
+  if(cap) cap.textContent = (c.note || '近 7 日轮次（完成/取消）').replace(/^口径=?/, '口径：');
+  const css = getComputedStyle(document.documentElement);
+  const gridColor = css.getPropertyValue('--border').trim() || '#eef1f6';
+  const axisColor = css.getPropertyValue('--text-2').trim() || '#9aa7ba';
+  [0,1,2].forEach(g=>{const v=max*(1-g/2), y=H-pad-(v/max)*(H-pad-14);s+=`<line x1="${pad}" x2="${W-pad}" y1="${y}" y2="${y}" stroke="${gridColor}"/><text x="4" y="${y+3}" font-size="9" fill="${axisColor}">${v>=1000?(v/1000).toFixed(1)+'k':Math.round(v)}</text>`});
+  $('#callChart').innerHTML=s;
+}
+
+function renderMetrics(){
+  $('#metricRows').innerHTML = DATA.metrics.map(m=>{
+    // 有可核算口径(note)时只给数值+说明；只有显式阈值才画水位条，避免无依据的百分比
+    if(m.note) return `<div class="metric-row" style="align-items:flex-start">
+        <span class="m-label">${esc(m.label)}</span>
+        <span style="flex:1;color:var(--text-2);font-size:11px;line-height:1.5">${esc(m.note)}</span>
+        <span class="m-val" style="width:auto">${esc(m.val)}</span></div>`;
+    return `<div class="metric-row"><span class="m-label">${esc(m.label)}</span>
+      <div class="m-track"><i style="width:${m.pct}%;background:${m.color}"></i></div>
+      <span class="m-val">${esc(m.val)}</span></div>`;
+  }).join('');
+}
+
+let curTab='models';
+function switchTab(k){
+  curTab=k;
+  document.querySelectorAll('#assetTabs .tab').forEach(t=>t.classList.toggle('active', t.dataset.k===k));
+  renderAssets();
+}
+function renderAssets(){
+  const list = Array.isArray(DATA.assets[curTab]) ? DATA.assets[curTab] : [];
+  if(!list.length){
+    $('#assetGrid').innerHTML = '<div class="panel pad" style="color:var(--text-2);text-align:center">该分类数据不可用（数据源读取失败）</div>';
+    return;
+  }
+  // 用 data-i + 事件委托，不在内联 onclick 里拼字符串（避免名称含单引号截断 JS，审计 M3）
+  $('#assetGrid').innerHTML = list.map((a, i)=>`
+    <div class="panel asset">
+      <div class="a-head"><b>${esc(a.name)}</b><span class="tag ${esc(a.tagCls || 'queue')}">${esc(a.tag || '')}</span></div>
+      <div class="desc">${esc(a.desc || '')}</div>
+      <div class="meta">${Object.entries(a.meta || {}).map(([k,v])=>`<span>${esc(k)} <b>${esc(v)}</b></span>`).join('')}</div>
+      <div class="a-actions">
+        <button class="btn small" data-act="manage" data-i="${i}">⚙ 管理</button>
+        <button class="btn small" data-act="log" data-i="${i}">📜 日志</button>
+      </div>
+    </div>`).join('');
+}
+document.getElementById('assetGrid').addEventListener('click', e => {
+  const b = e.target.closest('button[data-act]');
+  if(!b) return;
+  const a = (DATA.assets[curTab] || [])[+b.dataset.i];
+  if(!a) return;
+  toast(b.dataset.act === 'manage'
+    ? `「${a.name}」管理面板待接真实配置入口`
+    : `已打开「${a.name}」日志视图（示例）`);
+});
+
+let logFilter='all', logRange='all', logPage=1;
+const LOG_PAGE = 20;
+function filterLog(l, el){
+  logFilter=l; logPage=1;
+  document.querySelectorAll('.log-filter .chip').forEach(c=>c.classList.remove('active'));
+  el.classList.add('active');
+  renderLogs();
+}
+function changeRange(v){ logRange=v; logPage=1; renderLogs(); }
+function logCutoff(){
+  // 返回截止时间戳（含当天）；'all' 返回 0
+  if(logRange==='all') return 0;
+  const back = {today: 0, '3d': 2, '7d': 6}[logRange] ?? 0;
+  const d = new Date(); d.setHours(0,0,0,0); d.setDate(d.getDate() - back);
+  return d.getTime();
+}
+function renderLogs(){
+  const kw = ($('#logSearch').value || '').trim().toLowerCase();
+  const cut = logCutoff();
+  const list = DATA.logs.filter(l => {
+    if(logFilter!=='all' && l.lvl!==logFilter) return false;
+    if(cut && l.date && new Date(l.date+'T00:00:00').getTime() < cut) return false;
+    if(kw && !((l.msg||'')+(l.src||'')).toLowerCase().includes(kw)) return false;
+    return true;
+  });
+  const pages = Math.max(1, Math.ceil(list.length / LOG_PAGE));
+  logPage = Math.min(Math.max(1, logPage), pages);
+  const slice = list.slice((logPage-1)*LOG_PAGE, logPage*LOG_PAGE);
+  $('#logBody').innerHTML = slice.length ? slice.map(l=>`
+    <tr><td class="time">${esc(l.date ? l.date.slice(5)+' '+l.time : (l.time || '—'))}</td><td><span class="lvl ${l.lvl}">${l.lvl}</span></td><td>${esc(l.src)}</td><td class="msg">${esc(l.msg)}</td></tr>`).join('')
+    : '<tr><td colspan="4" style="text-align:center;color:var(--text-2);padding:24px">无匹配日志</td></tr>';
+  $('#logPager').innerHTML = `
+    <span>共 ${list.length} 条 · 第 ${logPage}/${pages} 页</span>
+    <button ${logPage<=1?'disabled':''} data-page="${logPage-1}">上一页</button>
+    <button ${logPage>=pages?'disabled':''} data-page="${logPage+1}">下一页</button>`;
+  $('#logPager').querySelectorAll('button[data-page]').forEach(b=>{
+    b.onclick = () => { logPage = +b.dataset.page; renderLogs(); };
+  });
+  ['all','ERROR','WARN','INFO'].forEach(k=>{
+    const n = k==='all' ? DATA.logs.length : DATA.logs.filter(l=>l.lvl===k).length;
+    const el = $('#cnt-'+k); if(el) el.textContent = n;
+  });
+}
+
+let todoFilter='all';
+function filterTodo(p, el){
+  todoFilter=p;
+  document.querySelectorAll('.todo-filter .chip').forEach(c=>c.classList.remove('active'));
+  el.classList.add('active');
+  renderTodos();
+}
+function renderTodos(){
+  const list = DATA.todos.filter(t => todoFilter==='all' || t.p===todoFilter);
+  $('#todoList').innerHTML = list.length ? list.map((t,i)=>`
+    <label class="todo ${t.done?'checked':''}">
+      <input type="checkbox" ${t.done?'checked':''} onchange="toggleTodo('${todoFilter}',${i},this)">
+      <div class="t-body"><div class="t-title">${esc(t.title)}</div>
+      <div class="t-meta"><span class="tag ${t.p.toLowerCase()}">${t.p}</span><span>来源：${esc(t.src)}</span><span>截止：${esc(t.due)}</span></div></div>
+    </label>`).join('') : '<div style="color:var(--text-2);padding:20px;text-align:center">该优先级下暂无待办 🎉</div>';
+}
+function toggleTodo(p, i, cb){
+  const list = DATA.todos.filter(t => p==='all' || t.p===p);
+  list[i].done = cb.checked;
+  cb.closest('.todo').classList.toggle('checked', cb.checked);
+  // TODO: 接真实数据后此处应回写 QUEUE 台账（写操作，需走后端接口）
+}
+
+const ACTION_ICON = {status:"📊", doctor:"🩺", diagnose:"🔍", repush_daily:"📤", inspection:"🛰️", digest_dry:"📝", ci_status:"🏁"};
+function renderQuicks(){
+  const list = DATA.actions || [];
+  if(!list.length){
+    $('#quickGrid').innerHTML = '<div class="panel pad" style="color:var(--text-2);grid-column:1/-1">动作清单不可用（服务端未返回）</div>';
+    return;
+  }
+  $('#quickGrid').innerHTML = list.map((a, i)=>`
+    <button class="quick" data-i="${i}">
+      <div class="q-icon">${ACTION_ICON[a.key] || '⚡'}</div>
+      <b>${esc(a.name)}</b><span>${esc(a.desc)}</span>
+      <span class="tag ${a.mode === 'confirm' ? 'p1' : 'queue'}" style="margin-top:6px">${a.mode === 'confirm' ? '需确认' : '只读'}</span>
+    </button>`).join('');
+}
+$('#quickGrid').addEventListener('click', e => {
+  const b = e.target.closest('button[data-i]');
+  if(b && !b.disabled) runAction(+b.dataset.i);
+});
+function showActionResult(name, status, d, ok, extraHtml){
+  const box = $('#actionResult');
+  box.style.display = 'block';
+  const color = ok === true ? 'var(--green)' : (ok === false ? 'var(--red)' : 'var(--text-2)');
+  const head = `<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+      <b>${esc(name)}</b><span style="color:${color};font-size:12px;font-weight:600">${esc(status)}</span>
+      ${d && d.elapsed !== undefined ? `<span style="color:var(--text-2);font-size:11px">${d.elapsed}s · rc=${d.rc}</span>` : ''}
+      ${extraHtml || ''}
+    </div>`;
+  const body = (d && d.out)
+    ? `<pre style="margin:0;white-space:pre-wrap;word-break:break-all;font-size:11.5px;line-height:1.6;max-height:260px;overflow:auto;background:var(--pre);padding:10px;border-radius:8px">${esc(d.out)}</pre>`
+    : '';
+  box.innerHTML = head + body;
+}
+async function postAction(key){
+  try{
+    const r = await fetch('/api/hub/action', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-Hub-Request': '1'},
+      body: JSON.stringify({action: key, ack: true})
+    });
+    const d = await r.json().catch(() => ({error: '响应非 JSON'}));
+    return {ok: r.ok && d.ok !== false, d};
+  }catch(err){
+    return {ok: false, d: {error: '请求失败：' + err.message}};
+  }
+}
+async function runAction(i){
+  const a = (DATA.actions || [])[i];
+  if(!a) return;
+  if(a.key === 'repush_daily') return previewThenPush(a);   // 先预览再推送，避免盲推
+  if(a.mode === 'confirm' && !confirm(`「${a.name}」有副作用，确认执行？\n${a.desc}`)) return;
+  const btn = document.querySelector(`#quickGrid button[data-i="${i}"]`);
+  if(btn) btn.disabled = true;
+  showActionResult(a.name, '执行中…', null, null);
+  const {ok, d} = await postAction(a.key);
+  showActionResult(a.name, ok ? '完成' : (d.error || ('失败 rc=' + d.rc)), d, ok);
+  if(btn) btn.disabled = false;
+}
+async function previewThenPush(a){
+  if(!confirm('「重推今日日报」会先出预览，确认内容后再推送到群。继续？')) return;
+  const btn = document.querySelector(`#quickGrid button[data-i="${(DATA.actions||[]).findIndex(x=>x.key==='repush_daily')}"]`);
+  if(btn) btn.disabled = true;
+  showActionResult('今日日报', '生成预览中…', null, null);
+  const p = await postAction('digest_dry');
+  if(btn) btn.disabled = false;
+  if(!p.ok) return showActionResult('今日日报预览', p.d.error || ('失败 rc=' + p.d.rc), p.d, false);
+  showActionResult('今日日报预览', '预览完成 · 尚未推送', p.d, null,
+                   '<button class="btn small primary" id="confirmPush">确认推送到群</button>');
+  const cp = document.getElementById('confirmPush');
+  if(cp) cp.onclick = async () => {
+    cp.disabled = true; cp.textContent = '推送中…';
+    const r = await postAction('repush_daily');
+    showActionResult('重推今日日报', r.ok ? '已推送' : (r.d.error || ('失败 rc=' + r.d.rc)), r.d, r.ok);
+  };
+}
+
+function applyLive(d){
+  // 真数据模式：全量覆盖，缺什么就空什么——绝不把示例数据混进真视图（审计 M1）
+  const kToday = (d.kpi && Array.isArray(d.kpi.today)) ? d.kpi.today : [];
+  const kWeek  = (d.kpi && Array.isArray(d.kpi.week))  ? d.kpi.week  : kToday;
+  DATA.kpi = {today: kToday, week: kWeek};
+  DATA.tasks   = Array.isArray(d.tasks)   ? d.tasks   : [];
+  DATA.logs    = Array.isArray(d.logs)    ? d.logs    : [];
+  DATA.todos   = Array.isArray(d.todos)   ? d.todos   : [];
+  DATA.metrics = Array.isArray(d.metrics) ? d.metrics : [];
+  DATA.callChart = (d.callChart && Array.isArray(d.callChart.days))
+    ? d.callChart
+    : {days: [], ok: [], fail: [], note: "暂无数据"};
+  DATA.assets = {
+    models:   (d.assets && Array.isArray(d.assets.models))   ? d.assets.models   : [],
+    services: (d.assets && Array.isArray(d.assets.services)) ? d.assets.services : [],
+    apps:     (d.assets && Array.isArray(d.assets.apps) && d.assets.apps.length) ? d.assets.apps : DATA.assets.apps,
+  };
+  if(Array.isArray(d.actions) && d.actions.length) DATA.actions = d.actions;  // 动作白名单以服务端为准
+}
+function applyMock(){
+  // 降级为示例数据：整体切回快照，避免与上一次真数据混用
+  const m = JSON.parse(JSON.stringify(MOCK_SEED));
+  Object.keys(m).forEach(k => { DATA[k] = m[k]; });
+}
+function setSrcState(live, ts, sources){
+  const el = $('#srcState');
+  const errs = Object.entries(sources || {}).filter(([, v]) => v && v.error).map(([k]) => k);
+  if(live){
+    const warn = errs.length > 0;
+    el.style.background = warn ? 'var(--orange-soft)' : 'var(--green-soft)';
+    el.style.color = warn ? 'var(--orange)' : 'var(--green)';
+    el.title = warn ? ('降级源：' + errs.join('、')) : '';
+    el.innerHTML = `<span class="dot" style="background:${warn ? 'var(--orange)' : 'var(--green)'}"></span>`
+                 + `真数据 ${ts ? ts.slice(11, 19) : ''}${warn ? ` · ${errs.length} 源降级` : ''}`;
+  }else{
+    el.style.background='var(--orange-soft)'; el.style.color='var(--orange)';
+    el.title='聚合 API 不可达（未启动 / 端口不同 / 跨域）';
+    el.innerHTML = '<span class="dot" style="background:var(--orange)"></span>示例数据 · 聚合 API 不可达';
+  }
+}
+async function refreshAll(manual){
+  let live = false, gen = null, sources = {};
+  try{
+    const r = await fetch('/api/hub/overview' + (manual ? '?force=1' : ''), {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    applyLive(d); gen = d.generated_at; sources = d.sources || {}; live = true;
+  }catch(e){
+    applyMock();   // 不可达 → 整体回到示例数据（二态隔离，不混用）
+  }
+  setSrcState(live, gen, sources);
+  renderAll();
+  toast(live ? (manual ? '已刷新（真数据）' : '自动刷新完成')
+             : '聚合 API 不可达，展示示例数据（启动见档案）');
+}
+
+let toastTimer;
+function toast(msg){
+  const t=$('#toast'); t.textContent=msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2600);
+}
+function tick(){
+  const d=new Date();
+  $('#clock').textContent = d.toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit',weekday:'short'})+' '+d.toLocaleTimeString('zh-CN',{hour12:false});
+}
+function renderAll(){ renderKPIs(); renderTasks(); renderChart(); renderMetrics(); renderAssets(); renderLogs(); renderTodos(); renderQuicks(); }
+/* 主题：默认跟随系统，手动切换记忆在 localStorage */
+function applyTheme(t, redraw){
+  document.documentElement.dataset.theme = t;
+  try{ localStorage.setItem('hub-theme', t); }catch(e){}
+  const b = $('#themeBtn');
+  if(b) b.textContent = t === 'dark' ? '☀️' : '🌙';
+  if(redraw) renderChart();   // 图表取色来自 CSS 变量，需重绘
+}
+function toggleTheme(){
+  applyTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark', true);
+}
+(function initTheme(){
+  let saved = null;
+  try{ saved = localStorage.getItem('hub-theme'); }catch(e){}
+  const sysDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
+  applyTheme(saved || (sysDark ? 'dark' : 'light'), false);
+})();
+
+refreshAll(true); tick(); setInterval(tick,1000); setInterval(()=>refreshAll(false), 5*60*1000);
+</script>
+</body>
+</html>
