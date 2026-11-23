@@ -337,6 +337,11 @@ def collect():
                 if s == "done": done_day[d] += 1
                 elif s == "cancelled": fail_day[d] += 1
                 u = r.get("usage")
+                if isinstance(u, str):          # 库里 usage 是 JSON 文本，不是 dict
+                    try:
+                        u = json.loads(u)
+                    except Exception:
+                        u = None
                 if isinstance(u, dict):
                     tok_day[d][0] += u.get("input", 0) or 0
                     tok_day[d][1] += u.get("output", 0) or 0
