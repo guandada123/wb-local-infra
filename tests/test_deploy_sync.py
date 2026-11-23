@@ -296,7 +296,13 @@ class TestCheckFailSafe(unittest.TestCase):
         shutil.copy2(self.REPO / "bin" / "archive-index.py", self.repo / "bin" / "archive-index.py")
 
     def test_stale_archive_index_is_not_ok(self):
-        """_archive 变动后索引过期 → 必须报问题（审计建议的第三类检查）。"""
+        """_archive 变动后索引过期 → 必须报问题（审计建议的第三类检查）。
+
+        2026-11-23 修：此前 r0 走 _run() 不带 ARCHIVE_DIR，实际断言的是用户**真实**
+        ~/WorkBuddy/_archive —— 真目录一旦新增归档就假红（实测 00:22 多了
+        memory-segments-recovered 目录，本用例在 08:0x 变红，与代码无关）。
+        现两段都走 _run_with(env_extra)，只断言临时目录。
+        """
         arc = self.tmp / "archive"
         arc.mkdir()
         (arc / "a.tgz").write_bytes(b"x")
@@ -305,14 +311,11 @@ class TestCheckFailSafe(unittest.TestCase):
         # 先建索引（一致状态）
         subprocess.run([sys.executable, str(self.repo / "bin" / "archive-index.py"), "--dir", str(arc)],
                        capture_output=True, text=True, timeout=60)
-        r0 = self._run()
+        r0 = self._run_with(env_extra)
         self.assertIn("OK:", r0.stdout, f"一致时应 OK\nstdout={r0.stdout}")
         # 新增文件 → 索引过期
         (arc / "b.tgz").write_bytes(b"y")
-        env = {**os.environ, "REPO_OVERRIDE": str(self.repo), "LOG_OVERRIDE": str(self.tmp / "chk.log"),
-               "AGENTS": str(self.agents), "LIVE_BIN": str(self.live),
-               "CLAW_HOME": str(self.tmp / "no-claw"), "DRY_RUN": "1", **env_extra}
-        r1 = subprocess.run(["/bin/bash", str(self.CHECK)], capture_output=True, text=True, timeout=120, env=env)
+        r1 = self._run_with(env_extra)
         self.assertIn("与 _archive 不一致", r1.stdout, f"未识别索引过期\nstdout={r1.stdout}")
         self.assertNotIn("OK:", r1.stdout, "索引过期却报 OK")
 
