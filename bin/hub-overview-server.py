@@ -32,7 +32,10 @@ PROJECTS = [("Claw", "Claw", "P0"), ("QTS", "QTS", "P1"),
 PROXY_LOGS = [os.path.expanduser("~/Library/Logs/proxy-deepseek.stdout.log"),  # v1.8.0 起（持久路径）
               "/tmp/proxy-deepseek.stdout.log"]                                  # 切换前旧路径，过渡期合并计数
 PROXY_TAIL = 4 * 1024 * 1024   # 只读尾部 4MB（约 10 天量），避免日志无限增长后每次全量扫
-PROXY_DAILY = os.path.expanduser("~/.agent-autoloop/hub-proxy-daily.json")  # 每日计数快照（补重启丢数）
+PROXY_DAILY = os.path.expanduser("~/.agent-autoloop/hub-proxy-daily.json")
+# 第三方补丁的落点（上游仓的克隆）。重装/升级会整目录覆盖，补丁随之消失。
+# 仅"等它再出错"太慢（可能几周），故每次采集直接核对两处签名。
+PATCH_VALIDATE = os.path.expanduser("~/.agent-autoloop/app/protocol/validate.ts")  # 每日计数快照（补重启丢数）
 CI_CACHE = os.path.expanduser("~/.agent-autoloop/hub-ci-cache.json")       # CI 结果后台缓存（15 分钟过期）
 _proxy_cache = {"key": None, "stats": None}
 _status_cache = {"ts": 0, "data": None}
@@ -248,6 +251,25 @@ def _svc_ts(line):
     return "", ""
 
 
+def patch_state():
+    """核对回执补丁是否还在。返回 (状态文案, 说明)。
+    两处签名缺一不可：cancel 宽容（!== true）+ 报错指位（laterProblem）。"""
+    try:
+        with open(PATCH_VALIDATE, encoding="utf-8", errors="ignore") as fh:
+            body = fh.read()
+    except Exception as e:
+        return "不可读", f"{type(e).__name__}"
+    has_cancel = "later.cancel !== true" in body
+    has_why = "function laterProblem" in body
+    if has_cancel and has_why:
+        return "在位", "两处签名齐（cancel 宽容 + 报错指位）"
+    missing = []
+    if not has_cancel:
+        missing.append("cancel 宽容")
+    if not has_why:
+        missing.append("报错指位")
+    return "缺失", "缺 " + "、".join(missing) + " → 回执会重新丢 later，按 patches/ 重打"
+
 def service_logs(per_file=3, total=30):
     """从 ~/.agent-autoloop/logs/*.log 抽真实报错行 → 日志区可见。
     时间只取行内时间戳；行内无时间戳则留空（不臆造）。"""
@@ -457,14 +479,16 @@ def collect():
              "note": ps.get("note", "")},
             {"label": "最老待办", "val": (f"{old_days} 天" if old_days is not None else "—"),
              "note": (f"{old_title[:40]}（仅统计群消息来源条目）" if old_title else "无带原文的待办")},
+            {"label": "回执补丁", "val": patch_state()[0],
+             "note": f"{patch_state()[1]}（{PATCH_VALIDATE.replace(os.path.expanduser('~'), '~')}）"},
             {"label": "CI 未启动", "val": f"{sum(1 for v in (ci.get('repos') or {}).values() if v.get('not_started'))} 仓",
              "note": ("未跑=计费/额度拦截，不是代码红：" +
                       "、".join(f"{k}({v.get('secs', 0)}s)" for k, v in (ci.get("repos") or {}).items() if v.get("not_started"))
                       if any(v.get("not_started") for v in (ci.get("repos") or {}).values())
                       else "无（各仓 CI 均在正常跑）")},
             {"label": "回执不合规(7日)", "val": f"{rc_cnt} 次",
-             "note": (f"最近 {rc_last}（本地时间）；这是补丁哨兵，若补丁被升级覆盖会重新涨"
-                      if rc_cnt else "近 7 天无新增；补丁若被升级覆盖，这里会重新涨起来")},
+             "note": (f"最近 {rc_last}（本地时间）；滞后指标——补丁是否还在，看上面「回执补丁」那行"
+                      if rc_cnt else "近 7 天无新增（滞后指标；补丁在位与否见「回执补丁」行）")},
         ]
 
         # 日志区 = events 事件账（结构化、有级别可判）+ 尾部日志行补充

@@ -41,6 +41,7 @@
 | 代理请求数 | `~/Library/Logs/proxy-deepseek.stdout.log` + `~/.agent-autoloop/hub-proxy-daily.json`（每日快照，取 max） | ✅ 接通，重启不归零；v1.10.6 起快照**原子写**（tmp+fsync+replace），防并发读到半个 JSON |
 | 等你决策 | `agent-autoloop status --json` 的 `totals.attention` + 首张卡标题 | ✅ 接通 |
 | 回执不合规(7日) | `hub.db` 的 `cards` 表（标题含「回执」，近 7 天） | ✅ v1.10.4 接通：兼作第三方补丁哨兵 |
+| 回执补丁在位（v1.10.7） | `~/.agent-autoloop/app/protocol/validate.ts` 的两处签名 | ✅ 已接通：**在位/缺失** 每次采集直判（滞后指标看「回执不合规」，在位看这条） |
 
 ## 四、自动化规则
 
@@ -70,7 +71,7 @@
 - [x] **页面纳入版本控制**（v1.10.0，`wb-local-infra/share/hub-overview/index.html`）
 - [x] 源码持久化闭环（v1.10.1：部署器 → `wb-local-infra/workbench/install-hub-overview.sh`、档案 → `docs/hub-workbench.md`、页面 → `share/hub-overview/index.html`、服务端与探活 → `bin/`；**空机验证**：git clone 一份即可重建，7 个文件齐、服务端可编译、页面 JS 可解析）
 - [x] `share/` 同步闸门（v1.10.1：`tests/test_share_sync.py`，逐字节 + 负控——只改 live 一字节必须报红、恢复必须变绿、文件缺失必须报红）
-- [ ] 交互未验证项（L12/L15/L17）：资产卡按钮、日志翻页、级别筛选需人工点一次
+- [ ] 交互未验证（L12/L15/L17）：资产卡按钮、日志翻页、级别筛选需人工点一次。**2026-11-25 再试已确认环境阻塞**：DOM 快照接口返回空字符串、整页截图超 10MiB 上限，两条独立限制 → 受控浏览器内无法完成点击级验证，只能由人点（或换截图方式）
 - [ ] 代理日志无自动轮转（约 0.5MB/天，靠只读尾部 4MB 保性能）
 - [ ] 「打开 QUEUE 台账」**不接**：后台服务执行 `open` 无 GUI 上下文，纯摆设
 
@@ -78,6 +79,7 @@
 
 | 版本 | 日期 | 摘要 |
 |---|---|---|
+| v1.10.7 | 2026-11-25 | **补丁在位哨兵 + 措辞分工**：原唯一哨兵是「等它再出错」（可能几周不触发），改为每次采集直读 `app/protocol/validate.ts` 判两处签名（`later.cancel !== true` + `function laterProblem`）→ metrics「回执补丁：在位/缺失」。**可证伪验证**：真实文件=在位；造一份被覆盖的临时文件=缺失，且原因写明缺哪处。另把「回执不合规(7日)」标为滞后指标，避免两行都自称哨兵。跨日核验：代理快照自动滚到 11-25（27 次）、保留 13 天、回执 7 日窗仍 3 次不串日 |
 | v1.10.6 | 2026-11-24 | **CI 未启动可见 + 快照原子写**：① metrics 加「CI 未启动 N 仓」（note 列仓名与耗时，口径写明「未跑=计费拦截，不是代码红」），实测 1 仓 `workbuddy-user-memory` 2s——补上一笔「监控扩到 5 仓但页面只显示 4 个卡」的不一致；② 代理每日快照改 tmp+fsync+`os.replace` 原子写：多线程下读-算-覆盖写可能读到半个 JSON，退化后会只写最近 7 天并让当日值倒退；并发 5 请求压测后仍 12 天、今日值不变。**诚实记录**：16:55 曾读到「今日代理 1621」，与现在 1024（=日志实际条数）不符，1621 实为 11-23 快照值，原因未复现、不下结论 |
 | v1.10.5 | 2026-11-24 | **CI 语义修正：区分「没跑」与「真红」**：`workbuddy-user-memory` 的 memory-checks 连续 3 次失败，实为 job 2~3 秒 0 步骤（GitHub 计费/额度拦截），且该仓此前不在监控名单 → 记忆保险的闸门已停摆无人知。改动：①`looks_not_started()` 用耗时 ≤15s 机械判据判「疑未启动」（文案写「疑」，不代替 Billing 核实）；②纳入 `~/.workbuddy/user-*-personal`（glob，不写死 UUID）；③标题仓数改用实际 targets 数（原写死 4）；④服务端 not_started 显示「⛔ 未启动(疑计费) · Ns」不再画 ❌。实测动作 13.8s / 5 仓；闸门 66 tests OK |
 | v1.10.4 | 2026-11-24 | **回执哨兵 + 账本状态核实**：① metrics 新增「回执不合规(7日)」（hub.db cards 表，created_at 去 T 后比 UTC、展示 +8h），实测 3 次（11-19/23/24），补丁若被升级覆盖会重新涨；② 核实实盘账本：`check_holdings_freshness.py --dry-run` 三个维度全 fresh、错过 0 个交易日（11-24 已人工确认），卡片 #42 已由用户/中台处理完毕（attention 0）；③ 查明 `portfolio_import.pyc` 是孤儿产物——中台 20:08 造过重复品、随即自认「官方入口 `update_live_snapshot.py` 早就在」并 revert；官方录入口令为 `update_live_snapshot.py --position 代码:股数:成本 --cash 可用资金 [--dry-run]` |
