@@ -901,7 +901,12 @@ class TestUiGuard(unittest.TestCase):
                            capture_output=True, text=True, timeout=60)
         out = p.stdout + p.stderr
         self.assertIn("interlock", out, f"status 没有在位断言:\n{out}")
-        self.assertIn(p.returncode, (0, 7), f"status 异常退出 rc={p.returncode}:\n{out}")
+        # 原断言接受 (0,7)，而 7 正是「未接线」—— 对断链无能为力（审计 P1-2）。
+        # 现在按输出判断该是哪个码：说已接线就必须 rc=0，说未接线就必须 rc=7。
+        if "已接线" in out:
+            self.assertEqual(0, p.returncode, f"声称已接线但 rc={p.returncode}:\n{out}")
+        else:
+            self.assertEqual(7, p.returncode, f"声称未接线但 rc={p.returncode}:\n{out}")
 
 
 class TestMirrorLogTimestamp(unittest.TestCase):
@@ -966,3 +971,63 @@ class TestUiGuardScanScope(unittest.TestCase):
         """
         src = self.SCRIPT.read_text(encoding="utf-8")
         self.assertIn("allNames", src, "缺少「先取进程名」的优化，扫描会退化到数秒")
+
+
+class TestInterlockVerify(unittest.TestCase):
+    """接线自检必须与闸门自身解耦（2026-11-24 审计 P1-1）。
+
+    早期自检用 `cliclick p`，而此刻 cliclick 已指向 shim → 自检要过闸门自己，
+    结论取决于瞬时界面状态（实测：受禁前台下单独 cliclick 被拒 rc=3，安装却报成功）。
+    """
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "wb-ui-guard.py"
+
+    def _mod(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wb_ui_guard_mod_v", self.SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_calls_real_binary_not_shim(self):
+        """必须调真身绝对路径 + `p`，不能调 PATH 里的 cliclick（那是 shim）。"""
+        from types import SimpleNamespace
+
+        mod = self._mod()
+        seen = {}
+
+        def runner(argv, **kw):
+            seen["argv"] = argv
+            return SimpleNamespace(returncode=0, stdout="10,20\n", stderr="")
+
+        ok, _ = mod._verify_interlock("/opt/homebrew/Cellar/cliclick/5.1/bin/cliclick",
+                                      runner=runner, scanner=lambda: {"front": "Finder"})
+        self.assertTrue(ok)
+        self.assertEqual("/opt/homebrew/Cellar/cliclick/5.1/bin/cliclick", seen["argv"][0],
+                         "自检没有直调真身，会重新变成「过闸门自己」")
+        self.assertEqual("p", seen["argv"][1])
+
+    def test_independent_of_guard_deny(self):
+        """前台是受禁应用时，自检仍应通过（它不该受闸门判定影响），且 detail 里留下 front。"""
+        from types import SimpleNamespace
+
+        mod = self._mod()
+        ok, detail = mod._verify_interlock(
+            "/x/cliclick",
+            runner=lambda argv, **kw: SimpleNamespace(returncode=0, stdout="5,6\n", stderr=""),
+            scanner=lambda: {"front": "Passwords", "bundle": "com.apple.Passwords"})
+        self.assertTrue(ok, "自检被闸门判定影响 → 又回到 P1-1")
+        self.assertEqual("Passwords", detail.get("front"), "自检现场没留痕，无法排查")
+
+    def test_fails_when_real_broken(self):
+        """真身不可用（空输出）时必须判失败，触发回滚。"""
+        from types import SimpleNamespace
+
+        mod = self._mod()
+        ok, detail = mod._verify_interlock(
+            "/x/cliclick",
+            runner=lambda argv, **kw: SimpleNamespace(returncode=0, stdout="", stderr=""),
+            scanner=lambda: {"front": "Finder"})
+        self.assertFalse(ok)
+        self.assertEqual("0", str(detail.get("rc")))

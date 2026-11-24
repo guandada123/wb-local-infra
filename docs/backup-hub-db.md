@@ -169,7 +169,7 @@ HC_BACKUP_PING_URL=https://hc-ping.com/<uuid>
 | check 详情 Events | `#1 Started` → `#2 OK` | 10:02 两次，Last Duration 1 sec，new → up |
 | 事件 User-Agent | `wb-autoloop-backup/1.0` | 是本机脚本打的，不是别处同名探测 |
 | 集成 Last Notification | `Delivered`（2 周 3 天前，非 Failed） | 这条 webhook 历史上真送出过 |
-| `wb-autoloop-backup.py daily` 输出 | `打卡[开始] HTTP 200` / `打卡[结束] HTTP 200` | 备份那一步同时通过 10 项校验 |
+| `wb-autoloop-backup.py daily` 输出 | `打卡[开始] HTTP 200` / `打卡[结束] HTTP 200` | 备份那一步同时通过 12 项校验（A1–A12） |
 
 **没做的一件**：对新 check 造一次 `/fail` 实弹。理由是 11-23 刚因误报往群里道过歉，不再为
 「验证」制造假告警。第一次实弹会是真失败（>26h 无打卡），届时以群消息 + check 状态双向核对。

@@ -377,6 +377,29 @@ exec python3 "$HOME/.local/bin/wb-ui-guard.py" forward "$@"
 """
 
 
+def _verify_interlock(real, runner=None, scanner=None):
+    """接线自检：只验证「真身能跑」，**不经过 shim**。
+
+    为什么改（2026-11-24 审计 P1-1）：早期用 `cliclick p` 验证，而此刻 cliclick 已指向 shim
+    → 自检要过闸门自己。前台是受禁应用、或屏幕上有任意模态时，结论取决于瞬时界面状态；
+    实测出现过「同一前台单独 cliclick 被拒 rc=3，而安装却报成功」的矛盾，且全程无日志可查。
+    改成直调真身绝对路径后，自检与闸门解耦；同时把 front/rc/out 交给调用方写日志。
+    """
+    s = (scanner or scan_screen)()
+    detail = {"front": s.get("front", ""), "bundle": s.get("bundle", ""), "err": s.get("err")}
+    run = runner or subprocess.run
+    try:
+        r = run([real, "p"], capture_output=True, text=True, timeout=30)
+        out = (getattr(r, "stdout", "") or "").strip()
+        detail["rc"] = getattr(r, "returncode", "?")
+        detail["out"] = out[:60]
+        return bool(re.match(r"^\s*\d+\s*,\s*\d+\s*$", out)), detail
+    except (subprocess.TimeoutExpired, OSError) as e:
+        detail["rc"] = "exc"
+        detail["out"] = "%s: %s" % (e.__class__.__name__, e)
+        return False, detail
+
+
 def cmd_install(_args):
     if not INTERLOCK.exists() and not INTERLOCK.is_symlink():
         print("❌ %s 不存在，不动" % INTERLOCK, file=sys.stderr)
@@ -399,18 +422,13 @@ def cmd_install(_args):
     INTERLOCK.unlink()
     INTERLOCK.write_text(SHIM_BODY, encoding="utf-8")
     INTERLOCK.chmod(0o755)
-    # 接线自检必须测「真的转发到了真身」，不能只看有没有输出：
-    # cliclick 无参数时打的是 "You did not pass any commands..."（不含 Usage 字样），
-    # 早期版本按 "Usage" 匹配会误判失败并自动回滚。用 `cliclick p`（打印鼠标坐标）最稳。
-    try:
-        r = subprocess.run(["cliclick", "p"], capture_output=True, text=True, timeout=30)
-        passed = bool(re.match(r"^\s*\d+\s*,\s*\d+\s*$", (r.stdout or "").strip()))
-    except (subprocess.TimeoutExpired, OSError) as e:
-        r, passed = None, False
-        print("⚠️ 接线后自检异常：%s" % e, file=sys.stderr)
+    # 自检调真身绝对路径（不经 shim），并把现场写进日志 —— 见 _verify_interlock 的说明。
+    passed, detail = _verify_interlock(real)
+    _log("install-interlock 自检 front=%s bundle=%s rc=%s passed=%s out=%r"
+         % (detail.get("front"), detail.get("bundle"), detail.get("rc"), passed, detail.get("out")))
     if not passed:
-        print("⚠️ 接线后自检异常 rc=%s out=%r，正在还原"
-              % (getattr(r, "returncode", "?"), (getattr(r, "stdout", "") or "")[:60]), file=sys.stderr)
+        print("⚠️ 接线自检失败（真身 %s）rc=%s out=%r，正在还原"
+              % (real, detail.get("rc"), detail.get("out")), file=sys.stderr)
         cmd_remove([])
         return 1
     print("✅ 已接线：%s 现在先过闸门（真身 %s）" % (INTERLOCK, real))

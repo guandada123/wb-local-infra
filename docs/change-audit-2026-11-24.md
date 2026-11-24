@@ -165,3 +165,26 @@
 - P2 六条全部成立（`com.apple.MobileSMS` 确无依据；`SECRET_CN` 含裸"密钥"；
   `FALLBACK_REAL` 硬编码 5.1；shim 依赖 PATH；0.32s/1.6s 实测；connector 附带为实测）
 - 容量闸门失败返回 `rc=3` 成立（代码 532 行 + 自检 847 行断言）
+
+---
+
+## 十、修正记录（2026-11-24 21:15，按 M8 的三步执行）
+
+| 原问题 | 修法 | 验证 |
+|---|---|---|
+| **P1-1** 接线自检经 shim，过闸门自己；且全程无日志 | 新增 `_verify_interlock(real, runner, scanner)`：**直调真身绝对路径**，与闸门判定解耦；`cmd_install` 把 `front/bundle/rc/out/passed` 写进日志 | 【实测】受禁前台 `Passwords` 下安装成功，日志留 `front=Passwords bundle=com.apple.Passwords rc=0 passed=True out='917,610'`；**同一前台单独 `cliclick p` 仍被拒 `rc=3`**（闸门未失效） |
+| **P1-2** Python 测试接受 `rc=7`（未接线） | 改为按 status 输出判定：称"已接线"则 `rc` 必须 0，否则必须 7 | 【实测】61 项测试 OK |
+| **P1-3** 文档"三次全量遍历" | 改为实测口径：preflight 每项 2 次 + verify 体内 5 处 `walk(`，一次运行 **≥4 次** | 【实测】`grep -n 'walk('` 行号 26/57/58/111/132 |
+| **P1-4** 文档"10 项校验" | 改为 12 项（A1–A12） | 【实测】`grep -o '"A[0-9]*"'` 去重 = 12 |
+
+新增 3 项测试（`TestInterlockVerify`）：调真身而非 shim、受禁前台下仍通过且留痕、真身不可用时判失败。
+**变异测试**：把自检改回 `["cliclick", "p"]` → `test_calls_real_binary_not_shim` 单独变红，其余通过（3 项中 1 红）。
+
+### 仍未解决（保持诚实）
+
+- **历史成因无法回溯**：16:44 与 20:2x 那两次"受禁前台下自检通过"的旧现象，因为没有日志，
+  已无法确定当时 `cliclick p` 到底走到了哪。新实现不再依赖这条路径，且有日志可查，问题被绕过而非"解释清楚"。
+- **P2-1 / P2-2 未动**：`com.apple.MobileSMS` 仍在 DENY 名单；`SECRET_CN` 仍含裸"密钥"。
+  两者都会改变拦截行为，属产品判断，需用户点头再改。
+- **P3-3 未动**：`cmd_install` 回滚路径仍无测试（现已有 `_verify_interlock` 可注入失败，
+  补一条"注入失败 → 软链被还原"的断言即可，本次未做）。
