@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.user.wb-offsite-mirror</string>
+
+  <!-- 每日 03:20 把「只此一份」的数据镜像到内盘。
+       为什么 03:20：23:40 的 hub.db 备份先跑完；离 08:00 的自动化和 09:25 开盘还有空档；
+       它只读外置盘、写内盘，不会和盘中任何作业抢同一块盘。 -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+    <string>/Users/guan/.local/bin/wb-offsite-mirror.py</string>
+    <string>daily</string>
+  </array>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>20</integer>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/guan/Library/Logs/wb-offsite-mirror.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/guan/Library/Logs/wb-offsite-mirror.log</string>
+
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>LowPriorityIO</key>
+  <true/>
+  <key>Nice</key>
+  <integer>5</integer>
+</dict>
+</plist>

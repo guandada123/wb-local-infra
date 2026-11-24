@@ -1,4 +1,4 @@
-# 当前活跃 launchd job 清单（2026-11-23 22:59 由 live 重建）
+# 当前活跃 launchd job 清单（2026-11-24 12:28 由 live 重建）
 # 用途：install.sh --plists 按此清单从 launchd/ 快照恢复（DR 用），只补缺失、不覆盖已有。
 # 标注 [deploy] 的由 Claw .workbuddy/deploy 部署脚本管理，本清单不负责。
 # 换机恢复：本机用户名硬编码在 plist 内部（launchd 不支持 ~），恢复前需替换为新用户名。
@@ -34,5 +34,6 @@
 [deploy] com.user.wb-job-watch.plist
         com.user.wb-liveness.plist
 [deploy] com.user.wb-local-review.plist
+        com.user.wb-offsite-mirror.plist
         com.user.workbuddy-ssd-guard.plist
         com.user.zhongtai-board.plist

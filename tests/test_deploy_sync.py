@@ -774,3 +774,58 @@ class TestBackupPing(unittest.TestCase):
             out = mod._ping("", timeout=2)
         self.assertIsInstance(out, str)
         self.assertIn("打卡失败", out)
+
+
+class TestOffsiteMirror(unittest.TestCase):
+    """离线镜像闸门（2026-11-24 建立）。
+
+    背景：`~/WorkBuddy` 与 `~/.workbuddy` 都是指向 /Volumes/ZHITAI 的软链，用户数据全在
+    那块便携 SSD 上；报告、会话历史、各 workspace 记忆既没有第二副本，也不在任何 git 里。
+    TM 指到 ZHITAI 只能覆盖内盘（系统/应用），盖不到这些 —— 所以单独做靶向镜像。
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+    SCRIPT = REPO / "bin" / "wb-offsite-mirror.py"
+    PLIST = REPO / "launchd" / "com.user.wb-offsite-mirror.plist"
+
+    def test_script_compiles(self):
+        subprocess.run([sys.executable, "-m", "py_compile", str(self.SCRIPT)], check=True)
+
+    def test_fault_injection_all_red(self):
+        """11 项故障注入必须全绿（每项断言恰好那一项变红）。"""
+        p = subprocess.run([sys.executable, str(self.SCRIPT), "self-test"],
+                           capture_output=True, text=True, timeout=180)
+        out = p.stdout + p.stderr
+        self.assertEqual(0, p.returncode, f"故障注入未全通过:\n{out}")
+        m = re.search(r"(\d+)/(\d+) 通过", out)
+        self.assertIsNotNone(m, f"输出里没有通过计数:\n{out}")
+        got, total = int(m.group(1)), int(m.group(2))
+        self.assertEqual(got, total, f"故障注入未全通过：{got}/{total}\n{out}")
+        self.assertGreaterEqual(total, 13, "故障注入用例数不应减少（每条反证一个判据）")
+
+    def test_plist_points_at_existing_python(self):
+        """plist 硬编码的解释器一旦因 WorkBuddy 升级消失，作业静默不跑。"""
+        import plistlib
+        with open(self.PLIST, "rb") as f:
+            data = plistlib.load(f)
+        args = data["ProgramArguments"]
+        self.assertEqual("daily", args[-1], "plist 应调用 daily 子命令")
+        self.assertTrue(Path(args[1]).is_file(), f"镜像脚本不存在: {args[1]}")
+        py = Path(args[0])
+        if not py.exists():
+            if os.environ.get("SKIP_RULES") == "1":
+                self.skipTest(f"授权 python 不在且 SKIP_RULES=1：{py}")
+            self.fail(f"plist 指向的 python 不存在：{py} —— 作业会静默不跑，需更新 plist")
+
+    def test_manifest_items_exist_on_this_machine(self):
+        """清单里的非通配项必须真实存在 —— 否则镜像会「成功地什么都没做」。"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("wb_offsite_mirror", self.SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if not mod.SRC_ROOT.exists():
+            self.skipTest(f"源根不在本机（CI 环境）：{mod.SRC_ROOT}")
+        pairs = mod.expand_items(mod.SRC_ROOT)
+        self.assertGreaterEqual(len(pairs), 3, f"展开项过少：{[n for n, _ in pairs]}")
+        missing = [n for n, p in pairs if not p.is_dir()]
+        self.assertEqual([], missing, f"清单项不存在：{missing}")

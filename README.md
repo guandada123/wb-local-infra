@@ -208,3 +208,19 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
 - **外部观测**（2026-11-24 接通）：healthchecks.io check `Autoloop Backup`（1 day / 2h grace），
   `daily` 打 `/start`、成功打 plain、失败打 `/fail`；ping URL 只在 `~/.local/etc/wb-autoloop-backup.conf`
 - **完整说明与残余风险**（整机无 TM/FileVault、落点卷未加密、作业无法自证未跑）：`docs/backup-hub-db.md`
+
+## 离线镜像：只此一份的数据 → 内盘（2026-11-24 加）
+
+`~/WorkBuddy` 与 `~/.workbuddy` 都是指向 `/Volumes/ZHITAI` 的软链 —— 用户数据全在那块便携 SSD 上，
+而报告、会话历史、各 workspace 记忆既无第二副本、也不在任何 git 里。本作业把它们靶向复制到内盘：
+
+- 脚本 `bin/wb-offsite-mirror.py`：`run / verify / daily / status / self-test`
+- 定时 `launchd/com.user.wb-offsite-mirror.plist`：每日 03:20（LowPriorityIO + Nice 5）
+- 覆盖：`Claw/output`(714M) + `workbuddy_data/projects`(5.5G) + 各 `.workbuddy/memory`(15M)
+- 判据 V1–V5：异卷 / 非空 / **集合包含**（不是数量比）/ 抽样 sha256 / 落点旧文件只 WARN
+- **不跟随删除**：镜像不做 `--delete`，否则一次误删两边都没了
+- 13 项故障注入；V3 的增长/截断靠 mtime 区分（只靠「前缀一致」分不出来，实测踩过）
+- 外部观测：healthchecks check `Offsite Mirror`（1 day / 2h grace），配置在
+  `~/.local/etc/wb-offsite-mirror.conf`
+- **完整说明、残余风险（单设备/未加密/TM 仍未配）与「TM 为什么配不上」的实测记录**：
+  `docs/offsite-mirror.md`
