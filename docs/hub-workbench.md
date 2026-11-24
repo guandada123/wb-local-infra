@@ -77,6 +77,7 @@
 
 | 版本 | 日期 | 摘要 |
 |---|---|---|
+| v1.10.3 | 2026-11-24 | **回执问题补齐第二个原因 + 报错指位**：13:30 同一句报错再现（run 256），实为 `later` 写成对象而非数组（与昨日 `cancel:false` 不同因同症）。补丁扩为三处（cancel 宽容、单对象归一、`laterProblem()` 指位指字段）；两份真回执均 `problem=none`；5 项测试 + typecheck 通过；全量 760 pass/14 fail 与改前一致。补丁更名 `agent-autoloop-later-receipt.patch` 并在干净上游验证 |
 | v1.10.2 | 2026-11-24 | **回执悬案定位并修复（第三方补丁）**：`later` 项写 `"cancel": false` 会让整份回执被拒、其中的后续安排全部丢失，而报错只提 key/at/about。用平台自身 `readMessage`/`resultFrom` 复现并逐条拆解定位；改为 `cancel !== true` + 新增 `tests/later-cancel.test.ts`（3 项，含缺 at/缺 key/超 10 项仍拒收）；全量 797 项测试中 14 项失败经 A/B 对照确认与本改动无关。补丁与重打方式登记在 `wb-local-infra/docs/third-party-patches.md` + `patches/*.patch`（干净上游验证通过）|
 | v1.10.1 | 2026-11-23 | **持久化闭环 + 部署器/闸门入仓**：① 部署器从「工作区 → live」改为「**仓 → live**」（`workbench/install-hub-overview.sh`，默认 dry-run、`--apply` 才落盘 + kickstart + 探活非 200 即失败）；② 档案入仓 `docs/hub-workbench.md`、补 `workbench/README.md`（三处文件关系/部署/回滚/两道闸门/边界）；③ 新增 `tests/test_share_sync.py`（share ↔ live 逐字节 + 三项负控）；④ 实测：`--apply` 端到端新 pid 起、页面/API 200、Token 仍 77809.7k；全量闸门 **41 tests OK**；⑤ 空机重建验证——clone 一份即 7 文件齐备、可编译可解析。提交 `cf01d02` 已推远端 |
 | v1.10.0 | 2026-11-23 | **源码恢复 + Token 假数字修复 + 页面入仓**：① 会话工作区被平台清理后，从内盘部署副本恢复 server/index/deploy 四文件，与部署副本逐字节一致；② 修 `LLM Token(今日)` 长期显示 0 —— `runs.usage` 在库里是 JSON **文本**，代码只判 `isinstance(dict)` 恒假，改为先 `json.loads`，实测今日 **77,809.7k（=7781 万，与中台口径一致）**、7 日 337,226k；③ 页面纳入 `wb-local-infra/share/hub-overview/index.html`（此前是唯一无 git 的产物），两笔提交已推送远端；④ 重建本档案（原档随工作区丢失）。 |
@@ -84,20 +85,24 @@
 
 > v1.9.1 及之前（v1.0.0 → v1.9.1，含数据接入、白名单 6 动作、双主题、日志分页、代理日志改持久路径、CI 进卡、等你决策等）的逐条记录随原档丢失。已完成的功能状态见第二节与第三节，代码历史见内盘副本 mtime 与 `wb-local-infra` 提交历史。
 
-## 八、已定位（原「回执读不懂」悬案）
+## 八、「回执读不懂」：两个原因、已全部修复
 
-**结论：`later` 项里写了 `"cancel": false` 被整份拒收。**2026-11-24 08:2x 用平台自己的代码（`readMessage` + `resultFrom`）跑 run 252 的真回执复现成功：
+同一句报错（「later 每一项要有 key，以及带时区的 at 和 about，或者 cancel: true，最多 10 项」）实际对应**两种互不相干的原因**，各中一次：
 
-| 判定项 | 值 | 结果 |
-|---|---|---|
-| 回执 JSON | 对象、1 项、字段 key/at/about | 通过 |
-| `key` | 21 字 | 通过 |
-| `at` | `2026-11-24T06:30:00+08:00` | 通过（`dateTime` 返回 true）|
-| `about` | 418 字 | 通过 |
-| **`cancel`** | **`false`（显式写了）** | **不通过** |
+| 起因 | 实际写法 | 旧规则为什么拒 | 时间 |
+|---|---|---|---|
+| A | `"cancel": false` | 要求 `cancel === undefined`，`false ≠ undefined` | 11-19(#34)、11-23(#41/run 252) |
+| B | `"later": {…}` 对象 | 要求数组，`Array.isArray` 为假 | 11-24 13:30(#43/run 256) |
 
-规则是「`cancel === true` 才算取消，否则要求 `cancel === undefined`」——`false ≠ undefined`，整条被判不合规，**该回执里的 `later`（06:30 复查）因此从未被排期**（事后查未来排期 = 0）。报错文案只提 key/at/about，完全没提 cancel，所以两次（11-19 #34、11-23 #41）都像灵异事件。
+**病根不只是这两处写法，而是报错从不指位**：它只重述「要求」，不说第几项、哪个字段错了。两次都得拿真回执喂给平台自己的 `readMessage`/`resultFrom` 反向复现才定位，代价过高。
 
-处置：把 `=== undefined` 放宽为 `!== true`（false 与「不写」语义相同），补 3 项测试；**A/B 对照**证明全量测试里 14 项失败在撤掉补丁后同样失败（installer/权限/进程组环境类），与改动无关。补丁登记在 `wb-local-infra/docs/third-party-patches.md`，可重打文件 `patches/agent-autoloop-later-cancel-false.patch`（已在干净上游 `d3a44ca` 验证可应用、3 测试全过）。
+处置（补丁在 `wb-local-infra/docs/third-party-patches.md`，可重打文件 `patches/agent-autoloop-later-receipt.patch`）：
+1. `cancel === undefined` → `cancel !== true`
+2. `later` 单个对象归一为数组
+3. 新增 `laterProblem()`：报错指位指字段（非数组 / 超 10 项 / 缺 key / 多余字段 / `cancel:true` 带 at / at 格式时区 / about 缺失超长）
 
-残留：上游未发 PR；重装/覆盖升级会丢补丁，需按台账重打。
+验证：两份真回执（252、256）改前均丢失 `later`，改后均 `problem=none` 且保留；新增 5 项测试；`typecheck` 通过；全量 760 pass / 14 fail，失败集与改前一致（installer/权限环境类）。
+
+实际损失（取证）：run 252 想排的 06:30 复查、run 256 想排的 14:10 查 CI，**两次都从未排期**。
+
+残留：上游未发 PR；重装/升级会丢补丁，需按台账重打。
