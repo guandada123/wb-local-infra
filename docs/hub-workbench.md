@@ -38,7 +38,7 @@
 | 待办 | `Claw/.autopilot/QUEUE.md` TODO 段 | ✅ 接通（按 `- [ ]` 行） |
 | 应用卡 git | 各项目目录 `git status --branch` + `log -1` | ✅ 4/5 命中（QTS 无本地 git → 标「未定位」，不伪造） |
 | 应用卡 CI | `~/.agent-autoloop/hub-ci-cache.json`（后台 15 分钟刷新，由 `hub-ci-status.py` 写） | ✅ 接通：**5 仓**（含记忆备份仓）；failure 且耗时 ≤15s 判「⛔ 未启动(疑计费)」，不画 ❌ |
-| 代理请求数 | `~/Library/Logs/proxy-deepseek.stdout.log` + `~/.agent-autoloop/hub-proxy-daily.json`（每日快照，取 max） | ✅ 接通，重启不归零 |
+| 代理请求数 | `~/Library/Logs/proxy-deepseek.stdout.log` + `~/.agent-autoloop/hub-proxy-daily.json`（每日快照，取 max） | ✅ 接通，重启不归零；v1.10.6 起快照**原子写**（tmp+fsync+replace），防并发读到半个 JSON |
 | 等你决策 | `agent-autoloop status --json` 的 `totals.attention` + 首张卡标题 | ✅ 接通 |
 | 回执不合规(7日) | `hub.db` 的 `cards` 表（标题含「回执」，近 7 天） | ✅ v1.10.4 接通：兼作第三方补丁哨兵 |
 
@@ -78,6 +78,7 @@
 
 | 版本 | 日期 | 摘要 |
 |---|---|---|
+| v1.10.6 | 2026-11-24 | **CI 未启动可见 + 快照原子写**：① metrics 加「CI 未启动 N 仓」（note 列仓名与耗时，口径写明「未跑=计费拦截，不是代码红」），实测 1 仓 `workbuddy-user-memory` 2s——补上一笔「监控扩到 5 仓但页面只显示 4 个卡」的不一致；② 代理每日快照改 tmp+fsync+`os.replace` 原子写：多线程下读-算-覆盖写可能读到半个 JSON，退化后会只写最近 7 天并让当日值倒退；并发 5 请求压测后仍 12 天、今日值不变。**诚实记录**：16:55 曾读到「今日代理 1621」，与现在 1024（=日志实际条数）不符，1621 实为 11-23 快照值，原因未复现、不下结论 |
 | v1.10.5 | 2026-11-24 | **CI 语义修正：区分「没跑」与「真红」**：`workbuddy-user-memory` 的 memory-checks 连续 3 次失败，实为 job 2~3 秒 0 步骤（GitHub 计费/额度拦截），且该仓此前不在监控名单 → 记忆保险的闸门已停摆无人知。改动：①`looks_not_started()` 用耗时 ≤15s 机械判据判「疑未启动」（文案写「疑」，不代替 Billing 核实）；②纳入 `~/.workbuddy/user-*-personal`（glob，不写死 UUID）；③标题仓数改用实际 targets 数（原写死 4）；④服务端 not_started 显示「⛔ 未启动(疑计费) · Ns」不再画 ❌。实测动作 13.8s / 5 仓；闸门 66 tests OK |
 | v1.10.4 | 2026-11-24 | **回执哨兵 + 账本状态核实**：① metrics 新增「回执不合规(7日)」（hub.db cards 表，created_at 去 T 后比 UTC、展示 +8h），实测 3 次（11-19/23/24），补丁若被升级覆盖会重新涨；② 核实实盘账本：`check_holdings_freshness.py --dry-run` 三个维度全 fresh、错过 0 个交易日（11-24 已人工确认），卡片 #42 已由用户/中台处理完毕（attention 0）；③ 查明 `portfolio_import.pyc` 是孤儿产物——中台 20:08 造过重复品、随即自认「官方入口 `update_live_snapshot.py` 早就在」并 revert；官方录入口令为 `update_live_snapshot.py --position 代码:股数:成本 --cash 可用资金 [--dry-run]` |
 | v1.10.3 | 2026-11-24 | **回执问题补齐第二个原因 + 报错指位**：13:30 同一句报错再现（run 256），实为 `later` 写成对象而非数组（与昨日 `cancel:false` 不同因同症）。补丁扩为三处（cancel 宽容、单对象归一、`laterProblem()` 指位指字段）；两份真回执均 `problem=none`；5 项测试 + typecheck 通过；全量 760 pass/14 fail 与改前一致。补丁更名 `agent-autoloop-later-receipt.patch` 并在干净上游验证 |
