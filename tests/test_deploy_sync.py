@@ -829,3 +829,73 @@ class TestOffsiteMirror(unittest.TestCase):
         self.assertGreaterEqual(len(pairs), 3, f"展开项过少：{[n for n, _ in pairs]}")
         missing = [n for n, p in pairs if not p.is_dir()]
         self.assertEqual([], missing, f"清单项不存在：{missing}")
+
+
+class TestUiGuard(unittest.TestCase):
+    """GUI 自动化物理闸门（2026-11-24 建立）。
+
+    背景：给时间机器加盘时用坐标点击在系统设置里连点七八次，中途弹出「抹掉 ZHITAI」
+    （=删掉 274GB 全部数据）。当时靠 Esc 救回来，说明**没出事靠临场反应，不是设计**。
+    这个闸门把三条判据变成机器：前台应用禁令 / 危险关键词先 Esc / 机密关键词绝不 Esc。
+    """
+
+    REPO = Path(__file__).resolve().parent.parent
+    SCRIPT = REPO / "bin" / "wb-ui-guard.py"
+    LOG = Path.home() / ".local" / "log" / "wb-ui-guard.log"
+    INTERLOCK = Path("/opt/homebrew/bin/cliclick")
+
+    def test_script_compiles(self):
+        subprocess.run([sys.executable, "-m", "py_compile", str(self.SCRIPT)], check=True)
+
+    def test_fault_injection_all_green(self):
+        """10 项故障注入必须全绿（每项只注入一个条件）。"""
+        p = subprocess.run([sys.executable, str(self.SCRIPT), "self-test"],
+                           capture_output=True, text=True, timeout=180)
+        out = p.stdout + p.stderr
+        self.assertEqual(0, p.returncode, f"故障注入未全通过:\n{out}")
+        m = re.search(r"(\d+)/(\d+) 通过", out)
+        self.assertIsNotNone(m, f"输出里没有通过计数:\n{out}")
+        got, total = int(m.group(1)), int(m.group(2))
+        self.assertEqual(got, total, f"故障注入未全通过：{got}/{total}\n{out}")
+        self.assertGreaterEqual(total, 10, "故障注入用例数不应减少（每条反证一个判据）")
+
+    def test_self_test_does_not_pollute_log(self):
+        """自检不得写真实日志。
+
+        status 的「历史拦截 N 次」如果混进自检噪音，这个计数就是假的 ——
+        等于用一个会自己涨的数字冒充「拦过几次」。
+        """
+        def lines():
+            if not self.LOG.exists():
+                return 0
+            return len(self.LOG.read_text(encoding="utf-8", errors="replace").splitlines())
+
+        before = lines()
+        subprocess.run([sys.executable, str(self.SCRIPT), "self-test"],
+                       capture_output=True, text=True, timeout=180)
+        self.assertEqual(before, lines(), "自检污染了真实日志，status 计数会失真")
+
+    def test_secret_branch_never_presses_escape(self):
+        """机密模态绝不能按 Esc —— 那会关掉恢复密钥的唯一一次显示。"""
+        p = subprocess.run([sys.executable, str(self.SCRIPT), "self-test"],
+                           capture_output=True, text=True, timeout=180)
+        hit = [ln for ln in (p.stdout + p.stderr).splitlines() if "恢复密钥" in ln]
+        self.assertTrue(hit, "自检里没有机密模态用例")
+        self.assertIn("esc=0", hit[0], f"机密分支按了 Esc：{hit[0]}")
+
+    def test_danger_tokens_and_deny_apps_present(self):
+        """危险词与前台禁令是 D1/D2 的全部依据，少一个就是少一道闸。"""
+        src = self.SCRIPT.read_text(encoding="utf-8")
+        for token in ("抹掉", "删除卷", "格式化", "erase", "wipe"):
+            self.assertIn(token, src, f"危险词缺 {token}")
+        for app in ("系统设置", "System Settings", "磁盘工具", "钥匙串访问"):
+            self.assertIn(app, src, f"前台禁令缺 {app}")
+
+    @unittest.skipUnless(INTERLOCK.exists(), "本机未装 cliclick")
+    def test_status_self_asserts_wiring(self):
+        """闸门必须能证明自己接在必经之路上，而不只是一份躺在仓库里的文件。"""
+        p = subprocess.run([sys.executable, str(self.SCRIPT), "status"],
+                           capture_output=True, text=True, timeout=60)
+        out = p.stdout + p.stderr
+        self.assertIn("interlock", out, f"status 没有在位断言:\n{out}")
+        self.assertIn(p.returncode, (0, 7), f"status 异常退出 rc={p.returncode}:\n{out}")

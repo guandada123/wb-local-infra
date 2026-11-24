@@ -204,7 +204,7 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
 - 脚本 `bin/wb-autoloop-backup.py`：`backup / check / drill / daily / self-test`
 - 定时 `launchd/com.user.autoloop-backup.plist`（必须先跑 `install.sh --apply` 部署脚本）
 - 12 项校验 + 15 项故障注入（A12 与它的对偶用例做过变异测试）；恢复演练真恢复到临时 `AGENT_AUTOLOOP_HOME` 后逐表比对
-- 快照含 `etc/`：`~/.local/etc/*.conf` 四个配置（心跳/记忆推送/备份打卡/memwatch）此前全部只有一份
+- 快照含 `etc/`：`~/.local/etc/*.conf`（心跳/记忆推送/备份打卡/镜像打卡/memwatch/UI 闸门状态）此前全部只有一份
 - **外部观测**（2026-11-24 接通）：healthchecks.io check `Autoloop Backup`（1 day / 2h grace），
   `daily` 打 `/start`、成功打 plain、失败打 `/fail`；ping URL 只在 `~/.local/etc/wb-autoloop-backup.conf`
 - **完整说明与残余风险**（整机无 TM/FileVault、落点卷未加密、作业无法自证未跑）：`docs/backup-hub-db.md`
@@ -227,3 +227,20 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
   `~/.local/etc/wb-offsite-mirror.conf`
 - **完整说明、残余风险（单设备/未加密/TM 仍未配）与「TM 为什么配不上」的实测记录**：
   `docs/offsite-mirror.md`
+
+## GUI 自动化闸门：点之前先看屏幕（2026-11-24 加）
+
+起因：给时间机器加盘时用坐标点击在系统设置里连点七八次，中途弹出「抹掉 ZHITAI」（=删 274GB 全部数据），
+靠 Esc 救回来 —— **没出事靠临场反应，不是设计**。本作业把「小心点」变成机器判据：
+
+- 脚本 `bin/wb-ui-guard.py`：`scan / forward / click / status / install-interlock / remove-interlock / self-test`
+- **D1 前台应用禁令**：系统设置 / 磁盘工具 / 钥匙串 / SecurityAgent 一律不接坐标点击（不读文本，最难绕过）
+- **D2 危险词 → 先 Esc 再拒**（抹掉/抹除/格式化/删除卷/erase/wipe…，英文按词边界防 `formatted` 误命中）
+- **D3 机密词 → 拒但绝不 Esc**（恢复密钥/recovery key；Esc 会关掉唯一一次显示）
+- **fail-closed**：看不懂的模态框、读不到屏幕，一律拒绝执行
+- **必须接线**：PATH 里 `/opt/homebrew/bin` 在 `~/.local/bin` 之前，所以在 local 放同名脚本挡不住；
+  `install-interlock` 把 `/opt/homebrew/bin/cliclick` 换成 shim（目录属 guan:admin，无需 sudo），可一键还原
+- **自身位断言**：`status` 的 rc 就是接线状态（0 已接 / 7 未接），避免「仓库里躺个文件当闸门」
+- 10 项故障注入 + 2 次变异测试（删「抹掉」→ 恰好 1 项红；机密分支按 Esc → 恰好 1 项红）；自检不写真实日志
+- **完整边界（只管 cliclick / 网页对话框不在 AX 树 / 未做实弹测试 / brew 升级会覆盖 shim）**：
+  `docs/gui-automation-guard.md`
