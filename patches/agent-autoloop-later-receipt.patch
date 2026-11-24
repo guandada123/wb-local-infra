@@ -1,0 +1,196 @@
+From 13d498ce100948f34c0ae2b9f3045bf809f898d2 Mon Sep 17 00:00:00 2001
+From: guandada123 <409899032@qq.com>
+Date: Tue, 24 Nov 2026 08:20:46 +0800
+Subject: [PATCH 1/2] =?UTF-8?q?fix(validate):=20later=20=E9=A1=B9=E5=86=99?=
+ =?UTF-8?q?=20cancel:false=20=E6=97=B6=E4=B8=8D=E5=86=8D=E6=95=B4=E4=BB=BD?=
+ =?UTF-8?q?=E5=9B=9E=E6=89=A7=E8=A2=AB=E6=8B=92?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+validLater 的 else 分支要求 cancel === undefined，于是显式写 "cancel": false
+（语义等同"没取消"）会让整份回执判不合规，其中的 later 全部丢失；
+而报错文案只提 key/at/about，看不出问题出在 cancel。
+
+实测（2026-11-23 run 252，stdout-1.log）：回执 JSON 合法、1 项、key/at(带时区)/about
+(418 字) 全合规，仍被判红，06:30 的复查从未排期。同类卡片 11-19(#34) 已出现一次。
+
+改为 cancel !== true：false 与「不写」等价，true 仍按取消处理。
+新增 tests/later-cancel.test.ts 三项断言（false 接受 / true 语义不变 /
+缺 at、缺 key、超 10 项仍拒收）。
+
+全量 tests/!(simulation)：797 项 14 失败，A/B 对照证明撤补丁同样 14 失败
+（installer/权限/进程组环境类），与本改动无关。
+---
+ protocol/validate.ts       |  2 +-
+ tests/later-cancel.test.ts | 26 ++++++++++++++++++++++++++
+ 2 files changed, 27 insertions(+), 1 deletion(-)
+ create mode 100644 tests/later-cancel.test.ts
+
+diff --git a/protocol/validate.ts b/protocol/validate.ts
+index 85859ae..943c6ab 100644
+--- a/protocol/validate.ts
++++ b/protocol/validate.ts
+@@ -145,7 +145,7 @@ const validLater = (later: Item) =>
+   text(later.key, 100) &&
+   (later.cancel === true
+     ? later.at === undefined
+-    : dateTime(later.at) && text(later.about, 4000) && later.cancel === undefined);
++    : dateTime(later.at) && text(later.about, 4000) && later.cancel !== true);
+ 
+ const validUsage = (usage: unknown) =>
+   usage === undefined ||
+diff --git a/tests/later-cancel.test.ts b/tests/later-cancel.test.ts
+new file mode 100644
+index 0000000..58362e4
+--- /dev/null
++++ b/tests/later-cancel.test.ts
+@@ -0,0 +1,26 @@
++import { test } from "node:test";
++import assert from "node:assert/strict";
++import { parseResult } from "../protocol/validate.ts";
++
++const at = "2026-11-24T06:30:00+08:00";
++
++// 2026-11-24：回执里写 "cancel": false 曾让整份回执被拒（later 全部丢失），
++// 但报错只说「要有 key/at/about」，看不出是 cancel 的问题。
++// false 与「不写」语义相同，不应被拒。
++test("cancel: false 等价于不取消", () => {
++  const r = parseResult({ outcome: "done", later: [{ key: "k", at, about: "再看", cancel: false }] });
++  assert.equal(r.later?.[0]?.key, "k");
++});
++
++test("cancel: true 仍按取消处理，且不许同时给 at", () => {
++  const r = parseResult({ outcome: "done", later: [{ key: "k", cancel: true }] });
++  assert.equal(r.later?.[0]?.cancel, true);
++  assert.throws(() => parseResult({ outcome: "done", later: [{ key: "k", at, about: "x", cancel: true }] }));
++});
++
++test("真正不合规的项仍被拒收（缺 at、缺 key、超过 10 项）", () => {
++  assert.throws(() => parseResult({ outcome: "done", later: [{ key: "k", about: "缺 at" }] }), "缺 at 应拒");
++  assert.throws(() => parseResult({ outcome: "done", later: [{ at, about: "缺 key" }] }), "缺 key 应拒");
++  const many = Array.from({ length: 11 }, (_, i) => ({ key: `k${i}`, at, about: "x" }));
++  assert.throws(() => parseResult({ outcome: "done", later: many }), "超过 10 项应拒");
++});
+-- 
+2.50.1 (Apple Git-155)
+
+
+From d58ca6fbd81fc39e61dcdd7a1da2508156726554 Mon Sep 17 00:00:00 2001
+From: guandada123 <409899032@qq.com>
+Date: Tue, 24 Nov 2026 17:01:24 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?fix(validate):=20later=20=E5=86=99=E6=88=90?=
+ =?UTF-8?q?=E5=8D=95=E4=B8=AA=E5=AF=B9=E8=B1=A1=E4=B9=9F=E8=AE=A4=EF=BC=9B?=
+ =?UTF-8?q?=E6=8A=A5=E9=94=99=E6=94=B9=E6=88=90=E6=8C=87=E4=BD=8D=E6=8C=87?=
+ =?UTF-8?q?=E5=AD=97=E6=AE=B5?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+2026-11-24 13:30（run 256）同一句报错又出现一次，但原因与昨天不同：
+回执把 later 写成 {"later":{"key":…}} 对象而非 [{…}] 数组，语义等价却被拒。
+实测两份真回执（252 写 cancel:false、256 写成对象）现在都 problem=none、later 保留。
+
+两处改动：
+1. parseResult 里若 later 是单个对象，归一成 [对象]——只安排一项时不该强制套数组。
+2. 报错不再只列「要求」，改为指出第几项、哪个字段：
+   laterProblem() 覆盖 非数组 / 超 10 项 / 缺 key / 多余字段 / cancel:true 带 at /
+   at 格式或时区 / about 缺失或超长。此前两种互不相干的原因共用一句提示，
+   只能靠拿真回执反向复现才能定位，代价过高。
+
+测试扩到 5 项（新增：单对象归一、报错含位置与字段）。
+typecheck 通过；全量 tests/!(simulation) 760 pass / 14 fail，失败集与改前完全一致
+（installer/权限/进程组环境类）。
+---
+ protocol/validate.ts       | 32 +++++++++++++++++++++++++++++++-
+ tests/later-cancel.test.ts | 26 ++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/protocol/validate.ts b/protocol/validate.ts
+index 943c6ab..495afad 100644
+--- a/protocol/validate.ts
++++ b/protocol/validate.ts
+@@ -152,6 +152,32 @@ const validUsage = (usage: unknown) =>
+   (isItem(usage) &&
+     Object.values(usage as Item).every((count) => typeof count === "number" && Number.isFinite(count) && count >= 0));
+ 
++/** 说清 later 到底哪一条、哪个字段不合规。
++ *
++ * 起因（2026-11-24）：此前只有一句「later 每一项要有 key…最多 10 项」，
++ * 而实际出现过两种互不相干的原因——写 "cancel": false（false 不等于「不写」）、
++ * 以及把 later 写成对象而不是数组——报错一模一样，只能靠反向复现真回执才能定位。
++ */
++function laterProblem(value: unknown): string {
++  if (value === undefined) return "";
++  if (!Array.isArray(value)) return "要写成数组，只安排一项也要写成 [ {…} ]";
++  if (value.length > 10) return `最多 10 项，现在 ${value.length} 项`;
++  for (const [i, item] of value.entries()) {
++    const n = `第 ${i + 1} 项`;
++    if (!isItem(item)) return `${n}要是对象`;
++    const extra = Object.keys(item).find((k) => !["key", "at", "about", "cancel"].includes(k));
++    if (extra) return `${n}有多余字段 ${extra}（只允许 key、at、about、cancel）`;
++    if (!text(item.key, 100)) return `${n}的 key 缺失或超过 100 字`;
++    if (item.cancel === true) {
++      if (item.at !== undefined) return `${n}写了 cancel: true 就不能同时给 at`;
++      continue;
++    }
++    if (!dateTime(item.at)) return `${n}的 at 要是带时区的 ISO 时间，例如 2026-11-24T06:30:00+08:00`;
++    if (!text(item.about, 4000)) return `${n}的 about 缺失或超过 4000 字`;
++  }
++  return "";
++}
++
+ export function parseResult(input: unknown): Result {
+   if (typeof input !== "object" || input === null || Array.isArray(input)) {
+     throw new InputError("结果要是一个 JSON 对象");
+@@ -176,8 +202,12 @@ export function parseResult(input: unknown): Result {
+   if (!listOf(result.resolve, 50, validResolve)) {
+     throw new InputError("resolve 每一项要有卡片编号和 1000 字以内的核实依据，最多 50 项");
+   }
++  if (isItem(result.later)) result.later = [result.later];   // 只安排一项时写成对象也认
+   if (!listOf(result.later, 10, validLater)) {
+-    throw new InputError("later 每一项要有 key，以及带时区的 at 和 about，或者 cancel: true，最多 10 项");
++    const why = laterProblem(result.later);
++    throw new InputError(
++      `later 不合法：${why || "每一项要有 key、带时区的 at 和 about，或 cancel: true，最多 10 项"}`,
++    );
+   }
+   if (result.events !== undefined) {
+     if (!items(result.events, 100)) throw new InputError("events 最多 100 项");
+diff --git a/tests/later-cancel.test.ts b/tests/later-cancel.test.ts
+index 58362e4..1b8366e 100644
+--- a/tests/later-cancel.test.ts
++++ b/tests/later-cancel.test.ts
+@@ -24,3 +24,29 @@ test("真正不合规的项仍被拒收（缺 at、缺 key、超过 10 项）",
+   const many = Array.from({ length: 11 }, (_, i) => ({ key: `k${i}`, at, about: "x" }));
+   assert.throws(() => parseResult({ outcome: "done", later: many }), "超过 10 项应拒");
+ });
++
++// 2026-11-24 13:30（run 256）：later 被写成对象 {…} 而不是数组 [{…}]，
++// 语义等价却被拒，报错与 cancel:false 那次一字不差。
++test("later 写成单个对象时按一项处理", () => {
++  const r = parseResult({ outcome: "done", later: { key: "k", at, about: "再看" } });
++  assert.ok(Array.isArray(r.later));
++  assert.equal(r.later?.length, 1);
++  assert.equal(r.later?.[0]?.key, "k");
++});
++
++test("不合规时，报错要指出第几项、哪个字段", () => {
++  const bad = (later: unknown) => {
++    try {
++      parseResult({ outcome: "done", later });
++      return "(没报错)";
++    } catch (e) {
++      return (e as Error).message;
++    }
++  };
++  assert.match(bad([{ key: "k", about: "缺 at" }]), /第 1 项.*at/);
++  assert.match(bad([{ key: "k", at, about: "x", extra: 1 }]), /第 1 项.*多余字段 extra/);
++  assert.match(bad([{ key: "k", at, about: "x", cancel: true }]), /第 1 项.*不能同时给 at/);
++  assert.match(bad("字符串"), /要写成数组/);
++  const eleven = Array.from({ length: 11 }, (_, i) => ({ key: `k${i}`, at, about: "x" }));
++  assert.match(bad(eleven), /最多 10 项，现在 11 项/);
++});
+-- 
+2.50.1 (Apple Git-155)
+
