@@ -234,13 +234,13 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
 靠 Esc 救回来 —— **没出事靠临场反应，不是设计**。本作业把「小心点」变成机器判据：
 
 - 脚本 `bin/wb-ui-guard.py`：`scan / forward / click / status / install-interlock / remove-interlock / self-test`
-- **D1 前台应用禁令**：系统设置 / 磁盘工具 / 钥匙串 / SecurityAgent 一律不接坐标点击（不读文本，最难绕过）
+- **D1 前台应用禁令**：系统设置 / 磁盘工具 / 密码(钥匙串) / SecurityAgent 一律不接坐标点击，**名字与 bundle id 双轨**（macOS 26 把钥匙串改成「密码」，只认名字会整条失效 —— 实测漏拦过）
 - **D2 危险词 → 先 Esc 再拒**（抹掉/抹除/格式化/删除卷/erase/wipe…，英文按词边界防 `formatted` 误命中）
 - **D3 机密词 → 拒但绝不 Esc**（恢复密钥/recovery key；Esc 会关掉唯一一次显示）
 - **fail-closed**：看不懂的模态框、读不到屏幕，一律拒绝执行
 - **必须接线**：PATH 里 `/opt/homebrew/bin` 在 `~/.local/bin` 之前，所以在 local 放同名脚本挡不住；
   `install-interlock` 把 `/opt/homebrew/bin/cliclick` 换成 shim（目录属 guan:admin，无需 sudo），可一键还原
 - **自身位断言**：`status` 的 rc 就是接线状态（0 已接 / 7 未接），避免「仓库里躺个文件当闸门」
-- 10 项故障注入 + 2 次变异测试（删「抹掉」→ 恰好 1 项红；机密分支按 Esc → 恰好 1 项红）；自检不写真实日志
+- 12 项故障注入 + 3 次变异测试（删「抹掉」/ 机密分支按 Esc / 去掉 bundle 判据，各恰好 1 项红）；自检不写真实日志
 - **完整边界（只管 cliclick / 网页对话框不在 AX 树 / 未做实弹测试 / brew 升级会覆盖 shim）**：
   `docs/gui-automation-guard.md`

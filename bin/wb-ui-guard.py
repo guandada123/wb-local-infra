@@ -28,7 +28,7 @@
     wb-ui-guard.py status               # 闸门是否真的接上线（自身位断言）
     wb-ui-guard.py install-interlock    # 替换 /opt/homebrew/bin/cliclick（可逆）
     wb-ui-guard.py remove-interlock     # 还原 brew 软链
-    wb-ui-guard.py self-test            # 10 项故障注入
+    wb-ui-guard.py self-test            # 12 项故障注入
 
 退出码：0 放行 / 2 危险模态(已 Esc) / 3 前台应用被禁 / 4 读不到屏幕 / 5 机密模态(未 Esc)
         / 6 未知模态 / 7 未接线仍被直接调用
@@ -51,10 +51,18 @@ INTERLOCK = Path("/opt/homebrew/bin/cliclick")
 FALLBACK_REAL = "/opt/homebrew/Cellar/cliclick/5.1/bin/cliclick"
 
 # D1：这些前台应用一律不接坐标点击。判据不读文本，只认应用身份。
+# 两套并行：名字给人看，bundle id 给机器判。**只靠名字会漏**—— macOS 26 把
+# 「钥匙串访问」改名为「密码」(Passwords)，进程名一变，名字表就整条失效（2026-11-24 实测踩到：
+# 前台 Passwords 时 cliclick 仍被放行）。bundle id 由 App 自身声明，升级改名也不变。
 DENY_APPS = (
     "System Settings", "系统设置", "System Preferences", "系统偏好设置",
-    "Disk Utility", "磁盘工具", "Keychain Access", "钥匙串访问",
+    "Disk Utility", "磁盘工具", "Keychain Access", "钥匙串访问", "Passwords", "密码",
     "SecurityAgent", "securityd", "Installer", "安装器", "Migration Assistant",
+)
+DENY_BUNDLES = (
+    "com.apple.systempreferences", "com.apple.DiskUtility", "com.apple.Passwords",
+    "com.apple.keychainaccess", "com.apple.SecurityAgent", "com.apple.Installer",
+    "com.apple.MigrateAssistant", "com.apple.MobileSMS",
 )
 
 # D2：破坏性动作。中文按子串（中文没有词边界问题），英文按词边界（防 formatted 误命中）。
@@ -115,6 +123,7 @@ function run() {
     if (!front) { out.err = "no-frontmost"; return JSON.stringify(out); }
     out.front = front;
     var p = se.processes.byName(front);
+    try { out.bundle = String(p.bundleIdentifier() || ""); } catch (eb) { out.bundle = ""; }
     var wins = p.windows();
     for (var wi = 0; wi < wins.length; wi++) {
       var w = wins[wi];
@@ -193,6 +202,7 @@ def scan_screen():
     except ValueError:
         return {"front": "", "groups": [], "err": "JXA 输出不可解析"}
     d.setdefault("front", "")
+    d.setdefault("bundle", "")
     d.setdefault("groups", [])
     return d
 
@@ -210,7 +220,7 @@ def _hit(needles_cn, needles_en, texts):
     return sorted(set(out))
 
 
-def classify(front, groups, read_ok=True):
+def classify(front, groups, read_ok=True, bundle=""):
     """纯函数：不碰屏幕、不按键。self-test 直接注入假数据反证它。"""
     if not read_ok:
         return VERDICT_UNREAD, ["读不到前台窗口"]
@@ -221,6 +231,10 @@ def classify(front, groups, read_ok=True):
     sec = _hit(SECRET_CN, SECRET_EN, all_texts)
     if sec:
         return VERDICT_SECRET, sec
+    # 名字与 bundle 任一命中即拒。名字表会因 App 改名失效（钥匙串访问→密码），
+    # bundle id 不会，所以两条都留：名字给人读日志，bundle 给机器兜底。
+    if bundle and any(bundle.lower() == b.lower() for b in DENY_BUNDLES):
+        return VERDICT_DENY, [front or bundle, bundle]
     if front and any(a == front or a in front for a in DENY_APPS):
         return VERDICT_DENY, [front]
     if groups:
@@ -237,7 +251,7 @@ def enforce(what, esc_fn=press_escape, scanner=None):
     """过闸门。返回 rc；0 才允许继续。"""
     s = (scanner or scan_screen)()
     verdict, hits = classify(s.get("front", ""), s.get("groups", []),
-                             read_ok=not s.get("err"))
+                             read_ok=not s.get("err"), bundle=s.get("bundle", ""))
     if verdict == VERDICT_OK:
         return RC_OK
     if verdict == VERDICT_BLOCK:
@@ -392,13 +406,13 @@ def cmd_remove(_args):
     return RC_OK
 
 
-def _mk(front, texts, kind="sheet"):
+def _mk(front, texts, kind="sheet", bundle=""):
     groups = [{"kind": kind, "texts": texts}] if texts is not None else []
-    return {"front": front, "groups": groups, "err": None}
+    return {"front": front, "groups": groups, "err": None, "bundle": bundle}
 
 
 def self_test():
-    """10 项故障注入：每项只注入一个条件，断言判定与「是否按 Esc」都对。"""
+    """12 项故障注入：每项只注入一个条件，断言判定与「是否按 Esc」都对。"""
     global _LOG_ENABLED
     _LOG_ENABLED = False
     calls = {"esc": 0}
@@ -432,6 +446,12 @@ def self_test():
         ("关键词只在标题不在模态", lambda: _mk("Terminal", None), VERDICT_OK, 0),
         # "formatted" 不应命中 \bformat\b；命中就会误报，且按 Esc 会打断正常流程
         ("formatted 不误命中 format", lambda: _mk("Disk Utility", ["磁盘已 formatted"]),
+         VERDICT_DENY, 0),
+        # macOS 26 把「钥匙串访问」改名「密码」→ 进程名变 Passwords，名字表曾整套失效
+        ("改名后 Passwords 仍被拦", lambda: _mk("Passwords", None, bundle="com.apple.Passwords"),
+         VERDICT_DENY, 0),
+        # 名字不在表内、只有 bundle 命中 —— 删掉 bundle 判据这一项必须变红
+        ("只靠 bundle 命中", lambda: _mk("SomeApp", None, bundle="com.apple.Passwords"),
          VERDICT_DENY, 0),
     ]
     passed = sum(1 for c in cases if run_case(*c))

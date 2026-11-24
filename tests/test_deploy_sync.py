@@ -857,7 +857,7 @@ class TestUiGuard(unittest.TestCase):
         self.assertIsNotNone(m, f"输出里没有通过计数:\n{out}")
         got, total = int(m.group(1)), int(m.group(2))
         self.assertEqual(got, total, f"故障注入未全通过：{got}/{total}\n{out}")
-        self.assertGreaterEqual(total, 10, "故障注入用例数不应减少（每条反证一个判据）")
+        self.assertGreaterEqual(total, 12, "故障注入用例数不应减少（每条反证一个判据）")
 
     def test_self_test_does_not_pollute_log(self):
         """自检不得写真实日志。
@@ -888,8 +888,11 @@ class TestUiGuard(unittest.TestCase):
         src = self.SCRIPT.read_text(encoding="utf-8")
         for token in ("抹掉", "删除卷", "格式化", "erase", "wipe"):
             self.assertIn(token, src, f"危险词缺 {token}")
-        for app in ("系统设置", "System Settings", "磁盘工具", "钥匙串访问"):
+        for app in ("系统设置", "System Settings", "磁盘工具", "钥匙串访问", "Passwords"):
             self.assertIn(app, src, f"前台禁令缺 {app}")
+        # 名字会因 App 改名失效（钥匙串访问→密码，2026-11-24 实测漏拦），bundle id 是兜底
+        for bid in ("com.apple.Passwords", "com.apple.systempreferences", "com.apple.DiskUtility"):
+            self.assertIn(bid, src, f"bundle 禁令缺 {bid}")
 
     @unittest.skipUnless(INTERLOCK.exists(), "本机未装 cliclick")
     def test_status_self_asserts_wiring(self):

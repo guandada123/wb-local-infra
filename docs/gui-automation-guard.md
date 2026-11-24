@@ -18,7 +18,7 @@
 
 | id | 判据 | 触发条件 | 动作 |
 |---|---|---|---|
-| D1 | 前台应用禁令 | 前台是 系统设置 / 磁盘工具 / 钥匙串访问 / SecurityAgent / 安装器 | 拒绝执行坐标点击，**不按键** |
+| D1 | 前台应用禁令 | 前台是 系统设置 / 磁盘工具 / 密码(钥匙串) / SecurityAgent / 安装器，**按名字或 bundle id 任一命中** | 拒绝执行坐标点击，**不按键** |
 | D2 | 危险关键词 | 模态框文本含 抹掉 / 抹除 / 格式化 / 初始化 / 删除卷 / erase / wipe / format… | **先按 Esc**，再拒绝 |
 | D3 | 机密关键词 | 模态框文本含 恢复密钥 / recovery key | 拒绝，**绝不按 Esc** |
 | — | fail-closed | 模态框存在但看不懂 / 屏幕读不到 / AX 超时 | 一律拒绝 |
@@ -29,6 +29,11 @@
   等于把用户的救命钥匙丢掉。这两件事共用一个「拦截」分支是错的。
 - **英文词按词边界匹配**（`\bformat\b`），否则 `formatted` 会误命中，把正常流程打断；
   中文按子串（中文没有词边界问题）。
+- **D1 不能只认应用名**。macOS 26 把「钥匙串访问」改名为「密码」，进程名变成 `Passwords`，
+  名字表整条失效 —— 2026-11-24 实弹测试时，前台就是 `Passwords`，`cliclick p` 照样放行（rc=0）。
+  修法：名字与 **bundle id** 双轨，任一命中即拒；bundle id 由 App 自身声明，改名/升级不变。
+- **前台是谁必须在同一条命令里判定完**。每条 shell 命令都会把 WorkBuddy 抢回前台，
+  所以「先开 A 应用、再单独跑一次 cliclick」测出来的永远是 WorkBuddy —— 会得到假放行。
 
 ## 三、为什么它必须接线
 
@@ -60,8 +65,9 @@ wb-ui-guard.py status      # rc=0 才算接线；rc=7 表示没接
 1. **只管 `cliclick`**。直接 `osascript -e '... click at {x,y}'`、或 AppleScript 的 `AXPress`
    不走这道闸门。它不是沙箱。
 2. **只认前台应用与原生模态框**。网页里的 confirm 框不在 AX 树里，D1 只能靠前台应用兜。
-3. **没做过实弹测试**。破坏性对话框刻意不制造——判据用 10 项故障注入 + 2 次变异测试反证，
-   而不是拿真盘试。
+3. **实弹测试只做了 D1**。2026-11-24 用「密码」App 验证过：前台为 `Passwords` 时
+   `cliclick p` 被拒（rc=3、无坐标输出、日志留痕），退出该 App 后恢复放行（rc=0）。
+   **破坏性对话框仍然刻意不制造** —— D2/D3 靠 12 项故障注入 + 3 次变异测试反证，不拿真盘试。
 4. **`brew upgrade cliclick` 会覆盖 shim**，状态退回「未接线」；`status` 会报 rc=7，重跑
    `install-interlock` 即可。这是设计上的可发现降级，不是静默失效。
 5. **自检不写真实日志**。否则 `status` 的「历史拦截 N 次」会混进自检噪音，变成自己会涨的假计数。
@@ -69,7 +75,7 @@ wb-ui-guard.py status      # rc=0 才算接线；rc=7 表示没接
 ## 六、维护
 
 ```bash
-python3 bin/wb-ui-guard.py self-test        # 10 项，每项只注入一个条件
+python3 bin/wb-ui-guard.py self-test        # 12 项，每项只注入一个条件
 python3 bin/wb-ui-guard.py scan             # 只判定，不动屏幕（排障第一步）
 python3 bin/wb-ui-guard.py install-interlock   # 接线
 python3 bin/wb-ui-guard.py remove-interlock    # 还原 brew 软链
@@ -81,7 +87,8 @@ python3 bin/wb-ui-guard.py remove-interlock    # 还原 brew 软链
 
 - 把「抹掉」从 `BLOCK_CN` 删掉 → `抹掉 ZHITAI 确认框` 那一项必须变红
 - 让机密分支也调 `press_escape()` → `恢复密钥（不许按 Esc）` 那一项必须变红
+- 去掉 bundle 判据、只留名字 → `只靠 bundle 命中` 那一项必须变红
 
-两条都实测过：各让自检从 10/10 掉到 9/10，且**只有那一项**红。
+三条都实测过：前两条各让自检从 12/12 掉到 11/12，第三条同样只掉 1 项，且**只有那一项**红。
 
 拦截记录：`~/.local/log/wb-ui-guard.log`（内盘；写外置卷会 TCC EPERM）。
