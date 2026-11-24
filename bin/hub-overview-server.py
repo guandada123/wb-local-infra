@@ -25,8 +25,10 @@ QUEUE = "/Volumes/ZHITAI/WorkBuddy/Claw/.autopilot/QUEUE.md"
 CLAW_REPO = os.path.dirname(os.path.dirname(QUEUE))          # <repo>/.autopilot/QUEUE.md → <repo>
 CLAW_SCRIPTS = os.path.join(CLAW_REPO, "scripts")
 BASE_DIR = os.path.dirname(CLAW_REPO)                        # 各项目同级父目录，避免逐条写死绝对路径
-# 项目卡真源：只在同级目录里按名字探测 .git，找不到就诚实标「未定位」
-PROJECTS = [("Claw", "Claw", "P0"), ("QTS", "QTS", "P1"),
+# 项目卡真源：sub 可为目录名（相对 BASE_DIR）或绝对路径（~ 展开）。
+# QTS 不在外置卷同级目录，2026-11-25 由 docker inspect 的 bind mount 查出真实路径。
+PROJECTS = [("Claw", "Claw", "P0"),
+            ("QTS", os.path.expanduser("~/WorkBuddy/QuantTradingSystem"), "P1"),
             ("StockInsight", "StockInsight", "P1"), ("PMF", "project-monitor-fusion", "P1"),
             ("EAK", "engineering-audit-kit", "P2")]
 PROXY_LOGS = [os.path.expanduser("~/Library/Logs/proxy-deepseek.stdout.log"),  # v1.8.0 起（持久路径）
@@ -35,7 +37,7 @@ PROXY_TAIL = 4 * 1024 * 1024   # 只读尾部 4MB（约 10 天量），避免日
 PROXY_DAILY = os.path.expanduser("~/.agent-autoloop/hub-proxy-daily.json")
 # 第三方补丁的落点（上游仓的克隆）。重装/升级会整目录覆盖，补丁随之消失。
 # 仅"等它再出错"太慢（可能几周），故每次采集直接核对两处签名。
-PATCH_VALIDATE = os.path.expanduser("~/.agent-autoloop/app/protocol/validate.ts")  # 每日计数快照（补重启丢数）
+PATCH_VALIDATE = os.path.expanduser("~/.agent-autoloop/app/protocol/validate.ts")
 CI_CACHE = os.path.expanduser("~/.agent-autoloop/hub-ci-cache.json")       # CI 结果后台缓存（15 分钟过期）
 _proxy_cache = {"key": None, "stats": None}
 _status_cache = {"ts": 0, "data": None}
@@ -556,7 +558,7 @@ def collect():
     # ---- 应用卡：同级目录探测 git 真源（找不到就诚实标「未定位」，不伪造状态）----
     apps = []
     for name, sub, prio in PROJECTS:
-        p = os.path.join(BASE_DIR, sub)
+        p = sub if os.path.isabs(sub) else os.path.join(BASE_DIR, sub)
         gi = git_info_cached(p) if os.path.isdir(os.path.join(p, ".git")) else None
         # CI 缓存的 key 是目录名（脚本按目录扫描），显示名不同，两者都试
         _repos = ci.get("repos") or {}
@@ -765,6 +767,23 @@ def invalidate_caches():
     _status_cache["data"] = None
     _ci_trigger["at"] = 0
 
+class QuietServer(ThreadingHTTPServer):
+    """客户端中途断开（刷新/关页/超时重试）会让 wfile.write 抛 BrokenPipe/ConnectionReset，
+    socketserver 默认打整段 traceback 到 stderr。这些不是服务故障，却会淹没真错误
+    （2026-11-25 实测 err 日志里出现过 1 次 BrokenPipe、1 次 ConnectionReset）。
+    只静默这两类，其它异常照旧上抛。"""
+
+    daemon_threads = True
+
+    def handle_error(self, request, client_address):
+        import sys
+
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
         """健康检查/监控工具常用 HEAD，返回与 GET 一致的元信息，不返回 body"""
@@ -840,4 +859,4 @@ if __name__ == "__main__":
     if args.static_root:
         BASE = os.path.realpath(args.static_root)   # 内盘副本运行时静态根不等于脚本位置
     print(f"[hub-overview] 只读聚合 API 就绪 → http://127.0.0.1:{args.port}  (静态根 {BASE})")
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    QuietServer(("127.0.0.1", args.port), Handler).serve_forever()

@@ -13,7 +13,10 @@ import argparse, json, os, re, shutil, subprocess, sys
 
 QUEUE = "/Volumes/ZHITAI/WorkBuddy/Claw/.autopilot/QUEUE.md"
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(QUEUE)))  # <base>/Claw/.autopilot/QUEUE.md
-PROJECTS = ["Claw", "StockInsight", "project-monitor-fusion", "engineering-audit-kit"]
+# name 可为目录名（相对 BASE_DIR）或绝对路径（~ 展开）。
+# QTS 不在外置卷同级目录，2026-11-25 由 docker inspect 的 bind mount 查出真实路径。
+PROJECTS = ["Claw", "StockInsight", "project-monitor-fusion", "engineering-audit-kit",
+            os.path.expanduser("~/WorkBuddy/QuantTradingSystem")]
 GH = shutil.which("gh") or "/opt/homebrew/bin/gh"
 ICON = {"success": "✅", "failure": "❌", "cancelled": "⚪️", "skipped": "⏭", None: "⏳"}
 
@@ -70,7 +73,13 @@ def main():
     # 额外纳入：记忆备份仓（~/.workbuddy/user-*-personal）。它是记忆的保险，
     # 但此前从未进过 CI 监控——2026-11-24 发现它连续 3 次「0 步骤失败」竟无人察觉。
     import glob
-    targets = [(n, os.path.join(BASE_DIR, n)) for n in PROJECTS]
+    # 缓存 key 用显示名（工作台按 name/sub 两路查），目录名不同时在此映射
+    ALIAS = {"QuantTradingSystem": "QTS"}
+    targets = []
+    for n in PROJECTS:
+        base = os.path.basename(n.rstrip("/")) or n
+        targets.append((ALIAS.get(base, base),
+                        n if os.path.isabs(n) else os.path.join(BASE_DIR, n)))
     for extra in sorted(glob.glob(os.path.expanduser("~/.workbuddy/user-*-personal"))):
         if os.path.isdir(os.path.join(extra, ".git")):
             targets.append(("workbuddy-user-memory", extra))
