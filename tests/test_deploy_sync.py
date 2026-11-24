@@ -899,3 +899,30 @@ class TestUiGuard(unittest.TestCase):
         out = p.stdout + p.stderr
         self.assertIn("interlock", out, f"status 没有在位断言:\n{out}")
         self.assertIn(p.returncode, (0, 7), f"status 异常退出 rc={p.returncode}:\n{out}")
+
+
+class TestMirrorLogTimestamp(unittest.TestCase):
+    """镜像日志必须每行带时间戳（2026-11-24 建立）。
+
+    起因：用 launchd 触发验证时，日志里 4 小时前那次（未配打卡 URL）与刚才这次混在一起，
+    出现「同一轮既未配置、又打卡 200」的错觉，白查十分钟。作业每天一跑、且可能与手工 run
+    重叠，没有时间戳就无法把一段输出归给某一次运行。
+    """
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "wb-offsite-mirror.py"
+
+    def test_log_line_has_timestamp(self):
+        """_log 只 print，日志文件由 launchd 的 StandardOutPath 重定向产生 —— 所以捕 stdout。"""
+        import contextlib
+        import importlib.util
+        import io
+
+        spec = importlib.util.spec_from_file_location("wb_offsite_mirror_mod", self.SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            mod._log("探针行")
+        line = buf.getvalue().strip()
+        self.assertRegex(line, r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 探针行$")

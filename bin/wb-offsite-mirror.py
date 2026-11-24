@@ -85,7 +85,13 @@ RSYNC_TMP_ALLOW = 64 * 1024**2  # 并发文件的固定开销
 
 
 def _log(msg: str) -> None:
-    print(msg, flush=True)
+    """每行带时间戳。
+
+    为什么：2026-11-24 用 launchd 触发验证时，日志把 4 小时前那次（当时还没配打卡 URL）
+    和刚才这次混在一起，出现「同一轮里既未配置打卡、又打卡 200」的错觉，白查了十分钟。
+    这个作业每天只跑一次、且可能与手工 run 重叠，没有时间戳就无法把一段输出归给某一次运行。
+    """
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
 
 
 def device_of(p: Path) -> int:
