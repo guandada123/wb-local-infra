@@ -26,6 +26,26 @@ def run(argv, timeout=20):
     except Exception as e:
         return -1, "", f"{type(e).__name__}: {e}"
 
+# GitHub 在「账号付款失败 / Actions 额度触顶」时会直接不启动 job：
+# 该 run 只有 2~4 秒、0 个步骤，结论仍是 failure —— 看起来像代码红，实际没跑。
+# 机械判据用耗时（≤15s）而非猜测；文案明确写「疑」，不代替去 Billing 核实。
+NOT_STARTED_SECS = 15
+
+def looks_not_started(head):
+    if (head.get("conclusion") or "") != "failure":
+        return False, 0
+    a, b = head.get("createdAt"), head.get("updatedAt")
+    if not a or not b:
+        return False, 0
+    try:
+        from datetime import datetime
+        fa = datetime.fromisoformat(a.replace("Z", "+00:00"))
+        fb = datetime.fromisoformat(b.replace("Z", "+00:00"))
+        secs = int((fb - fa).total_seconds())
+    except Exception:
+        return False, 0
+    return (0 <= secs <= NOT_STARTED_SECS), secs
+
 def repo_of(path):
     rc, out, _ = run(["git", "-C", path, "remote", "get-url", "origin"], timeout=6)
     if rc != 0 or not out:
@@ -47,10 +67,17 @@ def main():
             print(msg)
         return 0
 
-    lines = [f"CI 状态（{len(PROJECTS)} 仓 · 各取最近 3 次）"]
+    # 额外纳入：记忆备份仓（~/.workbuddy/user-*-personal）。它是记忆的保险，
+    # 但此前从未进过 CI 监控——2026-11-24 发现它连续 3 次「0 步骤失败」竟无人察觉。
+    import glob
+    targets = [(n, os.path.join(BASE_DIR, n)) for n in PROJECTS]
+    for extra in sorted(glob.glob(os.path.expanduser("~/.workbuddy/user-*-personal"))):
+        if os.path.isdir(os.path.join(extra, ".git")):
+            targets.append(("workbuddy-user-memory", extra))
+
+    lines = [f"CI 状态（{len(targets)} 仓 · 各取最近 3 次）"]
     repos = {}
-    for name in PROJECTS:
-        path = os.path.join(BASE_DIR, name)
+    for name, path in targets:
         if not os.path.isdir(os.path.join(path, ".git")):
             lines.append(f"  ⚪️ {name}: 本地无 git 仓库，跳过")
             repos[name] = {"conclusion": None, "reason": "no-git"}
@@ -61,7 +88,7 @@ def main():
             repos[name] = {"conclusion": None, "reason": "no-remote"}
             continue
         rc, out, err = run([GH, "run", "list", "--repo", repo, "--limit", "3",
-                            "--json", "status,conclusion,workflowName,displayTitle,createdAt"])
+                            "--json", "status,conclusion,workflowName,displayTitle,createdAt,updatedAt"])
         if rc != 0:
             reason = (err or "未知错误").splitlines()[0][:80]
             lines.append(f"  ⚪️ {name} ({repo}): 查询失败 · {reason}")
@@ -82,10 +109,16 @@ def main():
         seq = "/".join((r.get("conclusion") or r.get("status") or "?") for r in runs)
         when = (head.get("createdAt") or "").replace("T", " ")[5:16]
         wf = (head.get("workflowName") or "")[:26]
+        not_started, secs = looks_not_started(head)
         repos[name] = {"repo": repo, "conclusion": state, "seq": seq,
-                       "at": when, "workflow": wf, "title": (head.get("displayTitle") or "")[:52]}
-        lines.append(f"  {ICON.get(state, '❓')} {name} ({repo})")
-        lines.append(f"     最近: {state} · {wf} · {when}")
+                       "at": when, "workflow": wf, "title": (head.get("displayTitle") or "")[:52],
+                       "not_started": not_started, "secs": secs}
+        icon = "⛔" if not_started else ICON.get(state, "❓")
+        lines.append(f"  {icon} {name} ({repo})")
+        if not_started:
+            lines.append(f"     最近: 未启动 · 仅 {secs}s 即结束 · 疑 GitHub 计费/额度（去 Billing 核实）")
+        else:
+            lines.append(f"     最近: {state} · {wf} · {when}")
         lines.append(f"     近 3 次: {seq}")
         if head.get("displayTitle"):
             lines.append(f"     提交: {head['displayTitle'][:52]}")

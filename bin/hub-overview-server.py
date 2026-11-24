@@ -526,8 +526,12 @@ def collect():
         # CI 缓存的 key 是目录名（脚本按目录扫描），显示名不同，两者都试
         _repos = ci.get("repos") or {}
         c = _repos.get(sub) or _repos.get(name) or {}
+        # 计费/额度拦截的 run 只有 2~4 秒、0 步骤，conclusion 仍是 failure。
+        # 直接画 ❌ 会让人以为代码红 —— 这里单独标「未启动」（标签由 hub-ci-status.py 给）。
         icon = {"success": "✅", "failure": "❌"}.get(c.get("conclusion"), "⏳")
-        if not ci:
+        if c.get("not_started"):
+            ci_meta = f"⛔ 未启动(疑计费) · {c.get('secs', 0)}s · {c.get('at', '')}".strip(" ·")
+        elif not ci:
             ci_meta = "采集中…（后台首次约 9s）"
         elif c:
             ci_meta = f"{icon} {c.get('conclusion') or c.get('reason') or '无记录'} · {c.get('at', '')}".strip(" ·")
