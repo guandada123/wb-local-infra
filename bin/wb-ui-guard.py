@@ -122,23 +122,53 @@ function run() {
     }
     if (!front) { out.err = "no-frontmost"; return JSON.stringify(out); }
     out.front = front;
-    var p = se.processes.byName(front);
-    try { out.bundle = String(p.bundleIdentifier() || ""); } catch (eb) { out.bundle = ""; }
-    var wins = p.windows();
-    for (var wi = 0; wi < wins.length; wi++) {
-      var w = wins[wi];
-      var sheets = [];
-      try { sheets = w.sheets(); } catch (e) {}
-      for (var si = 0; si < sheets.length; si++) {
-        out.groups.push({ kind: "sheet", texts: collect(sheets[si]) });
-      }
-      var sub = "", role = "";
-      try { sub = String(w.subrole() || ""); } catch (e) {}
-      try { role = String(w.role() || ""); } catch (e) {}
-      if (sub === "AXDialog" || role === "AXDialog" || sub === "AXSystemDialog") {
-        out.groups.push({ kind: "dialog", texts: collect(w) });
+    var pf = se.processes.byName(front);
+    try { out.bundle = String(pf.bundleIdentifier() || ""); } catch (eb) { out.bundle = ""; }
+    // 扫描范围 = 所有可见进程的模态窗口，不只是前台 App。
+    // 为什么（2026-11-24 实测）：坐标点击命中的是屏幕最上层的窗口，与「谁在前台」无关。
+    // 当时两个对话框浮在最上面，但属主是后台的 System Events，只扫前台时报告「0 个模态」——
+    // 等于在最该拦住的位置瞎了。
+    function scanProc(p) {
+      var pname = "";
+      try { pname = String(p.name() || ""); } catch (e) { return; }
+      var wins = [];
+      try { wins = p.windows(); } catch (e) { return; }
+      for (var wi = 0; wi < wins.length; wi++) {
+        var w = wins[wi];
+        var sheets = [];
+        try { sheets = w.sheets(); } catch (e) {}
+        for (var si = 0; si < sheets.length; si++) {
+          out.groups.push({ kind: "sheet", app: pname, texts: collect(sheets[si]) });
+        }
+        var sub = "", role = "";
+        try { sub = String(w.subrole() || ""); } catch (e) {}
+        try { role = String(w.role() || ""); } catch (e) {}
+        if (sub === "AXDialog" || role === "AXDialog" || sub === "AXSystemDialog") {
+          out.groups.push({ kind: "dialog", app: pname, texts: collect(w) });
+        }
       }
     }
+    // 两个都不完美，取中间：
+    //   只扫前台        → 漏掉后台属主的置顶对话框（实测：System Events 的框浮在最上面却没被看见）
+    //   扫全部 87 个进程 → 实测 7.9 秒，每次点击都等 8 秒不可接受
+    // 所以扫「前台 + 已知会弹系统对话框的属主」。这些进程都是后台进程（visible=false），
+    // 按 visible 过滤恰好会把它们排除，这是第一版扫不到的真正原因。
+    var procs = [pf];
+    // 注意：不包含 NotificationCenter。它的「对话框」是通知（实测无可点按钮、Esc 关不掉），
+    // 当成阻塞项会把闸门变成死锁：一条关不掉的通知就能让所有点击永远被拒（实测 rc=6 挡死）。
+    // 通知不会挡住坐标点击的落点，因此不参与判定。
+    var extra = ["System Events", "UserNotificationCenter",
+                 "UserNotificationCenterHelper", "SecurityAgent", "CoreServicesUIAgent"];
+    // 关键性能细节：byName 查「不存在的进程」会卡好几秒（实测 7 次查询把总耗时推到 11 秒）。
+    // 先一次性取全部进程名（一次调用），只对确实存在的属主发 windows() 查询。
+    var allNames = [];
+    try { allNames = se.processes.name(); } catch (e4) {}
+    for (var ei = 0; ei < extra.length; ei++) {
+      if (extra[ei] === front) continue;
+      if (allNames.length && allNames.indexOf(extra[ei]) < 0) continue;
+      try { procs.push(se.processes.byName(extra[ei])); } catch (e3) {}
+    }
+    for (var pi = 0; pi < procs.length; pi++) scanProc(procs[pi]);
   } catch (e) { out.err = String(e); }
   return JSON.stringify(out);
 }

@@ -929,3 +929,40 @@ class TestMirrorLogTimestamp(unittest.TestCase):
             mod._log("探针行")
         line = buf.getvalue().strip()
         self.assertRegex(line, r"^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\] 探针行$")
+
+
+class TestUiGuardScanScope(unittest.TestCase):
+    """闸门扫描范围（2026-11-24 实弹测试换来的）。
+
+    起因：两个对话框浮在屏幕最上面，闸门却报「0 个模态」—— 因为它只扫前台应用，
+    而这两个框属主是后台的 System Events。坐标点击命中的是「最上层的窗口」，
+    不是「前台应用的窗口」，模型错了。
+    """
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "wb-ui-guard.py"
+
+    def test_scans_background_dialog_owners(self):
+        """必须扫 System Events —— 系统对话框的属主是它，且它是后台进程（visible=false）。"""
+        src = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('"System Events"', src, "扫描范围缺 System Events，浮层对话框会被漏掉")
+
+    def test_does_not_scan_notification_center(self):
+        """不能把 NotificationCenter 当阻塞项：它的「对话框」是通知，关不掉也拦不住点击。
+
+        实测：把它算进去后，一条「App 后台活动」通知让所有点击永久 rc=6（死锁）。
+        """
+        src = self.SCRIPT.read_text(encoding="utf-8")
+        i = src.find("var extra = [")
+        self.assertGreater(i, 0, "找不到扫描名单")
+        block = src[i:src.find("];", i)]
+        # 带引号精确匹配：UserNotificationCenter 含 NotificationCenter 子串，不能用裸子串
+        self.assertNotIn('"NotificationCenter"', block,
+                         "NotificationCenter 的按钮是通知不是模态，算进去会死锁")
+
+    def test_process_names_fetched_before_by_name(self):
+        """性能硬约束：byName 查不存在的进程会卡数秒（实测 11 秒），必须先取全部名字。
+
+        87 个进程全量遍历实测 7.9 秒，同样不可接受 —— 所以只查「前台 + 白名单属主」。
+        """
+        src = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("allNames", src, "缺少「先取进程名」的优化，扫描会退化到数秒")
