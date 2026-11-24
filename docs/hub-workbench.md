@@ -40,6 +40,7 @@
 | 应用卡 CI | `~/.agent-autoloop/hub-ci-cache.json`（后台 15 分钟刷新，由 `hub-ci-status.py` 写） | ✅ 接通 |
 | 代理请求数 | `~/Library/Logs/proxy-deepseek.stdout.log` + `~/.agent-autoloop/hub-proxy-daily.json`（每日快照，取 max） | ✅ 接通，重启不归零 |
 | 等你决策 | `agent-autoloop status --json` 的 `totals.attention` + 首张卡标题 | ✅ 接通 |
+| 回执不合规(7日) | `hub.db` 的 `cards` 表（标题含「回执」，近 7 天） | ✅ v1.10.4 接通：兼作第三方补丁哨兵 |
 
 ## 四、自动化规则
 
@@ -77,6 +78,7 @@
 
 | 版本 | 日期 | 摘要 |
 |---|---|---|
+| v1.10.4 | 2026-11-24 | **回执哨兵 + 账本状态核实**：① metrics 新增「回执不合规(7日)」（hub.db cards 表，created_at 去 T 后比 UTC、展示 +8h），实测 3 次（11-19/23/24），补丁若被升级覆盖会重新涨；② 核实实盘账本：`check_holdings_freshness.py --dry-run` 三个维度全 fresh、错过 0 个交易日（11-24 已人工确认），卡片 #42 已由用户/中台处理完毕（attention 0）；③ 查明 `portfolio_import.pyc` 是孤儿产物——中台 20:08 造过重复品、随即自认「官方入口 `update_live_snapshot.py` 早就在」并 revert；官方录入口令为 `update_live_snapshot.py --position 代码:股数:成本 --cash 可用资金 [--dry-run]` |
 | v1.10.3 | 2026-11-24 | **回执问题补齐第二个原因 + 报错指位**：13:30 同一句报错再现（run 256），实为 `later` 写成对象而非数组（与昨日 `cancel:false` 不同因同症）。补丁扩为三处（cancel 宽容、单对象归一、`laterProblem()` 指位指字段）；两份真回执均 `problem=none`；5 项测试 + typecheck 通过；全量 760 pass/14 fail 与改前一致。补丁更名 `agent-autoloop-later-receipt.patch` 并在干净上游验证 |
 | v1.10.2 | 2026-11-24 | **回执悬案定位并修复（第三方补丁）**：`later` 项写 `"cancel": false` 会让整份回执被拒、其中的后续安排全部丢失，而报错只提 key/at/about。用平台自身 `readMessage`/`resultFrom` 复现并逐条拆解定位；改为 `cancel !== true` + 新增 `tests/later-cancel.test.ts`（3 项，含缺 at/缺 key/超 10 项仍拒收）；全量 797 项测试中 14 项失败经 A/B 对照确认与本改动无关。补丁与重打方式登记在 `wb-local-infra/docs/third-party-patches.md` + `patches/*.patch`（干净上游验证通过）|
 | v1.10.1 | 2026-11-23 | **持久化闭环 + 部署器/闸门入仓**：① 部署器从「工作区 → live」改为「**仓 → live**」（`workbench/install-hub-overview.sh`，默认 dry-run、`--apply` 才落盘 + kickstart + 探活非 200 即失败）；② 档案入仓 `docs/hub-workbench.md`、补 `workbench/README.md`（三处文件关系/部署/回滚/两道闸门/边界）；③ 新增 `tests/test_share_sync.py`（share ↔ live 逐字节 + 三项负控）；④ 实测：`--apply` 端到端新 pid 起、页面/API 200、Token 仍 77809.7k；全量闸门 **41 tests OK**；⑤ 空机重建验证——clone 一份即 7 文件齐备、可编译可解析。提交 `cf01d02` 已推远端 |
