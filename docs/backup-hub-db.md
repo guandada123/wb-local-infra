@@ -104,7 +104,7 @@ python3 ~/.local/bin/wb-autoloop-backup.py drill
 3. **作业无法自证「自己没跑」**：plist 里硬编码授权 python 路径（`3.13.12`），WorkBuddy 升级
    若移除该版本，作业静默不跑且无人知道。缓解①：`tests/test_deploy_sync.py::TestBackupGate::
    test_plist_points_at_existing_python` 会在路径失效时变红（前提是有人跑测试）。
-   缓解②（外部观测，已接线待填 URL）：见下节。
+   缓解②（外部观测，已接线并实测）：见下节。
 
 ## 外部观测：healthchecks.io 独立 check
 
@@ -132,12 +132,38 @@ HC_BACKUP_PING_URL=https://hc-ping.com/<uuid>
 未配置时脚本**明说**「外部收不到打卡，check 会一直红」，不静默当成功 ——
 `_ping()` 永不抛异常、永不影响备份结论，`tests/test_deploy_sync.py::TestBackupPing` 守这三条。
 
-**check 侧要设的四个值**：Name=`Autoloop 数据备份`、Period=`1 day`、Grace=`2 hours`、
-Integrations=勾上与 Mac Alive 相同的通知集成（不勾 = check 是哑的，红了也没人知道）。
+**建 check 时填的值**：Name=`Autoloop Backup`、Period=`1 day`、Grace=`2 hours`。
 
-⚠️ 现状：**check 尚未创建**。建 check 需要在 healthchecks.io 账号内操作，本机没有 API key
-（keychain、`~/.local/etc` 三个 conf、zsh/bash 历史都查过，零命中）。历史记录显示上一套
-心跳（2026-10-20）是「用户重建的 Mac Alive」，即 ping 地址由人在网页建好后提供 —— 同样路径。
+✅ **现状（2026-11-24 10:02 建成并实测）**：check 名 `Autoloop Backup`，uuid 仅记前 8 位
+`f4b27c1b`（完整 ping URL 在 conf 里 —— 它等于打卡凭据，能伪造成功，不进文档也不进 git）。
+建的时候没看到集成选项，保存后到 Integrations 页核对，两条集成均显示
+**Assigned Checks `2 of 2`** —— 即 Mac alive 与本 check 都覆盖，不存在「建了个哑 check」。
+
+实测证据（不是「配置写好了」）：
+
+| 证据 | 值 | 说明 |
+|---|---|---|
+| check 详情 Events | `#1 Started` → `#2 OK` | 10:02 两次，Last Duration 1 sec，new → up |
+| 事件 User-Agent | `wb-autoloop-backup/1.0` | 是本机脚本打的，不是别处同名探测 |
+| 集成 Last Notification | `Delivered`（2 周 3 天前，非 Failed） | 这条 webhook 历史上真送出过 |
+| `wb-autoloop-backup.py daily` 输出 | `打卡[开始] HTTP 200` / `打卡[结束] HTTP 200` | 备份那一步同时通过 10 项校验 |
+
+**没做的一件**：对新 check 造一次 `/fail` 实弹。理由是 11-23 刚因误报往群里道过歉，不再为
+「验证」制造假告警。第一次实弹会是真失败（>26h 无打卡），届时以群消息 + check 状态双向核对。
+
+**告警频率（防刷群，已核对语义）**：healthchecks 只在 check **状态变化**时通知（up→down、down→up），
+同一 down 状态下重复 `/fail` 不重复发。所以连续失败不会每天刷群；对应地，「持续失败但已通知过一次」
+的沉默由脚本本地那条 7 天提醒补上 —— 两条链路是互补而非重复。恢复时 healthchecks 会再发一次 up 通知。
+
+**两条建 check 的路径都留档**：
+
+- 浏览器（本次实际走的）：Add Check → 填 Name/Period/Grace → Save → 去 Integrations 页核对 `N of N`
+- API（`bin/hc-create-check.py`，需 Full access key）：`list` 先查重再 `create`。
+  ⚠️ 该路径**未实跑**，只验证了缺 key / key 过短 / 端点不可达三条降级分支
+
+⚠️ 踩过的坑：用 `pbpaste > key 文件` 让人存 key 是坏设计 —— 对方要粘命令就得先复制命令，
+剪贴板里刚复制的 key 被命令覆盖，结果文件里存的是命令本身（实测 79 字符正是那条命令）。
+存凭据别让用户同时做「复制值」和「复制命令」两件事。
 
 ## 轮转与删除
 

@@ -204,4 +204,6 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
 - 脚本 `bin/wb-autoloop-backup.py`：`backup / check / drill / daily / self-test`
 - 定时 `launchd/com.user.autoloop-backup.plist`（必须先跑 `install.sh --apply` 部署脚本）
 - 11 项校验 + 12 项故障注入；恢复演练真恢复到临时 `AGENT_AUTOLOOP_HOME` 后逐表比对
+- **外部观测**（2026-11-24 接通）：healthchecks.io check `Autoloop Backup`（1 day / 2h grace），
+  `daily` 打 `/start`、成功打 plain、失败打 `/fail`；ping URL 只在 `~/.local/etc/wb-autoloop-backup.conf`
 - **完整说明与残余风险**（整机无 TM/FileVault、落点卷未加密、作业无法自证未跑）：`docs/backup-hub-db.md`

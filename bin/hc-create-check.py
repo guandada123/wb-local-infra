@@ -10,6 +10,10 @@
 用法：
   hc-create-check.py list                 # 只列已有 check，不建（先看再决定）
   hc-create-check.py create [--name N] [--timeout 86400] [--grace 7200]
+
+⚠️ 2026-11-24 状态：`Autoloop Backup` 这个 check 最终是**用浏览器建的**（用户未提供 API key）。
+本脚本的 API 路径**尚未实跑**，只验证了三条降级分支（缺 key / key 过短 / 端点不可达）。
+字段按 healthchecks v3 文档校对；首次真跑时要盯 `list` 的输出确认字段名没漂。
 """
 from __future__ import annotations
 
