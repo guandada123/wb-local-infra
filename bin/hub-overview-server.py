@@ -138,8 +138,14 @@ def proxy_stats():
     if json.dumps(daily, sort_keys=True) != before:
         try:
             os.makedirs(os.path.dirname(PROXY_DAILY), exist_ok=True)
-            with open(PROXY_DAILY, "w", encoding="utf-8") as fh:
+            # 原子写：服务是多线程的，直写会被并发请求读到半个 JSON（读失败 → daily={} →
+            # 只写回最近 7 天、历史天数被抹掉，且当日值可能倒退）。先写临时文件再 replace。
+            tmp = PROXY_DAILY + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
                 json.dump({k: daily[k] for k in sorted(daily)[-30:]}, fh)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, PROXY_DAILY)
         except Exception:
             pass
 
@@ -451,6 +457,11 @@ def collect():
              "note": ps.get("note", "")},
             {"label": "最老待办", "val": (f"{old_days} 天" if old_days is not None else "—"),
              "note": (f"{old_title[:40]}（仅统计群消息来源条目）" if old_title else "无带原文的待办")},
+            {"label": "CI 未启动", "val": f"{sum(1 for v in (ci.get('repos') or {}).values() if v.get('not_started'))} 仓",
+             "note": ("未跑=计费/额度拦截，不是代码红：" +
+                      "、".join(f"{k}({v.get('secs', 0)}s)" for k, v in (ci.get("repos") or {}).items() if v.get("not_started"))
+                      if any(v.get("not_started") for v in (ci.get("repos") or {}).values())
+                      else "无（各仓 CI 均在正常跑）")},
             {"label": "回执不合规(7日)", "val": f"{rc_cnt} 次",
              "note": (f"最近 {rc_last}（本地时间）；这是补丁哨兵，若补丁被升级覆盖会重新涨"
                       if rc_cnt else "近 7 天无新增；补丁若被升级覆盖，这里会重新涨起来")},
