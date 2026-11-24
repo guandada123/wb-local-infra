@@ -33,13 +33,19 @@ Time Machine —— 它没有配置任何目标（`No destinations configured`�
 | `workbuddy_data/projects` | 28,067 | 5.5G | 全部会话历史（JSONL）。mem-search 索引的源，丢了搜不回来 |
 | `WorkBuddy/*/.workbuddy/memory` | 690 | 15M | 各 workspace 的记忆。Claw 下 157 个里仅 22 个在 git 里 |
 
+另外**点名单文件库**（`DB_ITEMS`，不进 rsync 清单，走 sqlite 在线快照）：
+
+| 项 | 体积 | 为什么它只此一份 |
+|---|---|---|
+| `workbuddy_data/workbuddy.db` | 261M | WorkBuddy 自己的库：`automations` 240 条、`sessions` 13,945 条、`automation_runs` 3,422 条。全机的定时自动化配置都在这一个文件里，2026-11-24 审计确认**没有任何作业在备份它** |
+
 代码仓不在此列（11 个仓都有 GitHub 远端）；`hub.db` 与 `~/.local/etc/*.conf` 由
 `wb-autoloop-backup.py` 覆盖；`workbuddy_data` 下的 `binaries`(4.9G) / `logs`(1.4G) /
 `file-tree-manifests`(2.9G) 可重下或可重建，有意不镜像。
 
 落点：`~/Backups/offsite-mirror/<相对路径>`，内盘，按 `st_dev` 校验异卷。
 
-## 三、判据（V0 写前闸门 + V1–V5 事后校验）
+## 三、判据（V0 写前闸门 + V1–V6 事后校验）
 
 ### V0 容量闸门 —— 在动手之前
 
@@ -67,6 +73,27 @@ Time Machine —— 它没有配置任何目标（`No destinations configured`�
 | V3 | 集合包含 | 源有而落点无；落点偏短而源未再更新；落点比源大；落点 0 字节 |
 | V4 | 抽样 sha256 | 默认 30 个，`--sample 0` 全量。防同大小内容损坏 |
 | V5 | 落点旧文件 | 只 WARN。这是一份备份，不跟随删除 |
+| V6 | 单文件库副本 | 副本缺失 / quick_check 不过 / 与 sidecar 字节数或行数不符 / 快照超过 26h |
+
+### V6 为什么不用 rsync，而要 sqlite 自己拷
+
+`workbuddy.db` 是 **WAL 库且正被 WorkBuddy 写**。文件级复制（`cp` / rsync）可能拿到
+「一半旧页一半新页」，而 `-wal` 里还有没落盘的提交 —— 拷出来的东西能打开、能查表，
+但数据是错的。所以走 `sqlite3.Connection.backup()`：sqlite 自己在读事务里逐页拷，给的
+是一个自洽时间点；拷完再 `journal_mode=delete`，副本自成一体（不依赖 `-wal`/`-shm`），
+最后 `os.replace` 原子落地，绝不出现半截副本。
+
+副本能不能信，靠两条**不同来源**的证据：
+
+| 证据 | 防的是什么 |
+|---|---|
+| sidecar（`*.snapshot.json`：字节数 + 每表行数 + 时间） | 副本落地后被改过 / 被部分重写 / 过期 |
+| 源读数区间（备份前、备份后各读一次，副本行数必须被夹住） | **副本自证抓不到的那类错**：拷错库、只拷了 schema、空库 |
+
+第二条是补上的：sidecar 的行数是从副本自己算出来的，一个系统性错误的副本也会「自洽」。
+源是活的，行数会变，所以不能要求相等，只能要求落在两个真实读数构成的区间内 ——
+这是唯一不靠副本自证的口径（self-test 里两条对偶用例分别验「夹住算过」和「出区间必红」，
+变异测试：把区间判据改成永远放行，25 项里恰好那 1 项变红）。
 
 ### V3 为什么这么绕
 
@@ -116,8 +143,12 @@ python3 ~/.local/bin/wb-offsite-mirror.py status     # 上次结果与距上次�
 python3 ~/.local/bin/wb-offsite-mirror.py self-test  # 故障注入（每项断言恰好那一项红）
 ```
 
-自检当前 17 项：V1–V5 各 1–2 项、V0 容量 4 项（充足放行 / 余量被增量吃掉 /
-落点旧文件抵消增量 / 闸门不过则不写一个字节）。
+自检当前 25 项：V1–V5 各 1–2 项、V0 容量 4 项、V6 库快照 8 项。
+
+库副本实测（2026-11-24 12:43）：`workbuddy_data/workbuddy.db` 262MB / 20 表 / 0.7 秒；
+独立打开副本读到 `automations` 240 条、`sessions` 13,945 条、`automation_runs` 3,422 条、
+自动化名称为真实值、`quick_check=ok`、无 `-wal`/`-shm` 残留 —— 这是「能读出来」而不是
+「校验通过」的证据。
 
 首次实测（2026-11-24 12:14–12:31）：32,833 文件 / 6.6GB，V1–V5 全过、V4 抽样 30 个一致、
 增量 run 8 秒、launchd 实跑 `last exit code = 0`、外部 check 收到打卡（Last Duration 17s）。

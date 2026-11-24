@@ -217,9 +217,12 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
 - 脚本 `bin/wb-offsite-mirror.py`：`run / verify / daily / status / self-test`
 - 定时 `launchd/com.user.wb-offsite-mirror.plist`：每日 03:20（LowPriorityIO + Nice 5）
 - 覆盖：`Claw/output`(714M) + `workbuddy_data/projects`(5.5G) + 各 `.workbuddy/memory`(15M)
-- 判据 V1–V5：异卷 / 非空 / **集合包含**（不是数量比）/ 抽样 sha256 / 落点旧文件只 WARN
+- 外加**单文件库** `workbuddy_data/workbuddy.db`(261M，240 个自动化配置)：不走 rsync，
+  用 sqlite `backup()` 在线快照 + 原子替换，副本自带 sidecar
+- 判据 V0 容量闸门（写前，写后仍须 ≥20GiB，不过就一个字节都不写）+ V1–V6：异卷 / 非空 /
+  **集合包含**（不是数量比）/ 抽样 sha256 / 落点旧文件只 WARN / 库副本可读且行数被源读数夹住
 - **不跟随删除**：镜像不做 `--delete`，否则一次误删两边都没了
-- 13 项故障注入；V3 的增长/截断靠 mtime 区分（只靠「前缀一致」分不出来，实测踩过）
+- 25 项故障注入；V3 的增长/截断靠 mtime 区分（只靠「前缀一致」分不出来，实测踩过）
 - 外部观测：healthchecks check `Offsite Mirror`（1 day / 2h grace），配置在
   `~/.local/etc/wb-offsite-mirror.conf`
 - **完整说明、残余风险（单设备/未加密/TM 仍未配）与「TM 为什么配不上」的实测记录**：

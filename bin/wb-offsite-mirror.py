@@ -8,6 +8,7 @@
     · WorkBuddy/Claw/output            4,101 文件 / 714M   报告产物
     · workbuddy_data/projects         28,067 文件 / 5.5G   会话历史
     · 各 workspace 的 .workbuddy/memory  690 文件 /  15M   记忆
+    · workbuddy_data/workbuddy.db       261M          自动化配置库（240 条 automations）
 
   代码不在此列（11 个仓都有 GitHub 远端）；`hub.db` 另由 wb-autoloop-backup.py 覆盖。
 
@@ -27,6 +28,8 @@
   V3 源里每个 (相对路径, 字节数) 必须原样存在于落点 —— 集合包含，不是数量比对
   V4 抽样 sha256（默认 30 个，`--sample 0` 全量）防同大小内容损坏
   V5 落点上有源已没有的旧文件 → 只 WARN。这是一份备份，不跟随删除
+  V6 单文件 sqlite 库（DB_ITEMS）：副本可打开、quick_check 通过、与 sidecar 一致、
+     行数被「备份前/备份后」两个源读数夹住（≥26h 未更新 → FAIL）
 
 不做 `--delete`：镜像盘比源多几个旧文件是备份的正常形态；跟随删除等于把备份变成镜像，
 一次误删就两边都没有。
@@ -66,6 +69,12 @@ ITEMS = [
 
 STATE_FILE = Path(os.path.expanduser("~/.local/etc/wb-offsite-mirror.state.json"))
 PING_CONF = Path(os.path.expanduser("~/.local/etc/wb-offsite-mirror.conf"))
+
+# 单文件 sqlite 库（不在上面任何目录项里，单独走在线快照）。WAL 库直接 copy/rsync 会拿到
+# 不一致的页 —— -wal 里还有没落盘的提交，且复制过程中页还在变。只有 sqlite 自己的
+# backup API 能给出一个自洽的时间点，所以这类文件不进 rsync 清单。
+DB_ITEMS = ["workbuddy_data/workbuddy.db"]
+DB_MAX_AGE_H = 26
 REMIND_DAYS = 7
 
 # 容量闸门：写完之后内盘至少还要剩这么多。20 GiB 不是拍脑袋 —— 系统更新包、编译临时文件、
@@ -139,7 +148,9 @@ def capacity_verdict(pending: int, free: int,
 
 
 def capacity_preflight(pairs: list[tuple[str, Path]], dest_root: Path,
-                       min_free_after: int = MIN_FREE_AFTER, free_fn=None) -> dict:
+                       min_free_after: int = MIN_FREE_AFTER, free_fn=None,
+                       src_root: Path | None = None,
+                       db_items: list[str] | None = None) -> dict:
     """开写前的容量闸门：只读，不改任何文件。返回 ok/msg 与各分项，供日志与 status 用。"""
     probe = dest_root
     try:
@@ -159,6 +170,15 @@ def capacity_preflight(pairs: list[tuple[str, Path]], dest_root: Path,
         pending += nb
         if nb:
             detail.append(f"{name} {_gib(nb)}")
+    # 单文件库每次都整份重写（backup API 不支持增量），如实按源大小计空间
+    if src_root is not None:
+        for rel in (DB_ITEMS if db_items is None else db_items):
+            s = src_root / rel
+            if s.is_file():
+                sz = s.stat().st_size
+                pending += sz
+                dst_total += (dest_root / rel).stat().st_size if (dest_root / rel).is_file() else 0
+                detail.append(f"{rel} {_gib(sz)}")
     ok, need, after = capacity_verdict(pending, free, min_free_after)
     msg = (f"容量预检{'通过' if ok else '不通过'}：待写 {_gib(pending)}，含余量需 {_gib(need)}，"
            f"当前余 {_gib(free)}，写后剩 {_gib(after)}，下限 {_gib(min_free_after)}")
@@ -196,9 +216,149 @@ def _is_prefix(dst: Path, src: Path, n: int) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- sqlite 在线快照
+def _db_uri(p: Path) -> str:
+    return "file:" + urllib.parse.quote(p.as_posix(), safe="/:") + "?mode=ro"
+
+
+def _db_tables(conn) -> list[str]:
+    return [r[0] for r in conn.execute(
+        "select name from sqlite_master where type='table' order by name")]
+
+
+def _counts(conn) -> dict[str, int]:
+    return {t: conn.execute(f'select count(*) from "{t}"').fetchone()[0] for t in _db_tables(conn)}
+
+
+def _db_stats(p: Path) -> dict[str, int]:
+    """只读打开，返回 {表名: 行数}。表名取自 sqlite_master，不是外部输入。"""
+    import sqlite3
+    c = sqlite3.connect(_db_uri(p), uri=True, timeout=30)
+    try:
+        return _counts(c)
+    finally:
+        c.close()
+
+
+def rows_in_range(copy_counts: dict[str, int], before: dict[str, int],
+                  after: dict[str, int]) -> list[str]:
+    """副本每张表的行数必须落在「备份前/备份后」两个源读数构成的区间内。
+
+    为什么需要这一步：sidecar 的行数是**从副本自己算出来的**，一个系统性错误的副本
+    （拷错了库、只拷了 schema）也能自洽。源是活的、行数会变，所以不能要求相等，只能要求
+    被两个真实读数夹住 —— 这是唯一不靠副本自证的口径。
+    """
+    bad: list[str] = []
+    for t in sorted(set(copy_counts) | set(before) | set(after)):
+        lo = min(before.get(t, 0), after.get(t, 0))
+        hi = max(before.get(t, 0), after.get(t, 0))
+        n = copy_counts.get(t, -1)
+        if not lo <= n <= hi:
+            bad.append(f"{t} 副本 {n} 源区间 [{lo},{hi}]")
+    return bad
+
+
+def db_sidecar(dst: Path) -> Path:
+    return dst.with_name(dst.name + ".snapshot.json")
+
+
+def snapshot_db(src: Path, dst: Path) -> tuple[bool, str]:
+    """用 backup API 做在线快照：落 tmp → 原子替换 → 写 sidecar。
+
+    为什么不用 cp/rsync：源是 WAL 库且正被 WorkBuddy 写，文件级复制可能拿到「一半旧页
+    一半新页」，而 -wal 里还有没落盘的提交。backup API 由 sqlite 自己在读事务里逐页拷，
+    得到的是一个自洽时间点。sidecar 记下字节数与每张表行数，供下次 verify 反查副本有没有
+    被改过 —— 只有「能算出正确值又能写回」的判据才不是永红告警。
+    """
+    import sqlite3
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(dst.name + ".tmp")
+    junk = [tmp, tmp.with_name(tmp.name + "-wal"), tmp.with_name(tmp.name + "-shm")]
+    for p in junk:
+        if p.exists():
+            p.unlink()
+    try:
+        s = sqlite3.connect(_db_uri(src), uri=True, timeout=60)
+        d = sqlite3.connect(str(tmp))
+        try:
+            before = _counts(s)                       # 源读数①：备份前
+            s.backup(d)
+            after = _counts(s)                        # 源读数②：备份后（源是活的，夹住即可）
+            d.execute("pragma journal_mode=delete")   # 副本自成一体，不留 -wal/-shm
+            d.commit()
+        finally:
+            d.close()
+            s.close()
+        if not tmp.is_file() or tmp.stat().st_size == 0:
+            return False, "快照文件为空"
+        counts = _db_stats(tmp)
+        bad = rows_in_range(counts, before, after)
+        if bad:
+            for p in junk:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+            return False, "副本行数不在源区间内：" + "；".join(bad[:3])
+        os.replace(tmp, dst)                          # 原子替换：绝不出现半截副本
+    except Exception as e:                            # noqa: BLE001
+        for p in junk:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+        return False, f"快照失败：{e.__class__.__name__}: {e}"
+    db_sidecar(dst).write_text(json.dumps(
+        {"taken_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+         "bytes": dst.stat().st_size, "tables": counts,
+         "src_before": before, "src_after": after},
+        ensure_ascii=False, indent=1) + "\n")
+    return True, f"{dst.stat().st_size / 1024**2:.0f}MB / {len(counts)} 表 / {sum(counts.values())} 行"
+
+
+def db_verify(dst: Path) -> tuple[bool, str]:
+    """V6：副本存在 + 完整 + 与 sidecar 一致 + 不过期。"""
+    import sqlite3
+    if not dst.is_file():
+        return False, "副本不存在（这是唯一副本，必须红）"
+    side = db_sidecar(dst)
+    if not side.is_file():
+        return False, "缺 sidecar：不知道这份副本是什么时候、什么内容"
+    try:
+        meta = json.loads(side.read_text())
+        taken = time.mktime(time.strptime(meta["taken_at"], "%Y-%m-%dT%H:%M:%S"))
+    except (OSError, ValueError, KeyError) as e:
+        return False, f"sidecar 读不出：{e.__class__.__name__}"
+    real = dst.stat().st_size
+    if real != meta.get("bytes"):
+        return False, f"字节数 {real} != 记下的 {meta.get('bytes')}（副本被改过）"
+    try:
+        c = sqlite3.connect(_db_uri(dst), uri=True, timeout=30)
+        try:
+            counts = {t: c.execute(f'select count(*) from "{t}"').fetchone()[0]
+                      for t in _db_tables(c)}
+            qc = c.execute("pragma quick_check").fetchone()[0]
+        finally:
+            c.close()
+    except Exception as e:                            # noqa: BLE001
+        return False, f"打不开副本：{e.__class__.__name__}"
+    if qc != "ok":
+        return False, f"quick_check 不通过：{str(qc)[:80]}"
+    claim = meta.get("tables") or {}
+    if counts != claim:
+        diff = [f"{t} {claim.get(t)}→{counts.get(t)}"
+                for t in sorted(set(counts) | set(claim)) if counts.get(t) != claim.get(t)]
+        return False, f"行数与 sidecar 不符：{diff[:3]}"
+    age_h = (time.time() - taken) / 3600
+    if age_h > DB_MAX_AGE_H:
+        return False, f"快照已 {age_h:.0f} 小时（上限 {DB_MAX_AGE_H}h）—— 镜像停了，不是源在动"
+    return True, f"{len(counts)} 表 / {sum(counts.values())} 行 / {real / 1024**2:.0f}MB / {age_h:.1f}h 前"
+
+
 def verify(src_root: Path, dest_root: Path, sample: int = 30,
-           dev_fn=None, since: float | None = None) -> list[dict]:
-    """跑 V1–V5。返回 [{id, level, msg}]，level ∈ PASS/FAIL/WARN。"""
+           dev_fn=None, since: float | None = None,
+           db_items: list[str] | None = None) -> list[dict]:
+    """跑 V1–V6。db_items 传 [] 可跳过 V6（自检里单测 V1–V5 时用）。"""
     dev_fn = dev_fn or device_of
     items: list[dict] = []
 
@@ -332,6 +492,11 @@ def verify(src_root: Path, dest_root: Path, sample: int = 30,
         f"{stale} 个落点旧文件源已无（备份正常形态，不跟随删除）"
         + ("" if stale else "：无"), level="WARN" if stale else "PASS")
 
+    # V6 单文件 sqlite 库副本（workbuddy.db 这类：不在任何目录项里，且是唯一副本）
+    for rel in (DB_ITEMS if db_items is None else db_items):
+        ok6, msg6 = db_verify(dest_root / rel)
+        add("V6", ok6, f"{rel}：{msg6}")
+
     return items
 
 
@@ -352,7 +517,7 @@ def cmd_run(src_root: Path, dest_root: Path, verbose: bool = True) -> int:
         return 2
     pairs = expand_items(src_root)
     _log(f"→ 镜像 {len(pairs)} 项：{src_root} → {dest_root}")
-    cap = capacity_preflight(pairs, dest_root)
+    cap = capacity_preflight(pairs, dest_root, src_root=src_root)
     _log(f"  {cap['msg']}")
     if not cap["ok"]:
         _save_state(False, [{"id": "V0", "level": "FAIL", "msg": cap["msg"]}],
@@ -372,6 +537,17 @@ def cmd_run(src_root: Path, dest_root: Path, verbose: bool = True) -> int:
         _log(f"  {flag} {name}  {n} 文件  {time.time() - t0:.1f}s" +
              ("" if rc == 0 else f"  rc={rc} {out[:200]}"))
         if rc != 0:
+            fails += 1
+    for rel in DB_ITEMS:
+        src_db = src_root / rel
+        if not src_db.is_file():
+            _log(f"  ⚠️ {rel} 不存在（源侧缺项，交 V6 判）")
+            fails += 1
+            continue
+        t0 = time.time()
+        ok_db, msg = snapshot_db(src_db, dest_root / rel)
+        _log(f"  {'✓' if ok_db else '✗'} 快照 {rel}  {msg}  {time.time() - t0:.1f}s")
+        if not ok_db:
             fails += 1
     items = verify(src_root, dest_root, since=_since_ts())
     for it in items:
@@ -516,11 +692,13 @@ def cmd_self_test() -> int:
         return 0 if p.name == "src" else 1
 
     def reds(src: Path, dst: Path, sample: int = 0, since: float | None = None) -> list[str]:
-        return sorted(i["id"] for i in verify(src, dst, sample=sample, dev_fn=split_dev, since=since)
+        return sorted(i["id"] for i in verify(src, dst, sample=sample, dev_fn=split_dev,
+                                              since=since, db_items=[])
                       if i["level"] == "FAIL")
 
     def warns(src: Path, dst: Path, since: float | None = None) -> list[str]:
-        return sorted(i["id"] for i in verify(src, dst, sample=0, dev_fn=split_dev, since=since)
+        return sorted(i["id"] for i in verify(src, dst, sample=0, dev_fn=split_dev,
+                                              since=since, db_items=[])
                       if i["level"] == "WARN")
 
     def same_dev(_p: Path) -> int:
@@ -561,7 +739,8 @@ def cmd_self_test() -> int:
 
     def case_same_volume(root: Path) -> list[str]:
         src = build(root)
-        return sorted(i["id"] for i in verify(src, root / "dst", sample=0, dev_fn=same_dev)
+        return sorted(i["id"] for i in verify(src, root / "dst", sample=0, dev_fn=same_dev,
+                                              db_items=[])
                       if i["level"] == "FAIL")
 
     def case_grown_after_copy(root: Path) -> list[str]:
@@ -664,6 +843,75 @@ def cmd_self_test() -> int:
         assert json.loads((root / "state.json").read_text())["fails"] == ["V0"], "状态没记 V0"
         return []
 
+    # ---- V6 单文件 sqlite 库：快照 + 反查
+    def make_db(p: Path) -> Path:
+        import sqlite3
+        p.parent.mkdir(parents=True, exist_ok=True)
+        c = sqlite3.connect(str(p))
+        c.execute("create table automations(id integer primary key, name text)")
+        c.execute("create table sessions(id integer primary key, body text)")
+        c.executemany("insert into automations(name) values (?)", [("a",), ("b",), ("c",)])
+        c.executemany("insert into sessions(body) values (?)", [("x",)] * 7)
+        c.commit()
+        c.close()
+        return p
+
+    def db_case(root: Path, mutate=None) -> list[str]:
+        """造源库 → 快照 → 可选破坏 → 只跑含 V6 的 verify，返回红项。"""
+        src = build(root)
+        rel = DB_ITEMS[0]
+        make_db(src / rel)
+        ok, msg = snapshot_db(src / rel, root / "dst" / rel)
+        assert ok, f"快照失败：{msg}"
+        if mutate:
+            mutate(root / "dst" / rel)
+        items = verify(src, root / "dst", sample=0, dev_fn=split_dev, db_items=DB_ITEMS)
+        return sorted(i["id"] for i in items if i["level"] == "FAIL")
+
+    def case_db_ok(root: Path) -> list[str]:
+        return db_case(root)
+
+    def case_db_missing(root: Path) -> list[str]:
+        return db_case(root, lambda d: d.unlink())
+
+    def case_db_no_sidecar(root: Path) -> list[str]:
+        return db_case(root, lambda d: db_sidecar(d).unlink())
+
+    def case_db_same_size_corrupt(root: Path) -> list[str]:
+        """同大小、内容坏：字节数与 sidecar 一致，只能靠 quick_check/行数抓。"""
+        def boom(d: Path) -> None:
+            with open(d, "r+b") as f:
+                f.seek(4096 * 2)
+                f.write(b"\xff" * 512)
+        return db_case(root, boom)
+
+    def case_db_rows_tampered(root: Path) -> list[str]:
+        def tamper(d: Path) -> None:
+            side = db_sidecar(d)
+            meta = json.loads(side.read_text())
+            meta["tables"]["sessions"] = 999          # 谎报行数，副本实际 7
+            side.write_text(json.dumps(meta, ensure_ascii=False))
+        return db_case(root, tamper)
+
+    def case_db_stale(root: Path) -> list[str]:
+        def age(d: Path) -> None:
+            side = db_sidecar(d)
+            meta = json.loads(side.read_text())
+            meta["taken_at"] = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() - 48 * 3600))
+            side.write_text(json.dumps(meta, ensure_ascii=False))
+        return db_case(root, age)
+
+    def case_db_range_ok(root: Path) -> list[str]:
+        """源在备份期间长了一行：副本行数被两个读数夹住即算过。"""
+        assert rows_in_range({"a": 240}, {"a": 240}, {"a": 241}) == []
+        return []
+
+    def case_db_range_bad(root: Path) -> list[str]:
+        """空副本 / 拷错库：行数落在源区间外，必须抓到（sidecar 自证抓不到这种）。"""
+        assert rows_in_range({"a": 0}, {"a": 240}, {"a": 240}) != [], "空副本没被抓到"
+        assert rows_in_range({}, {"a": 240}, {"a": 240}) != [], "缺表没被抓到"
+        return []
+
     cases = [
         ("裸绿（无破坏）", case_ok, []),
         ("落点缺一整项", case_missing_item, ["V3"]),
@@ -682,6 +930,14 @@ def cmd_self_test() -> int:
         ("余量被增量吃掉", case_capacity_short, []),
         ("落点旧文件抵消增量", case_capacity_stale_offset, []),
         ("闸门不过则不写一个字节", case_capacity_gate_blocks_write, []),
+        ("库快照一致", case_db_ok, []),
+        ("库副本丢失", case_db_missing, ["V6"]),
+        ("库副本缺 sidecar", case_db_no_sidecar, ["V6"]),
+        ("库副本同大小损坏", case_db_same_size_corrupt, ["V6"]),
+        ("库行数与 sidecar 不符", case_db_rows_tampered, ["V6"]),
+        ("库快照已 48 小时", case_db_stale, ["V6"]),
+        ("库行数被源读数夹住", case_db_range_ok, []),
+        ("库行数落在源区间外", case_db_range_bad, []),
     ]
     passed = 0
     for title, fn, expect in cases:
