@@ -12,6 +12,7 @@
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -703,12 +704,20 @@ class TestBackupGate(unittest.TestCase):
         subprocess.run([sys.executable, "-m", "py_compile", str(self.SCRIPT)], check=True)
 
     def test_fault_injection_all_red(self):
-        """12 项故障注入必须全绿（即：每项都恰好按预期变红）。"""
+        """故障注入必须全绿（即：每项都恰好按预期变红）。
+
+        计数不写死成字符串：加用例时不该因为「测试里写的是 12」而红，
+        但用例数下降必须红 —— 每条都在反证一个判据，删一条就是悄悄降低覆盖。
+        """
         p = subprocess.run([sys.executable, str(self.SCRIPT), "self-test"],
                            capture_output=True, text=True, timeout=180)
         out = p.stdout + p.stderr
         self.assertEqual(0, p.returncode, f"故障注入未全通过:\n{out}")
-        self.assertIn("12/12 通过", out)
+        m = re.search(r"(\d+)/(\d+) 通过", out)
+        self.assertIsNotNone(m, f"输出里没有通过计数:\n{out}")
+        got, total = int(m.group(1)), int(m.group(2))
+        self.assertEqual(got, total, f"故障注入未全通过：{got}/{total}\n{out}")
+        self.assertGreaterEqual(total, 15, "故障注入用例数不应减少（每条反证一个判据）")
 
     def test_plist_points_at_existing_python(self):
         """plist 里硬编码的授权 python 一旦因 WorkBuddy 升级消失，作业会静默不跑。

@@ -28,6 +28,10 @@ restore 前 quick_check），缺的不是工具，是**调度、异卷落点、�
    那是飞书推送凭据，丢了要进控制台重置。本脚本额外补拷，缺失即红（A8）。
 4. 行数只做**方向校验**（备份不得多于 live）+ 非空校验；不做相等断言 —— live 在跑，
    相等是假要求，会把正常备份判红。
+5. **2026-11-24 扩到本机配置**：`~/.local/etc/*.conf` 四个文件（心跳打卡 URL、记忆推送仓与
+   群、备份打卡 URL、内存守护阈值）审计确认**全部只有一份**，丢了心跳与备份打卡同时哑。
+   现随快照存进 `etc/`（A12 校验同名集合相等 + 0600；自检专门有一条反证「用数量比对会漏」）。
+   `*.state.json` 有意不备份：运行态每天变，丢了最多重发一次提醒。
 
 用法
 ----
@@ -35,13 +39,14 @@ restore 前 quick_check），缺的不是工具，是**调度、异卷落点、�
   wb-autoloop-backup.py check [--json] [--all]
   wb-autoloop-backup.py drill             # 真恢复到临时 AGENT_AUTOLOOP_HOME 并逐表比对
   wb-autoloop-backup.py daily             # launchd 入口：备份→校验→出问题才推飞书
-  wb-autoloop-backup.py self-test         # 12 项故障注入（每项必须精确变红）
+  wb-autoloop-backup.py self-test         # 15 项故障注入（每项必须精确变红）
 
 退出码：0=全部 PASS｜1=有 FAIL｜2=环境/参数错误
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -59,6 +64,10 @@ DEFAULT_VAULT = os.environ.get("WB_VAULT") or "/Volumes/ZHITAI/backups/agent-aut
 MAX_AGE_H = 26.0      # 每日一次，留 2h 抖动余量
 KEEP = 8              # 保留份数上限（8×27MB ≈ 216MB）
 EXTRA_FILES = ["feishu.json"]   # 官方备份不覆盖、但丢了要重置的
+# 本机配置（心跳/记忆推送/备份打卡/memwatch）—— 2026-11-24 审计：4 个 *.conf 全部只有一份，
+# 丢了心跳与备份打卡一起哑。只拷 *.conf：*.state.json 是运行态（每天变），丢了最多重发一次提醒。
+ETC_DIR = Path(os.path.expanduser("~/.local/etc"))
+ETC_GLOB = "*.conf"
 KEY_SHAPE_LEN = 43
 TS_FMT = "%Y-%m-%dT%H%M"
 
@@ -144,12 +153,36 @@ def quick_check(db: Path) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------- 单份校验
+def copy_etc(etc_src: Path, snap: Path) -> list[str]:
+    """把 etc_src/*.conf 拷进快照的 etc/ 子目录，返回拷贝的文件名。
+
+    为什么单独一组：这 4 个 conf 是整机自动化的神经中枢（心跳打卡 URL、记忆推送仓与群、
+    备份打卡 URL、内存守护阈值），2026-11-24 审计确认**全部只有一份**。
+    它们含「能伪造打卡/能往群里发消息」的引用，所以落盘一律 0600。
+
+    用 copyfile 不用 copy2：理由同 EXTRA_FILES —— copystat 会把 st_flags（uchg）
+    一起搬进备份，备份里那份从此 chmod EPERM、轮转删不掉。
+    """
+    srcs = sorted(p for p in etc_src.glob(ETC_GLOB) if p.is_file()) if etc_src.is_dir() else []
+    if not srcs:
+        return []
+    d = snap / "etc"
+    d.mkdir(exist_ok=True)
+    os.chmod(d, 0o700)
+    names = []
+    for s in srcs:
+        shutil.copyfile(s, d / s.name)
+        os.chmod(d / s.name, 0o600)
+        names.append(s.name)
+    return names
+
+
 def check_snapshot(snap: Path, live_home: Path, vault: Path, max_age_h: float = MAX_AGE_H,
-                   dev_fn=None) -> list[dict]:
-    """对一份快照跑 A1–A8。返回 [{id, level, msg}]，level ∈ PASS/FAIL/WARN。
+                   dev_fn=None, etc_src: Path | None = None) -> list[dict]:
+    """对一份快照跑 A1–A12。返回 [{id, level, msg}]，level ∈ PASS/FAIL/WARN。
 
     dev_fn 只为自检注入（临时目录里源与落点必然同卷，无法真造两个物理卷）；
-    生产路径永远用 device_of。
+    etc_src 同理，自检用临时目录，生产用 ~/.local/etc。
     """
     dev_fn = dev_fn or device_of
     items: list[dict] = []
@@ -221,6 +254,33 @@ def check_snapshot(snap: Path, live_home: Path, vault: Path, max_age_h: float = 
     miss = [f for f in EXTRA_FILES if not (snap / f).exists()]
     add("A8", not miss, "额外文件齐全" if not miss else f"缺 {miss}（官方备份不覆盖，丢了要重置）")
 
+    # A12 本机配置快照（etc/*.conf）
+    # 判据是「同名集合相等」而不是「数量不少于」：源里新加一个 conf 而备份没跟上，
+    # 用数量比会漏（源 5 个、备份 4 个且多一个旧文件时数量正好相等）。
+    etc_src = etc_src or ETC_DIR
+    want = {p.name for p in etc_src.glob(ETC_GLOB) if p.is_file()} if etc_src.is_dir() else set()
+    ed = snap / "etc"
+    have = {p.name for p in ed.iterdir() if p.is_file()} if ed.is_dir() else set()
+    perm_bad = []
+    if ed.is_dir() and (ed.stat().st_mode & 0o077):
+        perm_bad.append(f"etc/={oct(ed.stat().st_mode & 0o777)}")
+    for p in (ed.iterdir() if ed.is_dir() else []):
+        if p.is_file() and (p.stat().st_mode & 0o077):
+            perm_bad.append(f"etc/{p.name}={oct(p.stat().st_mode & 0o777)}")
+    if not want:
+        add("A12", False, f"源 {etc_src} 下没有 {ETC_GLOB}（路径不对或目录不可读）")
+    else:
+        ok12 = (want == have) and not perm_bad
+        detail = f"etc {len(have & want)}/{len(want)} 个配置"
+        if not ok12:
+            if want - have:
+                detail += f"；缺 {sorted(want - have)}"
+            if have - want:
+                detail += f"；多 {sorted(have - want)}"
+            if perm_bad:
+                detail += f"；权限过宽 {perm_bad}"
+        add("A12", ok12, detail)
+
     return items
 
 
@@ -285,7 +345,12 @@ def cmd_backup(vault: Path, home: Path) -> int:
             os.chmod(snap / name, 0o600)
             _log(f"  + {name}（官方备份不覆盖；已剥掉源文件标志位）")
 
-    items = check_snapshot(snap, home, vault) + check_live_vs_backup(snap, home)
+    got_etc = copy_etc(ETC_DIR, snap)     # 本机配置：心跳/记忆推送/备份打卡/memwatch
+    if got_etc:
+        _log(f"  + etc/{len(got_etc)} 个配置：{', '.join(got_etc)}")
+
+    items = (check_snapshot(snap, home, vault, etc_src=ETC_DIR)
+             + check_live_vs_backup(snap, home))
     bad = [i for i in items if i["level"] == "FAIL"]
     for i in items:
         _log(f"  {i['level']:<4} {i['id']} {i['msg']}")
@@ -369,11 +434,37 @@ def cmd_drill(vault: Path, home: Path) -> int:
         diff = [f"{t}: 备份{c_bk.get(t)} vs 恢复{c_dr.get(t)}" for t in sorted(set(c_bk) | set(c_dr))
                 if c_bk.get(t) != c_dr.get(t)]
         key_ok = len((Path(tmp) / "master.key").read_text().strip()) == KEY_SHAPE_LEN
+
+        # 配置恢复：snap/etc → tmp/etc，逐文件 sha256 自校验（证明这份快照真能落地），
+        # 再与线上 ~/.local/etc 比 —— 不一致说明「备份之后又改过配置」，不是故障，
+        # 但要报出来，否则会误信「备份里有最新配置」。
+        etc_snap = snap / "etc"
+        etc_files = sorted(p for p in etc_snap.iterdir() if p.is_file()) if etc_snap.is_dir() else []
+        etc_bad, etc_stale = [], []
+        if etc_files:
+            dst = Path(tmp) / "etc"
+            dst.mkdir(exist_ok=True)
+            os.chmod(dst, 0o700)
+            for f in etc_files:
+                shutil.copyfile(f, dst / f.name)
+                os.chmod(dst / f.name, 0o600)
+                h1 = hashlib.sha256(f.read_bytes()).hexdigest()
+                if hashlib.sha256((dst / f.name).read_bytes()).hexdigest() != h1:
+                    etc_bad.append(f.name)
+                live = ETC_DIR / f.name
+                if live.exists() and hashlib.sha256(live.read_bytes()).hexdigest() != h1:
+                    etc_stale.append(f.name)
+
         _log(f"演练快照 {snap.name}｜恢复耗时 {secs:.1f}s")
         _log(f"  表数 备份={n_bk} 恢复={n_dr}")
         _log(f"  逐表行数{'一致' if not diff else '不一致：' + str(diff)}")
         _log(f"  master.key 形状{'正常' if key_ok else '异常'}")
-        ok = not diff and n_bk > 0 and n_dr == n_bk and key_ok
+        if etc_files:
+            _log(f"  etc {len(etc_files)} 个 conf 恢复{'校验一致' if not etc_bad else '损坏：' + str(etc_bad)}"
+                 + ("" if not etc_stale else f"；与线上内容不同（备份后又改过？）{etc_stale}"))
+        else:
+            _log("  etc 快照缺失（旧快照或未拷配置）")
+        ok = not diff and n_bk > 0 and n_dr == n_bk and key_ok and not etc_bad
         _log("✅ 演练通过：备份可完整还原" if ok else "❌ 演练失败")
         return 0 if ok else 1
     finally:
@@ -399,12 +490,24 @@ def _fake_snapshot(root: Path, rows: int = 5, tables: int = 2) -> Path:
     (snap / "rules.json").write_text("{}")
     (snap / "feishu.json").write_text("{}")
     for f in snap.iterdir():
-        os.chmod(f, 0o600)
+        if f.is_file():
+            os.chmod(f, 0o600)
+    # 配置快照：生产走 ~/.local/etc，自检造一份同形的临时 etc（不在 case 里各写一遍，
+    # 否则 12 个用例都要记着补这一层，漏一个就变成「A12 恒红」的噪音）
+    etc = root / "etc"
+    if not etc.is_dir():
+        etc.mkdir()
+        os.chmod(etc, 0o700)
+        for n in ("wb-heartbeat.conf", "wb-autoloop-backup.conf", "wb-memory-push.conf"):
+            p = etc / n
+            p.write_text("K=v\n")
+            os.chmod(p, 0o600)
+    copy_etc(etc, snap)
     return snap
 
 
 def cmd_self_test() -> int:
-    """12 项故障注入：每项只破坏一个维度，断言**恰好那一项**变红。
+    """15 项故障注入：每项只破坏一个维度，断言**恰好那一项**变红。
 
     「全绿」不足以证明闸门有效（见项目纪律：用例须被反证过才算覆盖）。
     """
@@ -424,7 +527,8 @@ def cmd_self_test() -> int:
 
     def reds(root: Path, dev_fn=None) -> list[str]:
         snap = next((root / "vault").iterdir())
-        items = (check_snapshot(snap, root / "home", root / "vault", dev_fn=dev_fn)
+        items = (check_snapshot(snap, root / "home", root / "vault", dev_fn=dev_fn,
+                                etc_src=root / "etc")
                  + check_live_vs_backup(snap, root / "home"))
         return sorted(i["id"] for i in items if i["level"] == "FAIL")
 
@@ -463,7 +567,8 @@ def cmd_self_test() -> int:
 
     def case_same_volume(root: Path):
         s = _fake_snapshot(root); make_live(root)
-        items = check_snapshot(s, root / "home", root / "vault", dev_fn=same_dev)
+        items = check_snapshot(s, root / "home", root / "vault", dev_fn=same_dev,
+                               etc_src=root / "etc")
         return sorted(i["id"] for i in items if i["level"] == "FAIL")
 
     def case_perm(root: Path):
@@ -493,6 +598,29 @@ def cmd_self_test() -> int:
         _fake_snapshot(root); (root / "home").mkdir()   # 没有 live 库
         return reds(root, split_dev)
 
+    def case_no_etc(root: Path):
+        s = _fake_snapshot(root); make_live(root)
+        (s / "etc" / "wb-heartbeat.conf").unlink()
+        return reds(root, split_dev)
+
+    def case_etc_perm(root: Path):
+        s = _fake_snapshot(root); make_live(root)
+        os.chmod(s / "etc" / "wb-memory-push.conf", 0o644)
+        return reds(root, split_dev)
+
+    def case_src_rename_conf(root: Path):
+        # 源里换掉一个 conf（删 memory、加 brand-new），快照仍是旧的那个。
+        # 两边数量都是 3 —— 这是**专门为反证「数量比对」写的对偶用例**：
+        # 若 A12 用 len(want)==len(have) 判断，此例会绿（漏检）；只有集合比对抓得住。
+        # 已做变异测试：把判据临时改成数量比对，此例确实变绿（见 docs 记录）。
+        s = _fake_snapshot(root); make_live(root)
+        etc = root / "etc"
+        (etc / "wb-memory-push.conf").unlink()
+        p = etc / "brand-new.conf"
+        p.write_text("K=v\n")
+        os.chmod(p, 0o600)
+        return reds(root, split_dev)
+
     cases = [
         ("裸绿（无破坏）", "case_ok", case_ok, []),
         ("缺 master.key", "case_missing_key", case_missing_key, ["A6"]),
@@ -506,6 +634,9 @@ def cmd_self_test() -> int:
         ("缺 feishu.json", "case_no_extra", case_no_extra, ["A8"]),
         ("备份行数多于 live", "case_row_overflow", case_row_overflow, ["A9"]),
         ("live 库不可读", "case_live_unreadable", case_live_unreadable, ["A9"]),
+        ("快照缺一个 conf", "case_no_etc", case_no_etc, ["A12"]),
+        ("conf 权限 0644", "case_etc_perm", case_etc_perm, ["A12"]),
+        ("源换名 conf 未跟上", "case_src_rename_conf", case_src_rename_conf, ["A12"]),
     ]
 
     fail = 0
