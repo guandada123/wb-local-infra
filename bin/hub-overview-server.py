@@ -427,6 +427,19 @@ def collect():
                             "fail": [fail_day[d] for d in days],
                             "note": "口径=hub 轮次（done/cancelled），非模型原始调用次数"}
 
+        # 回执不合规次数（7 日）：既是问题指标，也是「第三方补丁是否被升级覆盖」的哨兵——
+        # 补丁一旦丢失，这个数字会重新涨。created_at 是 UTC ISO（带 T 和 Z），比较前去 T。
+        rc_cnt, rc_last = 0, ""
+        try:
+            row = q(con, "SELECT COUNT(*) AS c, datetime(MAX(replace(substr(created_at,1,19),'T',' ')),'+8 hours') AS m "
+                         "FROM cards WHERE title LIKE '%回执%' "
+                         "AND replace(substr(created_at,1,19),'T',' ') >= datetime('now','-7 days')")
+            if isinstance(row, list) and row:
+                rc_cnt = int(row[0].get("c") or 0)
+                rc_last = (row[0].get("m") or "")
+        except Exception:
+            pass
+
         # 资源水位：只给可核算的真实数值 + 口径说明，不做无阈值依据的百分比条
         out["metrics"] = [
             {"label": "runs 取样条数", "val": f"{len(runs)} 条（上限 500）", "note": "hub.db runs 视图，按 created_at 倒序"},
@@ -438,6 +451,9 @@ def collect():
              "note": ps.get("note", "")},
             {"label": "最老待办", "val": (f"{old_days} 天" if old_days is not None else "—"),
              "note": (f"{old_title[:40]}（仅统计群消息来源条目）" if old_title else "无带原文的待办")},
+            {"label": "回执不合规(7日)", "val": f"{rc_cnt} 次",
+             "note": (f"最近 {rc_last}（本地时间）；这是补丁哨兵，若补丁被升级覆盖会重新涨"
+                      if rc_cnt else "近 7 天无新增；补丁若被升级覆盖，这里会重新涨起来")},
         ]
 
         # 日志区 = events 事件账（结构化、有级别可判）+ 尾部日志行补充
