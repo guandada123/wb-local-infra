@@ -801,7 +801,7 @@ class TestOffsiteMirror(unittest.TestCase):
         self.assertIsNotNone(m, f"输出里没有通过计数:\n{out}")
         got, total = int(m.group(1)), int(m.group(2))
         self.assertEqual(got, total, f"故障注入未全通过：{got}/{total}\n{out}")
-        self.assertGreaterEqual(total, 13, "故障注入用例数不应减少（每条反证一个判据）")
+        self.assertGreaterEqual(total, 17, "故障注入用例数不应减少（每条反证一个判据）")
 
     def test_plist_points_at_existing_python(self):
         """plist 硬编码的解释器一旦因 WorkBuddy 升级消失，作业静默不跑。"""

@@ -39,7 +39,26 @@ Time Machine —— 它没有配置任何目标（`No destinations configured`�
 
 落点：`~/Backups/offsite-mirror/<相对路径>`，内盘，按 `st_dev` 校验异卷。
 
-## 三、判据 V1–V5
+## 三、判据（V0 写前闸门 + V1–V5 事后校验）
+
+### V0 容量闸门 —— 在动手之前
+
+这份镜像**只增不删**（见下 V5），体积只会涨。内盘被它写满不是「备份失败」这么轻的事：
+系统更新、编译临时文件、sleepimage 都要那块盘，写满会把与备份无关的工作一起弄坏。所以
+容量是闸门，不是报表：
+
+| 项 | 规则 |
+|---|---|
+| 待写量 | 按**相对路径集合**算「源有而落点无、或大小不同」的字节数 |
+| 需要量 | `待写 × 1.10 + 64MiB`（rsync 写临时文件再 rename，同一份会短暂占两份） |
+| 放行条件 | `可用 − 需要量 ≥ 20GiB` |
+
+不放行时 `run` 直接 `rc=3`，**一个文件都不写**，状态里记 `V0`，`daily` 随之打 `/fail`。
+
+为什么要按路径集合、而不是「源总量 − 落点总量」：落点积着源里已删除的旧文件时，旧文件
+会把这笔增量抵消掉、甚至算出负数，于是「空间不够」被算成「不用空间」。self-test 里
+「落点旧文件抵消增量」这条用例带**对偶断言**——同一组输入下旧口径必须放行，否则这个
+用例证明不了任何事（变异测试实测：把 `pending_bytes` 换回旧口径，17 项里恰好那 1 项变红）。
 
 | id | 判据 | 判红条件 |
 |---|---|---|
@@ -94,11 +113,19 @@ python3 ~/.local/bin/wb-offsite-mirror.py run        # rsync 增量 + 立即校�
 python3 ~/.local/bin/wb-offsite-mirror.py verify     # 只校验（不动落点）
 python3 ~/.local/bin/wb-offsite-mirror.py daily      # launchd 入口：备份→校验→打卡/告警
 python3 ~/.local/bin/wb-offsite-mirror.py status     # 上次结果与距上次成功
-python3 ~/.local/bin/wb-offsite-mirror.py self-test  # 13 项故障注入（每项断言恰好那一项红）
+python3 ~/.local/bin/wb-offsite-mirror.py self-test  # 故障注入（每项断言恰好那一项红）
 ```
+
+自检当前 17 项：V1–V5 各 1–2 项、V0 容量 4 项（充足放行 / 余量被增量吃掉 /
+落点旧文件抵消增量 / 闸门不过则不写一个字节）。
 
 首次实测（2026-11-24 12:14–12:31）：32,833 文件 / 6.6GB，V1–V5 全过、V4 抽样 30 个一致、
 增量 run 8 秒、launchd 实跑 `last exit code = 0`、外部 check 收到打卡（Last Duration 17s）。
+
+打卡**端到端**复验（12:36）：`daily` 打出 `打卡[start] HTTP 200` / `打卡[success] HTTP 200`，
+随后在 healthchecks 面板读到 `Offsite Mirror` 绿点、`Last Ping 10 minutes ago`、
+`Period 1 day / Grace 2 hours`。
+「HTTP 200」只证明对面收下了，不证明 check 里那条记录是绿的 —— 两步都要看。
 
 ## 六、残余风险（未解决，按严重度）
 

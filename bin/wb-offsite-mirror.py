@@ -16,6 +16,10 @@
   可重装），而真正不可替代的这 6G 恰好落在保护范围之外。内盘还剩 62G，够放下这份镜像 ——
   所以用「靶向镜像」先补上，而不是干等第三块盘。
 
+写之前先过容量闸门（V0，见 capacity_preflight）：这份镜像只增不删，内盘被它写满会连带
+把系统拖住（系统更新、临时文件、swap 都要空间），所以「余量不足」必须在开写前拦住，
+而不是写一半报 ENOSPC。
+
 判据（V1–V5，每条都有对应的故障注入用例）：
   V1 源与落点必须不同物理卷（按 st_dev，不看路径前缀）
   V2 每一项源必须存在且非空；含通配的项必须至少展开出 1 个目录
@@ -32,7 +36,7 @@
   wb-offsite-mirror.py verify         # 只校验，不动落点
   wb-offsite-mirror.py daily          # launchd 入口：run → 只在出问题时推飞书 + 打卡
   wb-offsite-mirror.py status         # 上次运行结果
-  wb-offsite-mirror.py self-test      # 13 项故障注入，每项断言恰好那一项变红
+  wb-offsite-mirror.py self-test      # 故障注入，每项只破坏一个维度，断言恰好那一项变红
 """
 
 from __future__ import annotations
@@ -63,6 +67,12 @@ ITEMS = [
 STATE_FILE = Path(os.path.expanduser("~/.local/etc/wb-offsite-mirror.state.json"))
 PING_CONF = Path(os.path.expanduser("~/.local/etc/wb-offsite-mirror.conf"))
 REMIND_DAYS = 7
+
+# 容量闸门：写完之后内盘至少还要剩这么多。20 GiB 不是拍脑袋 —— 系统更新包、编译临时文件、
+# sleepimage 都往系统盘写，写到 0 会连带把不属于备份的工作一起弄坏。
+MIN_FREE_AFTER = 20 * 1024**3
+GROWTH_SLACK = 1.10            # rsync 落点是「临时文件写完再 rename」，同一份文件会短暂占两份
+RSYNC_TMP_ALLOW = 64 * 1024**2  # 并发文件的固定开销
 
 
 def _log(msg: str) -> None:
@@ -104,6 +114,58 @@ def walk(root: Path) -> dict[str, int]:
             except OSError:
                 continue
     return files
+
+
+def _gib(n: float) -> str:
+    return f"{n / 1024**3:.1f}G"
+
+
+def pending_bytes(src: dict[str, int], dst: dict[str, int]) -> int:
+    """源里「落点没有、或大小不一致」的字节数。
+
+    用路径集合算，不用「源总量 − 落点总量」：落点留着上一版旧文件时，旧文件会把这笔
+    增量抵消掉（甚至算出负数），于是「空间不够」被算成「不用空间」。这条判据最可能
+    放过的是「落点积了大量源已删除的旧文件」，对偶用例见 self-test。
+    """
+    return sum(sz for rel, sz in src.items() if dst.get(rel) != sz)
+
+
+def capacity_verdict(pending: int, free: int,
+                     min_free_after: int = MIN_FREE_AFTER) -> tuple[bool, int, int]:
+    """纯算术，便于注入：返回 (是否放行, 需要字节, 写后剩余字节)。"""
+    need = int(pending * GROWTH_SLACK) + RSYNC_TMP_ALLOW
+    after = free - need
+    return after >= min_free_after, need, after
+
+
+def capacity_preflight(pairs: list[tuple[str, Path]], dest_root: Path,
+                       min_free_after: int = MIN_FREE_AFTER, free_fn=None) -> dict:
+    """开写前的容量闸门：只读，不改任何文件。返回 ok/msg 与各分项，供日志与 status 用。"""
+    probe = dest_root
+    try:
+        while not probe.exists() and probe != probe.parent:
+            probe = probe.parent
+        free = (free_fn or (lambda p: shutil.disk_usage(p).free))(probe)
+    except OSError as e:
+        return {"ok": False, "pending": 0, "need": 0, "free": 0, "after": 0, "mirror_bytes": 0,
+                "msg": f"读不到落点可用空间（{e.__class__.__name__}）—— 宁可拦住也不写"}
+    pending = 0
+    dst_total = 0
+    detail: list[str] = []
+    for name, p in pairs:
+        dst = walk(dest_root / name)
+        dst_total += sum(dst.values())
+        nb = pending_bytes(walk(p), dst)
+        pending += nb
+        if nb:
+            detail.append(f"{name} {_gib(nb)}")
+    ok, need, after = capacity_verdict(pending, free, min_free_after)
+    msg = (f"容量预检{'通过' if ok else '不通过'}：待写 {_gib(pending)}，含余量需 {_gib(need)}，"
+           f"当前余 {_gib(free)}，写后剩 {_gib(after)}，下限 {_gib(min_free_after)}")
+    if detail:
+        msg += "；增量 " + "、".join(detail[:3]) + ("…" if len(detail) > 3 else "")
+    return {"ok": ok, "pending": pending, "need": need, "free": free,
+            "after": after, "mirror_bytes": dst_total, "msg": msg}
 
 
 def sha256_of(p: Path, chunk: int = 1 << 20) -> str:
@@ -290,6 +352,13 @@ def cmd_run(src_root: Path, dest_root: Path, verbose: bool = True) -> int:
         return 2
     pairs = expand_items(src_root)
     _log(f"→ 镜像 {len(pairs)} 项：{src_root} → {dest_root}")
+    cap = capacity_preflight(pairs, dest_root)
+    _log(f"  {cap['msg']}")
+    if not cap["ok"]:
+        _save_state(False, [{"id": "V0", "level": "FAIL", "msg": cap["msg"]}],
+                    extra={"mirror_bytes": cap["mirror_bytes"]})
+        _log("❌ 容量不足，一个文件都没写 —— 写满系统盘会把与备份无关的事一起弄坏")
+        return 3
     fails = 0
     for name, p in pairs:
         if not p.is_dir():
@@ -310,16 +379,18 @@ def cmd_run(src_root: Path, dest_root: Path, verbose: bool = True) -> int:
         _log(f"  {icon} {it['id']} {it['msg']}")
     bad = [it for it in items if it["level"] == "FAIL"]
     ok = not bad and fails == 0
-    _save_state(ok, items)
+    _save_state(ok, items, extra={"mirror_bytes": cap["mirror_bytes"]})
     _log("✅ 镜像完成且校验通过" if ok else "❌ 镜像有问题（见上）")
     return 0 if ok else 1
 
 
-def _save_state(ok: bool, items: list[dict]) -> None:
+def _save_state(ok: bool, items: list[dict], extra: dict | None = None) -> None:
     st = _load_state()
     st["last_run"] = time.strftime("%Y-%m-%dT%H:%M:%S")
     st["ok"] = ok
     st["fails"] = [it["id"] for it in items if it["level"] == "FAIL"]
+    if extra:
+        st.update(extra)
     if ok:
         st["last_ok"] = st["last_run"]
     try:
@@ -403,6 +474,12 @@ def cmd_status() -> int:
         return 1
     _log(json.dumps(st, ensure_ascii=False, indent=1))
     _log("打卡配置：" + ("已配置" if _ping_url() else "未配置"))
+    if st.get("mirror_bytes"):
+        _log(f"镜像体积 {_gib(st['mirror_bytes'])}")
+        try:
+            _log(f"内盘当前余 {_gib(shutil.disk_usage(DEST_ROOT).free)}（下限 {_gib(MIN_FREE_AFTER)}）")
+        except OSError:
+            pass
     if st.get("last_ok"):
         t = time.mktime(time.strptime(st["last_ok"], "%Y-%m-%dT%H:%M:%S"))
         _log(f"距上次成功 {(time.time() - t) / 3600:.1f} 小时")
@@ -411,7 +488,7 @@ def cmd_status() -> int:
 
 # ---------------------------------------------------------------- 故障注入
 def cmd_self_test() -> int:
-    """13 项故障注入：每项只破坏一个维度，断言**恰好那一项**变红。"""
+    """故障注入：每项只破坏一个维度，断言**恰好那一项**变红。"""
     import tempfile
 
     def build(root: Path) -> Path:
@@ -527,6 +604,66 @@ def cmd_self_test() -> int:
         assert "V5" in warns(src, root / "dst"), "多余旧文件必须报 WARN"
         return []
 
+    # ---- 容量闸门（V0）：纯算术注入，不靠真把内盘写满
+    def case_capacity_ok(root: Path) -> list[str]:
+        build(root)
+        cap = capacity_preflight(expand_items(root / "src"), root / "dst",
+                                 free_fn=lambda _p: 1 << 40)
+        assert cap["ok"], f"空间充足却拦住：{cap['msg']}"
+        assert cap["pending"] == 0, f"落点已齐却算出待写 {cap['pending']} 字节"
+        return []
+
+    def case_capacity_short(root: Path) -> list[str]:
+        """余量只比下限多一点点，待写量把它吃掉 → 必须拦住。"""
+        src = build(root)
+        (root / "src/workbuddy_data/projects/p3").mkdir(parents=True)
+        (root / "src/workbuddy_data/projects/p3/big.bin").write_bytes(b"z" * (5 << 20))
+        cap = capacity_preflight(expand_items(src), root / "dst",
+                                 free_fn=lambda _p: MIN_FREE_AFTER + (1 << 20))
+        assert not cap["ok"], "待写量会吃掉余量，却放行了"
+        return []
+
+    def case_capacity_stale_offset(root: Path) -> list[str]:
+        """落点积着大量旧文件：用「源总量−落点总量」会算成负数而放行，必须用路径集合。
+
+        对偶断言（证明这个用例真的有效）：同一组输入下旧口径必须**放行** —— 否则它
+        只是又一个所有口径都拦得住的假绿灯。
+        """
+        src = build(root)
+        stale = root / "dst/workbuddy_data/projects/old"
+        stale.mkdir(parents=True, exist_ok=True)
+        (stale / "junk.bin").write_bytes(b"j" * (50 << 20))      # 50M 源里已删的旧文件
+        (root / "src/workbuddy_data/projects/p3").mkdir(parents=True)
+        (root / "src/workbuddy_data/projects/p3/big.bin").write_bytes(b"z" * (5 << 20))
+        free = MIN_FREE_AFTER + (66 << 20)                       # 只够旧口径蒙过去
+        pairs = expand_items(src)
+        cap = capacity_preflight(pairs, root / "dst", free_fn=lambda _p: free)
+        s_tot = sum(sum(walk(p).values()) for _n, p in pairs)
+        d_tot = sum(sum(walk(root / "dst" / n).values()) for n, _p in pairs)
+        naive_ok, _, _ = capacity_verdict(max(0, s_tot - d_tot), free)
+        assert naive_ok, "对偶前提不成立：旧口径也拦住，这个用例证明不了任何事"
+        assert cap["pending"] >= (5 << 20), f"路径口径应看到 5M 待写，实际 {cap['pending']}"
+        assert not cap["ok"], "旧文件抵消了增量，被算成放行"
+        return []
+
+    def case_capacity_gate_blocks_write(root: Path) -> list[str]:
+        """注入「闸门不过」→ cmd_run 必须 rc=3，且一个文件都不写、状态记 V0。"""
+        src = build(root)
+        shutil.rmtree(root / "dst")
+        saved = (globals()["capacity_preflight"], globals()["STATE_FILE"])
+        globals()["capacity_preflight"] = lambda *a, **k: {
+            "ok": False, "pending": 1, "need": 1, "free": 0, "after": -1,
+            "mirror_bytes": 0, "msg": "注入：余量不足"}
+        globals()["STATE_FILE"] = root / "state.json"
+        try:
+            rc = cmd_run(src, root / "dst")
+        finally:
+            globals()["capacity_preflight"], globals()["STATE_FILE"] = saved
+        assert rc == 3, f"闸门不过应 rc=3，实际 {rc}"
+        assert not (root / "dst" / "workbuddy_data").exists(), "拦住之后仍写了文件"
+        assert json.loads((root / "state.json").read_text())["fails"] == ["V0"], "状态没记 V0"
+        return []
+
     cases = [
         ("裸绿（无破坏）", case_ok, []),
         ("落点缺一整项", case_missing_item, ["V3"]),
@@ -541,6 +678,10 @@ def cmd_self_test() -> int:
         ("上次成功后新增文件", case_fresh_since_ok, []),
         ("上次成功已 48 小时", case_stale_since, ["V3"]),
         ("落点有多余旧文件", case_stale_ok, []),
+        ("容量充足放行", case_capacity_ok, []),
+        ("余量被增量吃掉", case_capacity_short, []),
+        ("落点旧文件抵消增量", case_capacity_stale_offset, []),
+        ("闸门不过则不写一个字节", case_capacity_gate_blocks_write, []),
     ]
     passed = 0
     for title, fn, expect in cases:

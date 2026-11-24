@@ -64,7 +64,7 @@ DEFAULT_VAULT = os.environ.get("WB_VAULT") or "/Volumes/ZHITAI/backups/agent-aut
 MAX_AGE_H = 26.0      # 每日一次，留 2h 抖动余量
 KEEP = 8              # 保留份数上限（8×27MB ≈ 216MB）
 EXTRA_FILES = ["feishu.json"]   # 官方备份不覆盖、但丢了要重置的
-# 本机配置（心跳/记忆推送/备份打卡/memwatch）—— 2026-11-24 审计：4 个 *.conf 全部只有一份，
+# 本机配置（心跳/记忆推送/备份打卡/memwatch/镜像打卡）—— 2026-11-24 审计：*.conf 全部只有一份，
 # 丢了心跳与备份打卡一起哑。只拷 *.conf：*.state.json 是运行态（每天变），丢了最多重发一次提醒。
 ETC_DIR = Path(os.path.expanduser("~/.local/etc"))
 ETC_GLOB = "*.conf"
@@ -156,7 +156,7 @@ def quick_check(db: Path) -> tuple[bool, str]:
 def copy_etc(etc_src: Path, snap: Path) -> list[str]:
     """把 etc_src/*.conf 拷进快照的 etc/ 子目录，返回拷贝的文件名。
 
-    为什么单独一组：这 4 个 conf 是整机自动化的神经中枢（心跳打卡 URL、记忆推送仓与群、
+    为什么单独一组：这些 conf 是整机自动化的神经中枢（心跳打卡 URL、记忆推送仓与群、
     备份打卡 URL、内存守护阈值），2026-11-24 审计确认**全部只有一份**。
     它们含「能伪造打卡/能往群里发消息」的引用，所以落盘一律 0600。
 
