@@ -857,7 +857,7 @@ class TestUiGuard(unittest.TestCase):
         self.assertIsNotNone(m, f"输出里没有通过计数:\n{out}")
         got, total = int(m.group(1)), int(m.group(2))
         self.assertEqual(got, total, f"故障注入未全通过：{got}/{total}\n{out}")
-        self.assertGreaterEqual(total, 12, "故障注入用例数不应减少（每条反证一个判据）")
+        self.assertGreaterEqual(total, 13, "故障注入用例数不应减少（每条反证一个判据）")
 
     def test_self_test_does_not_pollute_log(self):
         """自检不得写真实日志。
@@ -1031,3 +1031,72 @@ class TestInterlockVerify(unittest.TestCase):
             scanner=lambda: {"front": "Finder"})
         self.assertFalse(ok)
         self.assertEqual("0", str(detail.get("rc")))
+
+
+class TestInterlockRollback(unittest.TestCase):
+    """接线失败必须自动还原成软链（2026-11-24 审计 P3-3：回滚路径此前零测试）。"""
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "wb-ui-guard.py"
+
+    def _mod(self, td):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("wb_ui_guard_mod_r", self.SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.INTERLOCK = Path(td) / "cliclick"
+        mod.STATE = Path(td) / "state.json"
+        mod.LOG = Path(td) / "guard.log"
+        real = Path(td) / "real-cliclick"
+        real.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        real.chmod(0o755)
+        os.symlink(real, mod.INTERLOCK)
+        return mod, real
+
+    def test_rollback_when_verify_fails(self):
+        # 断言必须写在 with 块内：TemporaryDirectory 一退出，路径就不存在了，
+        # is_symlink() 会恒为 False（第一版就是这么写错的，测试红在自己身上）。
+        with tempfile.TemporaryDirectory() as td:
+            mod, real = self._mod(td)
+            mod._verify_interlock = lambda r, **kw: (False, {"front": "X", "rc": "0", "out": ""})
+            rc = mod.cmd_install([])
+            is_link = mod.INTERLOCK.is_symlink()
+            target = os.readlink(mod.INTERLOCK) if is_link else None
+        self.assertEqual(1, rc, "自检失败应返回 1")
+        self.assertTrue(is_link, "回滚后必须恢复为软链，不能留下半截 shim")
+        # macOS 上 /var 是 /private/var 的软链，比较必须按解析后的路径
+        self.assertEqual(str(real.resolve()), str(Path(target).resolve()))
+
+    def test_success_replaces_with_shim(self):
+        with tempfile.TemporaryDirectory() as td:
+            mod, _real = self._mod(td)
+            mod._verify_interlock = lambda r, **kw: (True, {"front": "X", "rc": "0", "out": "1,2"})
+            rc = mod.cmd_install([])
+            is_link = mod.INTERLOCK.is_symlink()
+            body = mod.INTERLOCK.read_text(encoding="utf-8")
+        self.assertEqual(0, rc)
+        self.assertFalse(is_link, "成功后 INTERLOCK 应被替换成 shim")
+        self.assertIn("wb-ui-guard", body)
+
+
+class TestGuardDenyListHygiene(unittest.TestCase):
+    """DENY/SECRET 名单的口径（2026-11-24 审计 P2-1/P2-2）。"""
+
+    SCRIPT = Path(__file__).resolve().parent.parent / "bin" / "wb-ui-guard.py"
+
+    def test_no_unjustified_mobile_sms(self):
+        """com.apple.MobileSMS 曾被无依据加入 DENY —— 它既不毁数据，也不显示机密。"""
+        src = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn("com.apple.MobileSMS", src, "无依据的 DENY 项会误拦「信息」窗口")
+
+    def test_secret_list_is_narrow(self):
+        """SECRET 只认「恢复密钥」：裸"密钥"会把钥匙串口令框也判成机密态。"""
+        src = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertIn('SECRET_CN = ("恢复密钥",)', src)
+        self.assertNotIn('SECRET_CN = ("恢复密钥", "密钥")', src)
+
+    def test_fallback_real_is_not_hardcoded_version(self):
+        """真身回退不能写死版本号，brew 一升级就失效（P2-3）。"""
+        src = self.SCRIPT.read_text(encoding="utf-8")
+        self.assertNotIn('"/opt/homebrew/Cellar/cliclick/5.1/bin/cliclick"', src)
+        self.assertIn("CELLAR_GLOB", src)

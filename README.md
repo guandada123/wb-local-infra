@@ -241,6 +241,6 @@ python3 bin/majiu-archive-index.py --check 总册.md      # 0 一致 / 1 过期 
 - **必须接线**：PATH 里 `/opt/homebrew/bin` 在 `~/.local/bin` 之前，所以在 local 放同名脚本挡不住；
   `install-interlock` 把 `/opt/homebrew/bin/cliclick` 换成 shim（目录属 guan:admin，无需 sudo），可一键还原
 - **自身位断言**：`status` 的 rc 就是接线状态（0 已接 / 7 未接），避免「仓库里躺个文件当闸门」
-- 12 项故障注入 + 3 次变异测试（删「抹掉」/ 机密分支按 Esc / 去掉 bundle 判据，各恰好 1 项红）；自检不写真实日志
+- 13 项故障注入 + 4 次变异测试（删「抹掉」/ 机密分支按 Esc / 去掉 bundle 判据 / 机密词放宽，各恰好 1 项红）；自检不写真实日志
 - **完整边界（只管 cliclick / 网页对话框不在 AX 树 / 未做实弹测试 / brew 升级会覆盖 shim）**：
   `docs/gui-automation-guard.md`

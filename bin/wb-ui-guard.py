@@ -28,7 +28,7 @@
     wb-ui-guard.py status               # 闸门是否真的接上线（自身位断言）
     wb-ui-guard.py install-interlock    # 替换 /opt/homebrew/bin/cliclick（可逆）
     wb-ui-guard.py remove-interlock     # 还原 brew 软链
-    wb-ui-guard.py self-test            # 12 项故障注入
+    wb-ui-guard.py self-test            # 13 项故障注入
 
 退出码：0 放行 / 2 危险模态(已 Esc) / 3 前台应用被禁 / 4 读不到屏幕 / 5 机密模态(未 Esc)
         / 6 未知模态 / 7 未接线仍被直接调用
@@ -48,7 +48,26 @@ HOME = Path(os.path.expanduser("~"))
 STATE = HOME / ".local/etc/wb-ui-guard.json"
 LOG = HOME / ".local/log/wb-ui-guard.log"
 INTERLOCK = Path("/opt/homebrew/bin/cliclick")
-FALLBACK_REAL = "/opt/homebrew/Cellar/cliclick/5.1/bin/cliclick"
+CELLAR_GLOB = "/opt/homebrew/Cellar/cliclick/*/bin/cliclick"  # 版本号会变，不能写死
+
+
+def _newest_cellar():
+    """按 Cellar 目录找最新的 cliclick 真身。
+
+    为什么不写死 `/opt/homebrew/Cellar/cliclick/5.1/bin/cliclick`：brew 一升级版本号就变，
+    写死会在升级后指向不存在的路径，报"找不到真 cliclick"，容易被误判成没装（审计 P2-3）。
+    """
+    import glob
+    cands = [p for p in glob.glob(CELLAR_GLOB) if Path(p).exists()]
+    if not cands:
+        return None
+    def _ver(path):
+        seg = Path(path).parts[-3]
+        return tuple(int(x) if x.isdigit() else 0 for x in seg.replace("-", ".").split("."))
+    return sorted(cands, key=_ver)[-1]
+
+
+FALLBACK_REAL = _newest_cellar() or "/opt/homebrew/bin/cliclick"
 
 # D1：这些前台应用一律不接坐标点击。判据不读文本，只认应用身份。
 # 两套并行：名字给人看，bundle id 给机器判。**只靠名字会漏**—— macOS 26 把
@@ -62,7 +81,7 @@ DENY_APPS = (
 DENY_BUNDLES = (
     "com.apple.systempreferences", "com.apple.DiskUtility", "com.apple.Passwords",
     "com.apple.keychainaccess", "com.apple.SecurityAgent", "com.apple.Installer",
-    "com.apple.MigrateAssistant", "com.apple.MobileSMS",
+    "com.apple.MigrateAssistant",
 )
 
 # D2：破坏性动作。中文按子串（中文没有词边界问题），英文按词边界（防 formatted 误命中）。
@@ -71,7 +90,10 @@ BLOCK_CN = ("抹掉", "抹除", "抹去", "格式化", "初始化", "清除所�
 BLOCK_EN = ("erase", "format", "initialize", "delete volume", "remove volume", "wipe", "reformat")
 
 # D3：机密。出现这些必须停手，但不能按 Esc。
-SECRET_CN = ("恢复密钥", "密钥")
+# 只认「恢复密钥」。曾写成 ("恢复密钥", "密钥")，而"密钥"会把钥匙串口令框、SSH 口令提示
+# 一并判成机密态 → 停手等人工（2026-11-24 审计 P2-2）。D3 存在的唯一理由是：Esc 会关掉
+# **恢复密钥**的唯一一次显示，其他含"密钥"字样的对话框没有这个性质。
+SECRET_CN = ("恢复密钥",)
 SECRET_EN = ("recovery key",)
 
 RC_OK, RC_BLOCK, RC_DENY, RC_UNREAD, RC_SECRET, RC_UNKNOWN, RC_UNWIRED = 0, 2, 3, 4, 5, 6, 7
@@ -373,7 +395,10 @@ def cmd_status(_args):
 SHIM_BODY = """#!/bin/sh
 # 由 wb-ui-guard.py install-interlock 生成 —— 先过闸门，再转发真 cliclick。
 # 还原：wb-ui-guard.py remove-interlock
-exec python3 "$HOME/.local/bin/wb-ui-guard.py" forward "$@"
+# 解释器：优先用系统 python3 的绝对路径。裸写 python3 依赖 PATH，在最小 PATH（某些 cron /
+# launchd）下会 exec 失败，连带 cliclick 整个不可用（审计 P2-4）。
+if [ -x /usr/bin/python3 ]; then PY=/usr/bin/python3; else PY=python3; fi
+exec "$PY" "$HOME/.local/bin/wb-ui-guard.py" forward "$@"
 """
 
 
@@ -460,7 +485,7 @@ def _mk(front, texts, kind="sheet", bundle=""):
 
 
 def self_test():
-    """12 项故障注入：每项只注入一个条件，断言判定与「是否按 Esc」都对。"""
+    """13 项故障注入：每项只注入一个条件，断言判定与「是否按 Esc」都对。"""
     global _LOG_ENABLED
     _LOG_ENABLED = False
     calls = {"esc": 0}
@@ -501,6 +526,10 @@ def self_test():
         # 名字不在表内、只有 bundle 命中 —— 删掉 bundle 判据这一项必须变红
         ("只靠 bundle 命中", lambda: _mk("SomeApp", None, bundle="com.apple.Passwords"),
          VERDICT_DENY, 0),
+        # 对偶用例：含"密钥"但不是恢复密钥 → 只能判 UNKNOWN（停手但不按 Esc），
+        # 不得判 SECRET。把 SECRET_CN 改回 ("恢复密钥","密钥") 时这一项必须变红。
+        ("普通密钥提示不算机密态", lambda: _mk("Finder", ["请输入密钥以访问该磁盘"]),
+         VERDICT_UNKNOWN, 0),
     ]
     passed = sum(1 for c in cases if run_case(*c))
     total = len(cases)
