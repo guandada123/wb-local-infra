@@ -86,6 +86,16 @@ wb-ui-guard.py status      # rc=0 才算接线；rc=7 表示没接
 
 1. **只管 `cliclick`**。直接 `osascript -e '... click at {x,y}'`、或 AppleScript 的 `AXPress`
    不走这道闸门。它不是沙箱。
+   - 同源的第二个缺口：**D1 判的是「前台应用」，而坐标点击命中的是「最上层的窗口」**。
+     后台开着的系统设置若正好压在点击点上，闸门看不见。要闭合它必须先拿到窗口 z 序，
+     2026-11-24 试过三条路都没成：
+     · `pyobjc`：`/usr/bin/python3` 与 `~/.workbuddy/binaries` 的 3.13.12 **都没有 Quartz 模块**
+     · JXA ObjC bridge：`ObjC.import('CoreGraphics'|'Cocoa')` 后 `CGWindowListCopyWindowInfo`
+       返回的对象不可解（`count=0` / `deepUnwrap` 得 `len=undefined`）
+     · 退路「用 AX 窗口矩形判断点是否落在受禁窗口内」会**过度拒绝**：系统设置窗口 723×959
+       常开着，盖住半个屏幕，做了之后大部分点击都会被拒 —— 等于把工具废掉
+     所以选择**不做**，并在这里写明：要用时先关掉系统设置/磁盘工具。
+     若将来装了 pyobjc，正确做法是取 z 序里最上层窗口的 owner，再判是否受禁。
 2. **只认前台应用与原生模态框**。网页里的 confirm 框不在 AX 树里，D1 只能靠前台应用兜。
 3. **实弹测试：D1、D2 已过，D3 未过**（2026-11-24）
    - D1 ✅ 前台 `Passwords` → `cliclick p` 被拒 `rc=3`、无坐标输出、日志留痕；退出后恢复 `rc=0`
