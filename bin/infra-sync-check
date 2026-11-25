@@ -156,6 +156,6 @@ args=(--title "🟠 中台基础设施漂移" --level warning)
 [ -n "$idx_issue" ] && args+=(--section "③ 归档索引" "${idx_issue}
 修法：python3 ~/WorkBuddy/wb-local-infra/bin/archive-index.py（重建 _archive/INDEX.md）")
 [ -n "$majiu_issue" ] && args+=(--section "⑤ 马厩归档总册" "${majiu_issue}
-修法：python3 ~/WorkBuddy/wb-local-infra/bin/majiu-archive-index.py --with-library --out ~/WorkBuddy/马厩归档总册.md（重建后覆盖资料库那份）")
+修法：python3 ~/WorkBuddy/wb-local-infra/bin/majiu-archive-index.py --with-library --out ~/WorkBuddy/马厩归档总册.md，然后**把这份覆盖到资料库「马厩归档总册」文档**（本机侧无法自动上传；只重建本机文件，资料库那份仍是旧的）")
 "$PY" "$HOME/.local/bin/push_card.py" "${args[@]}" 2>>"$LOG" || log "push_card 失败（见上）"
 exit 0
