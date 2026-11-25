@@ -90,7 +90,14 @@ if [ "$MODE" = "snapshot" ]; then
   LIST="$REPO/launchd/active.txt"
   [ -f "$LIST" ] || { echo "缺少清单: $LIST"; exit 1; }
   # || true：空清单时 grep -v 返回 1，set -e 会让整个脚本静默退出（rc=1 无输出）
-  listed="$(grep -v '^#' "$LIST" | sed 's/^\[deploy\] //' | tr -d ' ' | grep -v '^$' || true)"
+  # [deploy] 项由 Claw .workbuddy/deploy 部署脚本管理，本清单不负责 —— 必须整行排除。
+  # 2026-11-25 修：原写法 sed 's/^\[deploy\] //' 把标记剥掉后当普通项处理，
+  # 与 active.txt 的注释意图、以及测试的期望（_expected_plist_names 跳过 [deploy]）都相反。
+  # 后果：真实环境会与本仓重复管理同一批 plist；测试环境报一堆「live 不存在」假警告。
+  listed="$(grep -v '^#' "$LIST" | grep -v '^\[deploy\]' | tr -d ' ' | grep -v '^$' || true)"
+  # 反向检查（live 有但清单无）必须认全部条目，含 [deploy] —— 它们确实登记在清单里，
+  # 只是由 Claw 部署脚本负责。用 listed 比对会把它们全报成「未登记」（实测 12 个假警告）。
+  all_listed="$(grep -v '^#' "$LIST" | sed 's/^\[deploy\] //' | tr -d ' ' | grep -v '^$' || true)"
   changed=0; fresh=0; unlisted=0
   for n in $listed; do
     live="$AGENTS/$n"; snap="$REPO/launchd/$n"
@@ -101,7 +108,7 @@ if [ "$MODE" = "snapshot" ]; then
   done
   for f in "$AGENTS"/com.user.*.plist; do
     [ -f "$f" ] || continue; n="$(basename "$f")"
-    printf '%s\n' $listed | grep -qx "$n" || { echo "⚠️  live 有但清单无（请补 active.txt）: $n"; unlisted=$((unlisted+1)); }
+    printf '%s\n' $all_listed | grep -qx "$n" || { echo "⚠️  live 有但清单无（请补 active.txt）: $n"; unlisted=$((unlisted+1)); }
   done
   echo "刷新=$changed 已最新=$fresh 未登记=$unlisted"
   exit 0

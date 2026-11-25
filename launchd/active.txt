@@ -7,6 +7,7 @@
         com.user.autoloop-feishu-hub.plist
         com.user.autoloop-feishu-push.plist
         com.user.autopilot-gate.plist
+        com.user.ci-coverage-check.plist
 [deploy] com.user.claw-qts-sync.plist
         com.user.colima-shutdown-guard.plist
 [deploy] com.user.discovery-signal-refresh.plist
@@ -24,6 +25,7 @@
         com.user.pmf-db-drill.plist
 [deploy] com.user.pmf-db-snapshot-catchup.plist
         com.user.pmf-db-snapshot.plist
+        com.user.pgsql-stall-watch.plist
 [deploy] com.user.portfolio-refresh.plist
 [deploy] com.user.qts-daily-backfill.plist
         com.user.stale-card-remind.plist

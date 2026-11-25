@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.ci-coverage-check</string>
+
+    <!-- 2026-11-24：每日两次（11:00 / 23:00）检查「提交了但 CI 没跑」。
+         起因：GitHub push 事件随机不触发 workflow，实测 17% 失效率，
+         且完全无声（不红不告警）。脚本源码：Claw/scripts/check_ci_coverage.py
+         + 内盘封装 ~/.local/bin/ci-coverage-check.py -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
+        <string>/Users/guan/.local/bin/ci-coverage-check.py</string>
+    </array>
+
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Hour</key>
+            <integer>11</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Hour</key>
+            <integer>23</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+
+    <key>StandardOutPath</key>
+    <string>/Users/guan/.local/log/ci-coverage-check.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/guan/.local/log/ci-coverage-check.err</string>
+
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>

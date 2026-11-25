@@ -1100,3 +1100,65 @@ class TestGuardDenyListHygiene(unittest.TestCase):
         src = self.SCRIPT.read_text(encoding="utf-8")
         self.assertNotIn('"/opt/homebrew/Cellar/cliclick/5.1/bin/cliclick"', src)
         self.assertIn("CELLAR_GLOB", src)
+
+
+class TestDeployMarkerHandling(unittest.TestCase):
+    """active.txt 的 [deploy] 标记必须真的被跳过（2026-11-25 修）。
+
+    起因：install.sh 原用 `sed 's/^\\[deploy\\] //'` 把标记剥掉，于是 [deploy] 项被当成
+    本仓负责的普通项 —— 与 active.txt 的注释意图（由 Claw 部署脚本管理、本清单不负责）
+    和测试 _expected_plist_names 的期望都相反。真实后果有两个：
+      ① 正向：本仓会与 Claw 部署脚本重复管理同一批 plist
+      ② 反向：这些项被判成「清单里没有」，实测报 12 个假警告
+    """
+
+    INSTALL = Path(__file__).resolve().parent.parent / "install.sh"
+    REAL_AGENTS = Path.home() / "Library" / "LaunchAgents"
+
+    def test_deploy_rows_not_counted_as_unlisted(self):
+        """[deploy] 项已登记在清单里，不该被算进「未登记」。
+
+        回退到用 listed（已排除 [deploy]）做反向比对时，本项会变成 12 左右 → 测试红。
+        """
+        if not self.REAL_AGENTS.is_dir():
+            self.skipTest("无 ~/Library/LaunchAgents")
+        r = subprocess.run(
+            ["/bin/bash", str(self.INSTALL), "--snapshot-plists"],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "AGENTS": str(self.REAL_AGENTS)},
+        )
+        self.assertRegex(r.stdout, r"未登记=0",
+                         f"[deploy] 项被误算成未登记，或真有 plist 没进 active.txt\n{r.stdout}")
+
+    def test_deploy_rows_not_refreshed(self):
+        """[deploy] 项即使快照不一致，也不该被正向刷新（它们归 Claw 部署脚本管）。
+
+        这条补的是行为侧：只断言 all_listed（反向）不够 —— 正向用 listed 时，
+        [deploy] 项仍会被 cp 覆盖快照，与 Claw 部署脚本抢同一批文件。
+        """
+        active = self.INSTALL.parent / "launchd" / "active.txt"
+        deploy_names = [l[len("[deploy]"):].strip()
+                        for l in active.read_text(encoding="utf-8").splitlines()
+                        if l.startswith("[deploy]")]
+        if not deploy_names:
+            self.skipTest("清单里没有 [deploy] 项")
+        name = deploy_names[0]
+        snap = self.INSTALL.parent / "launchd" / name
+        if not snap.exists():
+            self.skipTest(f"无快照 {name}")
+        with tempfile.TemporaryDirectory() as td:
+            tgt = Path(td) / name
+            tgt.write_bytes(snap.read_bytes() + b"\n")
+            r = subprocess.run(
+                ["/bin/bash", str(self.INSTALL), "--snapshot-plists"],
+                capture_output=True, text=True, timeout=120,
+                env={**os.environ, "AGENTS": td},
+            )
+        self.assertNotIn(f"将刷新快照 {name}", r.stdout,
+                         f"[deploy] 项被当普通项刷新了\n{r.stdout}")
+
+    def test_listed_excludes_deploy_rows(self):
+        """listed 变量必须整行排除 [deploy] 项（不能只剥前缀）。"""
+        src = self.INSTALL.read_text(encoding="utf-8")
+        self.assertIn("grep -v '^\\[deploy\\]'", src,
+                      "listed 又变回剥前缀了 —— [deploy] 项会被当普通项管理")
