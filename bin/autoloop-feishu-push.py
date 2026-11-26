@@ -20,6 +20,8 @@
 import hashlib
 import json
 import sys
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +33,7 @@ CONF = Path.home() / ".agent-autoloop" / "feishu.json"
 STATE_DIR = Path.home() / ".agent-autoloop" / "feishu-push-state"
 REPORT_DIR = Path("/Users/guan/WorkBuddy/Claw/output/inspection-daily")
 API_BASE = "https://open.feishu.cn/open-apis"
+SEND_ATTEMPTS = 3
 
 
 def load_conf():
@@ -55,6 +58,30 @@ def get_token(conf):
     return d["tenant_access_token"]
 
 
+def _post(payload, token):
+    """发一次请求；网络瞬时故障重试，业务错误立刻交出（重试也不会好）。
+
+    2026-11-26：11-20 的日报曾因一次 TimeoutError 永久静默 —— 见 mark_pushed 的注释。
+    """
+    body = json.dumps(payload, ensure_ascii=False).encode()
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    for attempt in range(1, SEND_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            f"{API_BASE}/im/v1/messages?receive_id_type=chat_id", data=body, headers=headers
+        )
+        try:
+            return json.loads(urllib.request.urlopen(req, timeout=15).read())
+        except (TimeoutError, urllib.error.URLError, OSError) as e:
+            if attempt == SEND_ATTEMPTS:
+                raise
+            wait = 2 * attempt
+            print(
+                f"[WARN] 发送异常（第 {attempt}/{SEND_ATTEMPTS} 次）: {type(e).__name__}: {e}；{wait}s 后重试",
+                file=sys.stderr,
+            )
+            time.sleep(wait)
+
+
 def send(token, conf, text, post=False):
     """post 模式发富文本；飞书拒收时自动降级纯文本，保证消息不丢。"""
     payload = {
@@ -62,12 +89,7 @@ def send(token, conf, text, post=False):
         "msg_type": "post" if post else "text",
         "content": post_content(text) if post else json.dumps({"text": text}, ensure_ascii=False),
     }
-    req = urllib.request.Request(
-        f"{API_BASE}/im/v1/messages?receive_id_type=chat_id",
-        data=json.dumps(payload, ensure_ascii=False).encode(),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-    )
-    d = json.loads(urllib.request.urlopen(req, timeout=15).read())
+    d = _post(payload, token)
     if d.get("code") != 0:
         if post:
             print(f"[WARN] post 发送失败 {d.get('code')}，降级纯文本", file=sys.stderr)
@@ -77,14 +99,24 @@ def send(token, conf, text, post=False):
     return (d.get("data") or {}).get("message_id", "")
 
 
+def _digest(content: str) -> str:
+    return hashlib.sha256(content.encode()).hexdigest()[:16]
+
+
 def already_pushed(key, content):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    """这份内容是否已成功推送过。只读，不落账 —— 落账交给 mark_pushed。"""
     state = STATE_DIR / f"{key}.state"
-    digest = hashlib.sha256(content.encode()).hexdigest()[:16]
-    if state.exists() and state.read_text().strip() == digest:
-        return True
-    state.write_text(digest)
-    return False
+    return state.exists() and state.read_text().strip() == _digest(content)
+
+
+def mark_pushed(key, content):
+    """推送成功之后才记账。
+
+    2026-11-26 修复：原实现在推送前就写 state，一次 TimeoutError 之后每天都被判定
+    「已推送过（内容未变）」而静默跳过 —— 11-20 的巡检日报就是这样永久漏推的。
+    """
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    (STATE_DIR / f"{key}.state").write_text(_digest(content))
 
 
 def main():
@@ -121,6 +153,8 @@ def main():
 
     token = get_token(conf)
     mid = send(token, conf, text, post=post)
+    if key.startswith("daily-"):
+        mark_pushed(key, content)
     print(f"[OK] 已推送 -> {conf.get('chat_name')} | "
           f"msg_type={'post' if post else 'text'} | message_id={mid} | key={key}")
 
