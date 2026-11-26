@@ -19,6 +19,7 @@
 
 import hashlib
 import json
+import socket
 import sys
 import time
 import urllib.error
@@ -34,6 +35,7 @@ STATE_DIR = Path.home() / ".agent-autoloop" / "feishu-push-state"
 REPORT_DIR = Path("/Users/guan/WorkBuddy/Claw/output/inspection-daily")
 API_BASE = "https://open.feishu.cn/open-apis"
 SEND_ATTEMPTS = 3
+REQUEST_TIMEOUT = 30
 
 
 def load_conf():
@@ -58,10 +60,25 @@ def get_token(conf):
     return d["tenant_access_token"]
 
 
+def _connect_only(e) -> bool:
+    """这次失败是否发生在「消息肯定没送到」的阶段。
+
+    连接被拒/域名解析失败/连接被重置 —— 请求没到服务端，重试安全。
+    读超时**不算**：服务端可能已经把消息发出去了，只是响应没回来，重试会造成重复投递。
+    """
+    if isinstance(e, (ConnectionError, socket.gaierror)):
+        return True
+    if isinstance(e, urllib.error.URLError):
+        return isinstance(getattr(e, "reason", None), (ConnectionError, socket.gaierror))
+    return False
+
+
 def _post(payload, token):
-    """发一次请求；网络瞬时故障重试，业务错误立刻交出（重试也不会好）。
+    """发一次请求；只在连接阶段失败时重试。
 
     2026-11-26：11-20 的日报曾因一次 TimeoutError 永久静默 —— 见 mark_pushed 的注释。
+    重试只覆盖「连接失败」，读超时直接失败退出，由日程的第二个时点（18:40 / 19:20，幂等）兜底，
+    这样既不会丢一天，也不会因为重试在群里出现两条相同的日报。
     """
     body = json.dumps(payload, ensure_ascii=False).encode()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -70,13 +87,13 @@ def _post(payload, token):
             f"{API_BASE}/im/v1/messages?receive_id_type=chat_id", data=body, headers=headers
         )
         try:
-            return json.loads(urllib.request.urlopen(req, timeout=15).read())
-        except (TimeoutError, urllib.error.URLError, OSError) as e:
-            if attempt == SEND_ATTEMPTS:
+            return json.loads(urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT).read())
+        except (OSError, urllib.error.URLError) as e:
+            if not _connect_only(e) or attempt == SEND_ATTEMPTS:
                 raise
             wait = 2 * attempt
             print(
-                f"[WARN] 发送异常（第 {attempt}/{SEND_ATTEMPTS} 次）: {type(e).__name__}: {e}；{wait}s 后重试",
+                f"[WARN] 连接失败（第 {attempt}/{SEND_ATTEMPTS} 次）: {type(e).__name__}: {e}；{wait}s 后重试",
                 file=sys.stderr,
             )
             time.sleep(wait)
