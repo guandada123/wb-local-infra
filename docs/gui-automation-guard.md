@@ -155,3 +155,38 @@ python3 bin/wb-ui-guard.py remove-interlock    # 还原 brew 软链
 **改完必须 `./install.sh --apply` 再测。** 实测踩过：改的是仓内 `bin/wb-ui-guard.py`，
 而 `cliclick` 走的是 `~/.local/bin` 的副本 —— 于是出现「`scan` 判定 BLOCK，`cliclick` 照样放行」
 的矛盾。这正是 `test_no_drift` 存在的理由。
+
+## 七、旁证：截图取证是另一条链路（2026-11-26）
+
+本文档管的是「**点之前**拦一下」。截图取证是反向链路 —— 不点，只看。
+两者共用同一批 GUI 能力，但坑完全不同，混在一起会误导后来人。
+
+### 三条实测
+
+1. **`screencapture -R` 不能用来截指定应用的窗口**
+   `-R x,y,w,h` 截的是**屏幕坐标区域**。目标窗口被遮挡时，截到的是压在上面的那个。
+   实测：飞书几何 `49,40,1707,946`，用 `-R` 截出来的是 WorkBuddy 窗口。
+   **必须用 `-l <CGWindowID>`** —— 它截的是窗口本体，被遮挡也正确。
+   教训：文件存在 + 尺寸正确 **不等于** 截对了，必须看内容才敢说成功。
+
+2. **`CGWindowID` 拿不到**，与第五节第 1 条同一根因：
+   pyobjc 两个环境都没有 `Quartz`；`osascript` 的 `id of window 1` 与
+   `attribute "AXWindowNumber"` 均报 `-1728`（不支持该属性）。
+   唯一可靠来源是 computer-use `get_app_state` 返回的 `window_id`（实测与 CGWindowID 一致）。
+
+3. **Electron 应用的 AX 树是空壳**
+   飞书 `get_app_state` 返回 31 个元素，全是外壳（`MultiWebView - messenger`、搜索按钮、头像），
+   **读不到一条消息文本，连群名都没有**。第五节第 2 条只写了「网页 confirm 框不在 AX 树」，
+   实际更彻底：整个应用正文都在 canvas 里。
+   → AI **无法用 AX 读飞书群聊**，只能截图交视觉模型。
+
+### 推论：不要做「零参数截图工具」
+
+2026-11-26 试过包一个 `feishu-shot`（自动找窗口 → 自动截 → 自动存档），三个方案均不成立：
+`-R` 会截错、拿不到稳定 id、`-i` 需人工点。硬做出来的工具**会截错图并报成功**，
+而截错图比没有工具更危险（会让人误判「消息到了 / 没到」）。
+
+正确用法二选一：
+
+- `get_app_state` 取 window_id → `screencapture -x -o -l <id> out.png`（零交互、确定）
+- `screencapture -i -x out.png`（人工点一下窗口，一次点击 100% 准）
