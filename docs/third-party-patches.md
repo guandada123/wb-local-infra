@@ -52,7 +52,8 @@
 - **登记日期**：2026-11-26
 - **位置**：`~/.agent-autoloop/app`（基线 = 条目 1 之后的 HEAD `d58ca6f`；本地提交 `c04ecc7`）
 - **文件**：`kernel/decide.ts`（新增 `PEAK_WINDOWS` / `peakHold()`，`tick()` 内对到期 timer 判定）
-  + `tests/resume-thread.test.ts`（改 2 处时钟、新增 3 条）+ `tests/stops-and-threads.test.ts`（改 1 处时钟）
+  + `tests/resume-thread.test.ts`（改 2 处时钟、新增 4 条）+ `tests/stops-and-threads.test.ts`（改 1 处时钟）
+  ｜本地提交两笔：`c04ecc7`（实现）、`1d8c122`（补 rule-gone 用例）
 - **为什么**：DeepSeek 高峰（周一至五 09-12、14-18 北京时间）单价翻倍，其余时段半价。
   中台的「到点复查」不赶时间，撞在峰里等于白付一倍。实测改前 9 轮 ¥0.444/轮、改后 6 轮 ¥0.276/轮。
 - **改动**：
@@ -64,16 +65,16 @@
   12:05 / 12:20 两个非峰 timer 未受影响（对应 #284 / #285 按原点起跑）。
 - **验证**：
   - `tsc --noEmit` 通过；`prettier --check` 通过
-  - `node --test tests/!(simulation)`：**813 pass / 0 fail / 22 skipped**（改前 810/788）
-  - 新增 3 条：09:30 峰内顺延、09:00 整点顺延、12:00 整点不顺延
+  - `node --test tests/!(simulation)`：**814 pass / 0 fail / 22 skipped**（改前 810/788）
+  - 新增 4 条：09:30 峰内顺延、09:00 整点顺延、12:00 整点不顺延、**规则已失效不被顺延**
   - 既有 3 条时钟从 09:01 推到 13:00，断言一字未改
-- **可重打的补丁文件**：`patches/agent-autoloop-offpeak-timer.patch`（`git format-patch` 单笔，含提交信息与测试）
+- **可重打的补丁文件**：`patches/agent-autoloop-offpeak-timer.patch`（`git format-patch d58ca6f..HEAD`，含两笔提交与测试）
   ```bash
   cd ~/.agent-autoloop/app && git apply /path/to/patches/agent-autoloop-offpeak-timer.patch
-  node --disable-warning=ExperimentalWarning --test tests/resume-thread.test.ts   # 应含 3 条峰谷用例
+  node --disable-warning=ExperimentalWarning --test tests/resume-thread.test.ts   # 应含 4 条峰谷用例
   ```
-  已验证：在 `HEAD~1` 的干净副本上 `git apply --check` 通过。
-- **怎么撤**：`git revert c04ecc7`（或 `git reset --hard d58ca6f`）。撤销后 `peakHold` 消失，复查不再避峰。
+  已验证：在基线 `d58ca6f` 的干净副本上 `git apply --check` 通过、应用后 `peakHold` 在位。
+- **怎么撤**：`git revert 1d8c122 c04ecc7`（或 `git reset --hard d58ca6f`）。撤销后 `peakHold` 消失，复查不再避峰。
 - **上游**：未发 PR。这一笔是**本地策略**（绕开计费高峰），不是通用 bug 修复，不建议上游。
 - **风险**：
   - 周末分支**尚未经生产验证**（下一个周六定时器 11-28 09:00 到期才能验），目前只有单元测试覆盖

@@ -1,7 +1,7 @@
 From c04ecc7aaa003c2e826746d0969a585a5a760cf7 Mon Sep 17 00:00:00 2001
 From: guandada123 <409899032@qq.com>
 Date: Thu, 26 Nov 2026 16:53:18 +0800
-Subject: [PATCH] =?UTF-8?q?feat(kernel):=20=E5=88=B0=E7=82=B9=E5=A4=8D?=
+Subject: [PATCH 1/2] =?UTF-8?q?feat(kernel):=20=E5=88=B0=E7=82=B9=E5=A4=8D?=
  =?UTF-8?q?=E6=9F=A5=E9=81=BF=E5=BC=80=E5=8E=82=E5=95=86=E8=AE=A1=E8=B4=B9?=
  =?UTF-8?q?=E9=AB=98=E5=B3=B0?=
 MIME-Version: 1.0
@@ -189,6 +189,58 @@ index 5c8dc79..50c13b5 100644
    it.act("tick");
    const next = it.act("claimNext", "w1", "c2");
    assert.equal(it.run(next.run).lane, "#1");
+-- 
+2.50.1 (Apple Git-155)
+
+
+From 1d8c1225bf481353c2e477f430320160c453abb4 Mon Sep 17 00:00:00 2001
+From: guandada123 <409899032@qq.com>
+Date: Thu, 26 Nov 2026 17:36:58 +0800
+Subject: [PATCH 2/2] =?UTF-8?q?test(kernel):=20=E9=92=89=E4=BD=8F=E3=80=8C?=
+ =?UTF-8?q?=E8=A7=84=E5=88=99=E5=B7=B2=E5=A4=B1=E6=95=88=E7=9A=84=E5=A4=8D?=
+ =?UTF-8?q?=E6=9F=A5=E4=B8=8D=E8=A2=AB=E9=A1=BA=E5=BB=B6=E3=80=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+peakHold 只在 rule 存在时才顺延，规则已失效的 timer 直接发通知（不调模型、不花钱），
+这条曾有代码守卫但无测试。补一条：09:30 峰中到期、规则已被删除 → 不产生轮次、立刻出通知。
+若把代码里的 rule 守卫去掉，该断言会因通知数为 0 而失败。
+---
+ tests/resume-thread.test.ts | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/tests/resume-thread.test.ts b/tests/resume-thread.test.ts
+index c23415b..8b21f32 100644
+--- a/tests/resume-thread.test.ts
++++ b/tests/resume-thread.test.ts
+@@ -285,6 +285,26 @@ test("a due check that comes due inside a billing peak waits for the peak to end
+   it.check();
+ });
+ 
++test("a due check whose rule has gone is told at once, not held back for a peak", () => {
++  const it = hub();
++  it.message();
++  const first = it.claim();
++  it.act("finish", first.run, first.token, {
++    outcome: "done",
++    session: "S",
++    later: [{ key: "复查", at: "2026-11-05T01:30:00Z", about: "规则没了也到期" }],
++  });
++  const without = structuredClone(rules);
++  without.rules = without.rules.filter((rule) => rule.name !== "意见");
++  it.act("rules", without);
++  it.pass(90); // 09:30 in Asia/Shanghai, inside a peak
++  it.act("tick");
++  // Nothing starts (the rule is gone), but the notice is not worth deferring: it costs no tokens.
++  assert.equal(it.claim(), null);
++  assert.equal(it.cards().filter((card: any) => card.kind === "notice").length, 1);
++  it.check();
++});
++
+ test("a due check landing exactly on 09:00 waits, because the peak starts at 09:00", () => {
+   const it = hub();
+   it.message();
 -- 
 2.50.1 (Apple Git-155)
 
