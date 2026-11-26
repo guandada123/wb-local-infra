@@ -8,8 +8,6 @@
     <array>
         <string>/Users/guan/.workbuddy/binaries/python/versions/3.13.12/bin/python3</string>
         <string>/Volumes/ZHITAI/WorkBuddy/Claw/scripts/pgsql_stall_watch.py</string>
-        <string>--samples</string>
-        <string>5</string>
     </array>
     <key>StartInterval</key>
     <integer>300</integer>
