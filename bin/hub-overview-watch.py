@@ -3,6 +3,8 @@
 """
 hub-overview 健康探针（独立进程，不与被观测服务同生命）
 - 探活校验「响应身份」：HTTP 200 且 JSON 含 generated_at/kpi/sources，防 200-but-empty 假绿灯
+- 数据新鲜度：读 sources 里的 last_run_at / mtime 算年龄，超阈值并入降级集合。
+  **Phase 1 阈值留空（THRESHOLDS={}），只写日志不告警** —— 阈值须由实测间隔定，不拍脑袋
 - 状态翻转才告警（up→down / down→up），常态不刷群
 - 告警走既有出口 autoloop-feishu-push.py（中台独立应用，不新建应用、不读凭据）
 用法：
@@ -11,13 +13,28 @@ hub-overview 健康探针（独立进程，不与被观测服务同生命）
   python3 hub-overview-watch.py --force-notify "文本"  # 手动验证推送链路
 """
 import json, os, subprocess, sys, urllib.request
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 URL = "http://127.0.0.1:3355/api/hub/overview"
 STATE = os.path.expanduser("~/.agent-autoloop/hub-overview-watch.state")
 PUSH = os.path.expanduser("~/.local/bin/autoloop-feishu-push.py")
 AUTH_PY = os.path.expanduser("~/.workbuddy/binaries/python/versions/3.13.12/bin/python3")
 LOG = os.path.expanduser("~/Library/Logs/hub-overview-watch.log")
+
+TZ = timezone(timedelta(hours=8))
+
+# 数据新鲜度阈值（小时）。**Phase 1 刻意留空** = 只观察、不告警。
+# 填值前必须用实测间隔（p50/p90/max，满 7 天）定阈值，阈值 = max × 1.5。
+# 见 reports/probe-freshness-design.md（2026-11-26）。
+THRESHOLDS = {}
+
+# 源 → 时间字段。launchd 与 git 是实时枚举、没有年龄语义，**结构上不在表里**，
+# 因此不会被误判为陈旧 —— 这是刻意设计，不是遗漏。
+SOURCE_TIME_FIELDS = {
+    "hub.db": "last_run_at",
+    "rules.json": "mtime",
+    "QUEUE.md": "mtime",
+}
 
 def log(msg):
     line = f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} {msg}"
@@ -27,6 +44,50 @@ def log(msg):
             f.write(line + "\n")
     except Exception:
         pass
+
+def parse_iso(text):
+    """ISO 时间 → aware datetime。
+
+    `runs.created_at` 是 UTC 且带 Z（见 hub-overview-server.py 回执段注释），
+    漏掉这层换算会整整差 8 小时，把阈值判错。无时区的一律按 +08:00。
+    """
+    if not text or not isinstance(text, str):
+        return None
+    raw = text.strip()
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        val = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    return val if val.tzinfo else val.replace(tzinfo=TZ)
+
+
+def age_hours(text, ref=None):
+    """数据年龄（小时）。拿不到时间返回 None —— 与「0 小时」严格区分。"""
+    stamp = parse_iso(text)
+    if stamp is None:
+        return None
+    base = ref or datetime.now(TZ)
+    return round((base - stamp).total_seconds() / 3600.0, 2)
+
+
+def stale_sources(payload, ref=None, thresholds=None):
+    """返回超过阈值的源名。thresholds 为空 → 恒返回 []（Phase 1 的既定行为）。"""
+    limits = thresholds if thresholds is not None else THRESHOLDS
+    if not limits:
+        return []
+    sources = (payload or {}).get("sources") or {}
+    stale = []
+    for name, limit in limits.items():
+        field = SOURCE_TIME_FIELDS.get(name)
+        if not field:
+            continue
+        age = age_hours((sources.get(name) or {}).get(field), ref)
+        if age is not None and age > limit:
+            stale.append(name)
+    return sorted(stale)
+
 
 def probe():
     """返回 (ok, 说明, 降级源列表)。校验响应身份而不只看状态码。"""
@@ -44,6 +105,12 @@ def probe():
             return False, "kpi.today 为空", []
         srcs = d.get("sources") or {}
         errs = sorted(k for k, v in srcs.items() if isinstance(v, dict) and v.get("error"))
+        # 数据新鲜度：Phase 1 只观察。THRESHOLDS 为空时 stale 恒为 []，行为与改动前一致。
+        ages = {n: age_hours((srcs.get(n) or {}).get(f)) for n, f in SOURCE_TIME_FIELDS.items()}
+        log("数据年龄(h) " + " ".join(f"{n}={v}" for n, v in ages.items()))
+        stale = stale_sources(d)
+        if stale:
+            errs = sorted(set(errs) | set(stale))
         detail = f"ok · {len(srcs)} 源 · {kpi_n} KPI" + (f" · 降级 {','.join(errs)}" if errs else "")
         return True, detail, errs
     except Exception as e:

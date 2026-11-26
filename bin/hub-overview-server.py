@@ -68,6 +68,17 @@ _last_hit = {}   # 防连点：同动作 5s 内重复直接忽略
 
 def now(): return datetime.now(TZ)
 
+def iso_mtime(path):
+    """文件最后修改时间（本地时区 ISO）；读不到返回 None，绝不抛。
+
+    供 sources 的数据新鲜度判定使用：只写字段，不参与任何展示逻辑，
+    观察侧（hub-overview-watch.py）自行决定阈值。
+    """
+    try:
+        return datetime.fromtimestamp(os.stat(path).st_mtime, TZ).isoformat(timespec="seconds")
+    except OSError:
+        return None
+
 def db_ro():
     con = sqlite3.connect(f"file:{HUB_DB}?mode=ro", uri=True, timeout=3)
     con.row_factory = sqlite3.Row
@@ -352,7 +363,8 @@ def collect():
         evs = q(con, "SELECT id,source,type,subject,summary,received_at FROM events ORDER BY received_at DESC LIMIT 300")
         if isinstance(evs, dict): raise RuntimeError(evs["error"])
         out["sources"]["hub.db"] = {"runs": len(runs), "runs_limit": 500,
-                                    "schedules": len(scheds), "events_tail": len(evs)}
+                                    "schedules": len(scheds), "events_tail": len(evs),
+                                    "last_run_at": (runs[0].get("created_at") if runs else None)}
 
         # 按日聚合（本地时区）
         by_day = {d: 0 for d in days}
@@ -530,7 +542,7 @@ def collect():
                 "tag": "运行中", "tagCls": "done",
                 "meta": {"执行": "command" if a.get("use") == "command" else str(a.get("use", "")),
                          "worker": a.get("worker", "-")}})
-        out["sources"]["rules.json"] = {"agents": len(ags)}
+        out["sources"]["rules.json"] = {"agents": len(ags), "mtime": iso_mtime(RULES)}
     except Exception as e:
         out["sources"]["rules.json"] = {"error": str(e)}
 
@@ -553,7 +565,7 @@ def collect():
         for b in (todo_blocks or [])[:12]:
             out["todos"].append({"p": "P1", "title": todo_title(b),
                                  "src": "QUEUE.md TODO 段", "due": "-", "done": False})
-        out["sources"]["QUEUE.md"] = {"todo_blocks": len(todo_blocks or [])}
+        out["sources"]["QUEUE.md"] = {"todo_blocks": len(todo_blocks or []), "mtime": iso_mtime(QUEUE)}
 
     # ---- 应用卡：同级目录探测 git 真源（找不到就诚实标「未定位」，不伪造状态）----
     apps = []
