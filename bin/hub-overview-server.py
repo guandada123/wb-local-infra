@@ -38,7 +38,13 @@ PROXY_DAILY = os.path.expanduser("~/.agent-autoloop/hub-proxy-daily.json")
 # 第三方补丁的落点（上游仓的克隆）。重装/升级会整目录覆盖，补丁随之消失。
 # 仅"等它再出错"太慢（可能几周），故每次采集直接核对两处签名。
 PATCH_VALIDATE = os.path.expanduser("~/.agent-autoloop/app/protocol/validate.ts")
-CI_CACHE = os.path.expanduser("~/.agent-autoloop/hub-ci-cache.json")       # CI 结果后台缓存（15 分钟过期）
+CI_CACHE = os.path.expanduser("~/.agent-autoloop/hub-ci-cache.json")
+# QTS 告警库（只读）。2026-11-26 起页面要能直接看到「当前有几条未恢复告警」——
+# 当晚就有一条真实的板块超限 open 着，而页面上完全看不见。
+DOCKER = shutil.which("docker") or "/opt/homebrew/bin/docker"
+QTS_PG = "quant-postgres"
+QTS_DB = "quant_trading"
+QTS_PG_USER = "quant_user"       # CI 结果后台缓存（15 分钟过期）
 _proxy_cache = {"key": None, "stats": None}
 _status_cache = {"ts": 0, "data": None}
 _ci_trigger = {"at": 0}
@@ -283,6 +289,29 @@ def patch_state():
         missing.append("报错指位")
     return "缺失", "缺 " + "、".join(missing) + " → 回执会重新丢 later，按 patches/ 重打"
 
+def open_alerts(limit=3):
+    """读 QTS alerts 表里 status='open' 的行数与前几条文案（只读，docker exec psql）。"""
+    sql = ("SELECT rule_id || '|' || coalesce(level,'') || '|' || "
+           "regexp_replace(left(message, 90), '[|\n\r]', ' ', 'g') "
+           f"FROM alerts WHERE status = 'open' ORDER BY triggered_at DESC")
+    try:
+        p = subprocess.run(
+            [DOCKER, "exec", QTS_PG, "psql", "-U", QTS_PG_USER, "-d", QTS_DB, "-tAc", sql],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception as e:
+        return {"ok": False, "count": 0, "rows": [], "note": f"{type(e).__name__}"}
+    if p.returncode != 0:
+        return {"ok": False, "count": 0, "rows": [],
+                "note": (p.stderr or "psql 失败").strip().splitlines()[0][:60]}
+    rows = [ln.strip() for ln in (p.stdout or "").splitlines() if ln.strip()]
+    parsed = []
+    for ln in rows[:limit]:
+        parts = ln.split("|", 2)
+        if len(parts) == 3:
+            parsed.append({"rule": parts[0], "level": parts[1], "msg": parts[2]})
+    return {"ok": True, "count": len(rows), "rows": parsed, "note": ""}
+
 def service_logs(per_file=3, total=30):
     """从 ~/.agent-autoloop/logs/*.log 抽真实报错行 → 日志区可见。
     时间只取行内时间戳；行内无时间戳则留空（不臆造）。"""
@@ -345,6 +374,7 @@ def collect():
     ps = proxy_stats()
     st = status_snapshot()
     ci = ci_cache()
+    oa = open_alerts()
     old_days, old_title = (None, None)
     if todo_blocks is not None:
         try:
@@ -495,6 +525,9 @@ def collect():
              "note": (f"{old_title[:40]}（仅统计群消息来源条目）" if old_title else "无带原文的待办")},
             {"label": "回执补丁", "val": patch_state()[0],
              "note": f"{patch_state()[1]}（{PATCH_VALIDATE.replace(os.path.expanduser('~'), '~')}）"},
+            {"label": "未恢复告警", "val": f"{oa['count']} 条",
+             "note": ("；".join(f"[{r['level']}] {r['msg']}" for r in oa["rows"])[:150]
+                      if oa["count"] else ("读取失败：" + oa["note"] if not oa["ok"] else "无（全部已恢复）"))},
             {"label": "CI 未启动", "val": f"{sum(1 for v in (ci.get('repos') or {}).values() if v.get('not_started'))} 仓",
              "note": ("未跑=计费/额度拦截，不是代码红：" +
                       "、".join(f"{k}({v.get('secs', 0)}s)" for k, v in (ci.get("repos") or {}).items() if v.get("not_started"))

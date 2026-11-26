@@ -42,6 +42,7 @@
 | 等你决策 | `agent-autoloop status --json` 的 `totals.attention` + 首张卡标题 | ✅ 接通 |
 | 回执不合规(7日) | `hub.db` 的 `cards` 表（标题含「回执」，近 7 天） | ✅ v1.10.4 接通：兼作第三方补丁哨兵 |
 | 回执补丁在位（v1.10.7） | `~/.agent-autoloop/app/protocol/validate.ts` 的两处签名 | ✅ 已接通：**在位/缺失** 每次采集直判（滞后指标看「回执不合规」，在位看这条） |
+| 未恢复告警（v1.10.9） | QTS `alerts` 表 `status='open'`（`docker exec psql` 只读，15s 超时） | ✅ 已接通：显示条数 + 前 3 条原文；**读不到时显示「读取失败」不冒充 0**（实测连错容器 → note 带原因） |
 
 ## 四、自动化规则
 
@@ -79,6 +80,7 @@
 
 | 版本 | 日期 | 摘要 |
 |---|---|---|
+| v1.10.9 | 2026-11-26 | **接 QTS 未恢复告警**：新增 `open_alerts()`（`docker exec quant-postgres psql` 只读、15s 超时），metrics 加「未恢复告警 N 条」并列前 3 条原文。起因：当晚确有一条真实的板块超限 open 告警（73.5%），而页面上完全看不见。**失败可见**：连错容器时显示「读取失败：No such container」而非 0 条（实测）。实测取数 131ms、生产 metrics 11 项 |
 | v1.10.8 | 2026-11-25 | **QTS 定位 + 断连日志静默**：① 应用卡 QTS 从「未定位」变为**真实 git 源**——路径由 `docker inspect quant-ai-scheduler` 的 bind mount 查出（`~/WorkBuddy/QuantTradingSystem`，不在外置卷同级），`PROJECTS` 的 `sub` 改为支持绝对路径（`~` 展开，不写死 `/Users/xxx`），现 **5/5 命中**；② `hub-ci-status.py` 同步纳入 QTS（6 仓，10.6s）并加 `ALIAS` 把目录名 `QuantTradingSystem` 映射为显示名 `QTS`，否则缓存 key 与页面查询名不一致会继续显示「无记录」；实测 QTS CI `success · 11-24 02:19`；③ 新增 `QuietServer`：只静默 `BrokenPipeError`/`ConnectionResetError`（客户端刷新/关页导致），其余异常照旧上抛——**正/负控验证**：两类断连输出 0 字节、`ValueError` 输出 241 字节。闸门 66 tests OK |
 | v1.10.7 | 2026-11-25 | **补丁在位哨兵 + 措辞分工**：原唯一哨兵是「等它再出错」（可能几周不触发），改为每次采集直读 `app/protocol/validate.ts` 判两处签名（`later.cancel !== true` + `function laterProblem`）→ metrics「回执补丁：在位/缺失」。**可证伪验证**：真实文件=在位；造一份被覆盖的临时文件=缺失，且原因写明缺哪处。另把「回执不合规(7日)」标为滞后指标，避免两行都自称哨兵。跨日核验：代理快照自动滚到 11-25（27 次）、保留 13 天、回执 7 日窗仍 3 次不串日 |
 | v1.10.6 | 2026-11-24 | **CI 未启动可见 + 快照原子写**：① metrics 加「CI 未启动 N 仓」（note 列仓名与耗时，口径写明「未跑=计费拦截，不是代码红」），实测 1 仓 `workbuddy-user-memory` 2s——补上一笔「监控扩到 5 仓但页面只显示 4 个卡」的不一致；② 代理每日快照改 tmp+fsync+`os.replace` 原子写：多线程下读-算-覆盖写可能读到半个 JSON，退化后会只写最近 7 天并让当日值倒退；并发 5 请求压测后仍 12 天、今日值不变。**诚实记录**：16:55 曾读到「今日代理 1621」，与现在 1024（=日志实际条数）不符，1621 实为 11-23 快照值，原因未复现、不下结论 |
