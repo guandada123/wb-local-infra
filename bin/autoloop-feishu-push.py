@@ -19,6 +19,7 @@
 
 import hashlib
 import json
+import os
 import socket
 import sys
 import time
@@ -171,6 +172,12 @@ def main():
     token = get_token(conf)
     mid = send(token, conf, text, post=post)
     if key.startswith("daily-"):
+        # 2026-11-26：日报曾在 18:26 被一个查不到调用方的进程推走，且它的 stdout 不落在
+        # launchd 的 StandardOutPath 里。留一行审计，下次再出现能直接认出是谁。
+        print(
+            f"[AUDIT] key={key} ppid={os.getppid()} cwd={os.getcwd()} argv={' '.join(sys.argv)}",
+            flush=True,
+        )
         mark_pushed(key, content)
     print(f"[OK] 已推送 -> {conf.get('chat_name')} | "
           f"msg_type={'post' if post else 'text'} | message_id={mid} | key={key}")
