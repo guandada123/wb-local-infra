@@ -17,7 +17,10 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 DEST="${DEST:-$HOME/.local/bin}"
 AGENTS="${AGENTS:-$HOME/Library/LaunchAgents}"
 # ---- 参数解析（--force 可出现在任意位置；2026-11-27 加）----
-FORCE=0
+# 注意：FORCE 同时是「环境变量开关」（下方闸门提示语就是 `FORCE=1 ./install.sh ...`），
+# 所以默认值只能补空、不能无条件覆盖 —— 曾写 `FORCE=0` 把调用方的 FORCE=1 吃掉，
+# 导致脚本自己推荐的应急用法失效（test_deploy_sync 的 force 用例翻红）。
+FORCE="${FORCE:-0}"
 _ARGS=()
 for _a in "$@"; do
   if [ "$_a" = "--force" ]; then FORCE=1; else _ARGS+=("$_a"); fi
