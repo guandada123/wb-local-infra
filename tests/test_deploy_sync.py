@@ -154,6 +154,16 @@ class TestInstallModes(unittest.TestCase):
                     copied += 1
             if copied == 0:
                 self.skipTest("真实 plist 一个都没拷到，跳过")
+            # 2026-11-26：拷进 tmpdir 会改 mtime，比对一旦带上时间维度，就会把
+            # 「拷贝动作」误判成漂移 → 每日 infra-sync-check 报 unittest rc=1 假红
+            # （2026-11-26 10:35 实测 `刷新=1 已最新=25 未登记=0`）。
+            # 本用例要验的是「内容不一致才刷新」，先把副本 mtime 对齐到仓内快照。
+            for n in names:
+                live_copy = Path(td) / n
+                snap = self.SNAP / n
+                if live_copy.exists() and snap.exists():
+                    st = snap.stat()
+                    os.utime(live_copy, ns=(st.st_atime_ns, st.st_mtime_ns))
             # 全量一致时：刷新数应为 0
             r0 = self._run("--snapshot-plists", agents=td)
             self.assertRegex(r0.stdout, r"刷新=0", f"一致时不应报刷新\nstdout={r0.stdout}")

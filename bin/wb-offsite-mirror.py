@@ -612,18 +612,36 @@ def _ping_url() -> str | None:
     return None
 
 
+# 打卡重试（2026-11-27）：日志里 `打卡失败（hc-ping.com）：URLError` 之后，
+# healthchecks 判 down → 05:21 推了「Offsite Mirror 心跳失联」告警；而镜像本身
+# **03:22 已校验通过**。一次网络抖动就能把人从床上叫起来，代价远高于重试 2 次。
+# 打卡是幂等 GET，重试无副作用。
+PING_ATTEMPTS = 3
+PING_RETRY_SLEEP = 2.0
+
+
 def _ping(kind: str = "", timeout: float = 10) -> str:
-    """kind ∈ "", "start", "fail"。永不抛异常、永不影响备份结论。"""
+    """kind ∈ "", "start", "fail"。永不抛异常、永不影响备份结论。
+
+    失败重试 `PING_ATTEMPTS` 次；返回串会注明是第几次成功的，
+    便于下次看日志区分「一次就成」与「靠重试兜住」。
+    """
     url = _ping_url()
     if not url:
         return "未配置 HC_MIRROR_PING_URL（外部收不到打卡，check 会一直红）"
     full = url.rstrip("/") + (f"/{kind}" if kind else "")
-    try:
-        with urllib.request.urlopen(full, timeout=timeout) as r:
-            return f"打卡[{kind or 'success'}] HTTP {r.status}"
-    except Exception as e:                                  # noqa: BLE001
-        host = urllib.parse.urlparse(url).netloc or "?"
-        return f"打卡失败（{host}）：{e.__class__.__name__}"
+    host = urllib.parse.urlparse(url).netloc or "?"
+    last = ""
+    for attempt in range(1, PING_ATTEMPTS + 1):
+        try:
+            with urllib.request.urlopen(full, timeout=timeout) as r:
+                suffix = "" if attempt == 1 else f"（第 {attempt} 次成功）"
+                return f"打卡[{kind or 'success'}] HTTP {r.status}{suffix}"
+        except Exception as e:                              # noqa: BLE001
+            last = f"打卡失败（{host}）：{e.__class__.__name__}"
+            if attempt < PING_ATTEMPTS:
+                time.sleep(PING_RETRY_SLEEP)
+    return f"{last}（已重试 {PING_ATTEMPTS} 次）"
 
 
 def cmd_daily(src_root: Path, dest_root: Path) -> int:

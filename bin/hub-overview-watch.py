@@ -12,7 +12,7 @@ hub-overview 健康探针（独立进程，不与被观测服务同生命）
   python3 hub-overview-watch.py --self-test  # 状态机自测，不联网不推送
   python3 hub-overview-watch.py --force-notify "文本"  # 手动验证推送链路
 """
-import json, os, subprocess, sys, urllib.request
+import json, os, subprocess, sys, time, urllib.request
 from datetime import datetime, timezone, timedelta
 
 URL = "http://127.0.0.1:3355/api/hub/overview"
@@ -22,6 +22,11 @@ AUTH_PY = os.path.expanduser("~/.workbuddy/binaries/python/versions/3.13.12/bin/
 LOG = os.path.expanduser("~/Library/Logs/hub-overview-watch.log")
 
 TZ = timezone(timedelta(hours=8))
+
+# 判死前的补探等待（秒）。见 2026-11-26 复盘：探针单次 8s 预算撞上服务
+# 「15s 级阻塞取数 + 5s 缓存失效点」就 TimeoutError，10 分钟自愈的那种红卡
+# 全是这么来的。补探一次把「单次慢」与「真宕机」分开，真宕机最多晚 30s 报。
+PROBE_RETRY_DELAY = 30
 
 # 数据新鲜度阈值（小时）。**Phase 1 刻意留空** = 只观察、不告警。
 # 填值前必须用实测间隔（p50/p90/max，满 7 天）定阈值，阈值 = max × 1.5。
@@ -115,6 +120,31 @@ def probe():
         return True, detail, errs
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"[:140], []
+
+def probe_with_retry(prior_state="unknown", retry_delay=None):
+    """先探一次；失败且当前不是 down 时，等 retry_delay 秒再探一次。
+
+    两次都失败才判 down；任一次成功即 up。已经 down 的话再探一次不改变结论，
+    省掉 30s 等待与二次采集负载。
+    """
+    delay = PROBE_RETRY_DELAY if retry_delay is None else retry_delay
+    ok, detail, errs = probe()
+    if ok or prior_state == "down":
+        return ok, detail, errs
+    log(f"探活失败（{detail}），{delay}s 后补探一次再判")
+    try:
+        time.sleep(delay)
+    except Exception:
+        pass
+    try:
+        ok2, detail2, errs2 = probe()
+    except Exception as e:  # fail-closed：补探异常按失败处理
+        return False, f"补探异常 {type(e).__name__}: {e}"[:140], []
+    if ok2:
+        log(f"补探成功：{detail2}（首次失败原为 {detail}）")
+        return ok2, detail2, errs2
+    return False, f"两次均失败：首次 {detail} / 补探 {detail2}"[:200], errs2
+
 
 def read_state():
     """状态文件格式：`state[:deg1,deg2]`；兼容旧的纯 `up`/`down`"""
@@ -216,6 +246,10 @@ def main():
         URL = args[args.index("--url") + 1]
     if "--state-file" in args:
         STATE = args[args.index("--state-file") + 1]
+    probe_once = "--probe-once" in args       # 关掉补探（测试/手动一次性诊断用）
+    probe_retry_delay = PROBE_RETRY_DELAY
+    if "--probe-retry-delay" in args:
+        probe_retry_delay = float(args[args.index("--probe-retry-delay") + 1])
     dry = "--dry-run" in args
     if "--force-notify" in args:
         i = args.index("--force-notify")
@@ -227,7 +261,24 @@ def main():
         return 0 if notify(args[i + 1]) else 1
 
     prev_state, prev_deg = read_state()
-    ok, detail, errs = probe()
+    # 内层补探：--probe-once 可关（测试用），此时由下面的外层补探兜底。
+    if probe_once:
+        ok, detail, errs = probe()
+    else:
+        ok, detail, errs = probe_with_retry(prev_state, probe_retry_delay)
+    # 外层补探：内层被 --probe-once 关掉时仍要「两次才判死」。
+    if not ok and probe_once and prev_state != "down":
+        log(f"探活失败（{detail}），{probe_retry_delay}s 后补探一次再判")
+        try:
+            time.sleep(probe_retry_delay)
+        except Exception:
+            pass
+        ok2, detail2, errs2 = probe()
+        if ok2:
+            log(f"补探成功：{detail2}（首次失败原为 {detail}）")
+            ok, detail, errs = ok2, detail2, errs2
+        else:
+            ok, detail, errs = False, f"两次均失败：首次 {detail} / 补探 {detail2}"[:200], errs2
     notify_needed, kind = decide(prev_state, prev_deg, ok, errs)
     cur = "up" if ok else "down"
 
