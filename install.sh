@@ -16,6 +16,14 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")" && pwd)"
 DEST="${DEST:-$HOME/.local/bin}"
 AGENTS="${AGENTS:-$HOME/Library/LaunchAgents}"
+# ---- 参数解析（--force 可出现在任意位置；2026-11-27 加）----
+FORCE=0
+_ARGS=()
+for _a in "$@"; do
+  if [ "$_a" = "--force" ]; then FORCE=1; else _ARGS+=("$_a"); fi
+done
+set -- ${_ARGS+"${_ARGS[@]}"}
+
 APPLY=0
 MODE=scripts
 case "${1:-}" in
@@ -170,11 +178,21 @@ done
 
 mkdir -p "$DEST"
 changed=0
+drift=""
 for f in "$REPO"/bin/*; do
   [ -f "$f" ] || continue
   n="$(basename "$f")"
   d="$DEST/$n"
   if [ -f "$d" ] && cmp -s "$f" "$d"; then
+    continue
+  fi
+  # 🔴 新者优先保护（2026-11-27 事故）：线上比仓内新 → 拒绝覆盖。
+  # 事故经过：线上已热修（含当日新功能），仓内还是旧版；部署器直接覆盖，线上新功能
+  # 被静默回退、且自检仍"绿"（旧版自检也过）。备份只是事后凭证，挡不住回退。
+  # 正确动作：把线上改动提交回仓 bin/ 再部署；确需覆盖加 --force（仍会先备份）。
+  if [ -f "$d" ] && [ "$d" -nt "$f" ] && [ "$FORCE" -eq 0 ]; then
+    echo "🛑 拒绝覆盖 ${n}：线上比仓内新（线上 $(date -r "$d" '+%m-%d %H:%M') > 仓内 $(date -r "$f" '+%m-%d %H:%M')）"
+    drift="$drift $n"
     continue
   fi
   if [ "$APPLY" -eq 1 ]; then
@@ -192,6 +210,15 @@ for f in "$REPO"/bin/*; do
   fi
   changed=$((changed + 1))
 done
+
+if [ -n "$drift" ]; then
+  _cnt="$(echo $drift | wc -w | tr -d ' ')"
+  echo ""
+  echo "⚠️  有 ${_cnt} 个脚本被跳过（线上比仓内新）：$drift"
+  echo "   处理：把线上改动提交回仓 bin/ 并 git commit，再重新部署（仓是唯一源）；"
+  echo "   应急覆盖：./install.sh --apply --force（会先备份到 .deploy-backups/）"
+  exit 1
+fi
 
 if [ "$changed" -eq 0 ]; then
   # 计数必须只数普通文件：ls 会把 __pycache__ 等目录也算进去（曾显示 28 vs 实际 27）
