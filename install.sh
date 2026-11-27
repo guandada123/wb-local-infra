@@ -201,7 +201,9 @@ for f in "$REPO"/bin/*; do
   if [ "$APPLY" -eq 1 ]; then
     # 覆盖前备份 live 旧版到隐藏目录（不污染 PATH 目录），保留最近 5 份
     if [ -f "$d" ]; then
-      BK="$HOME/.local/bin/.deploy-backups"
+      # 备份目录跟随 DEST（2026-11-27 修）：原写死 $HOME/.local/bin，用 DEST=/tmp/... 演练时
+      # 会把测试假文件写进真实备份目录，污染取证链（实测留下一份 20261127-115737 假备份）。
+      BK="$DEST/.deploy-backups"
       mkdir -p "$BK"
       cp -p "$d" "$BK/$n.$(date +%Y%m%d-%H%M%S)"
       ls -t "$BK/$n".* 2>/dev/null | tail -n +6 | xargs -r rm -f
