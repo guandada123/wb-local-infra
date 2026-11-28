@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import datetime
 import subprocess
 import sys
 import tempfile
@@ -410,10 +411,18 @@ class TestCheckFailSafe(unittest.TestCase):
         return {"MAJIU_HOME": str(home), "MAJIU_FILE": str(self.tmp / "总册.md")}, home
 
     def _run_with(self, extra: dict):
+        # 2026-11-28（T-045）：先清「马厩总册连续过期」状态文件再跑 ——
+        # 否则同一测试里先跑「总册最新」（rc=0，清状态）再跑「总册过期」（rc=1），
+        # 后者会因状态文件刚被删而被判为「首次过期（1 天）< 7 天阈值」→ 不推卡，
+        # 于是 `assertIn("总册已过期")` 必然红（实测就这样红的，且现象伪装成产品 bug）。
         env = {**os.environ,
                "REPO_OVERRIDE": str(self.repo), "LOG_OVERRIDE": str(self.tmp / "chk.log"),
                "AGENTS": str(self.agents), "LIVE_BIN": str(self.live),
-               "CLAW_HOME": str(self.tmp / "no-claw"), "DRY_RUN": "1", **extra}
+               "CLAW_HOME": str(self.tmp / "no-claw"), "DRY_RUN": "1",
+               # 2026-11-28（T-045）：本测试会以各种 DRY_RUN 组合调用检查器，
+               # 而检查器新增了「马厩总册连续过期计数」状态文件。不隔离的话，
+               # 这些测试会把**本机真实计数**反复抹成「今天」（实测：连续天数永远=1）。
+               "MAJIU_STATE_OVERRIDE": str(self.tmp / "majiu-stale.json"), **extra}
         return subprocess.run(["/bin/bash", str(self.CHECK)], capture_output=True, text=True,
                               timeout=180, env=env)
 
@@ -426,6 +435,16 @@ class TestCheckFailSafe(unittest.TestCase):
         self.assertEqual(0, gen.returncode, gen.stderr)
         fresh = self._run_with(extra)
         self.assertIn("OK:", fresh.stdout, f"总册最新时应 OK\nstdout={fresh.stdout}")
+
+        # 2026-11-28（T-045）：把状态文件回拨到「已连续 7 天过期」。
+        # 本测试验的是「过期必须被识别」，而 T-045 之后「首次过期当天」按设计
+        # **不推卡**（只记日志）。不拨的话这里永远拿不到「总册已过期」字样，
+        # 断言会红 —— 红的不是产品 bug，是测试没跟上新分档语义。
+        st = self.tmp / "majiu-stale.json"
+        st.write_text(
+            '{"first_stale": "%s"}' % (datetime.date.today() - datetime.timedelta(days=6)),
+            encoding="utf-8",
+        )
         # 新收尾一份档案 → 总册过期
         nd = home / "Claw" / ".workbuddy" / "archive" / "2026-11-23-conversation"
         nd.mkdir()

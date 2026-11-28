@@ -86,6 +86,78 @@ if [ -f "$IDX_SCRIPT" ]; then
   esac
 fi
 
+# ---------- ⑤ 马厩归档总册是否过期（T-045：日常降级为日志，连续 N 天才推卡） ----------
+# 2026-11-28：总册不是「每天都需要刷新」的对象，每日必推卡 = 每日必忽略（告警疲劳）；
+# 但它也不是无害信息（DR/交接要靠它）。故分档：
+#   · 日常过期  → 只写日志，不推卡
+#   · 连续 ≥ MAJIU_ESCALATE_DAYS 天过期 → 推一张卡，且**只推一次**（按「本轮过期起始日」去重）
+#   · 恢复正常  → 清状态文件，下次重新计数
+# 状态文件记三件：first_stale（本轮连续过期起始日）、pushed_for（已为该起始日推过卡的标记）。
+MAJIU_ESCALATE_DAYS=7
+# 状态文件：默认落在 ~/.local/state。加 MAJIU_STATE_OVERRIDE 是为了**测试隔离** ——
+# 2026-11-28 实测：`tests/test_deploy_sync.py` 会以各种 DRY_RUN 组合调用本脚本，
+# 若它们共用真实状态文件，就会把本机「连续过期计数」搅乱（生产状态被测试改写）。
+# 这是「隔离」位，不是「改判据」位：它只换文件位置，不换任何阈值/分支语义。
+# 阈值 MAJIU_ESCALATE_DAYS 保持硬编码 —— 那才是真正的判据，不该被环境改。
+MAJIU_STATE="${MAJIU_STATE_OVERRIDE:-$HOME/.local/state/majiu-stale.json}"
+
+majiu_streak_days() {
+  # 输出本轮已连续过期多少天。**文件不存在 = 0**（初见，还没记过），存在才按起始日算。
+  # 初版文件不存在也返回 1，把「刚记下」当成「已连续 1 天」，语义偏了一天。
+  [ -f "$MAJIU_STATE" ] || { echo 0; return; }
+  "$PY" - "$MAJIU_STATE" <<'PYEOF' 2>/dev/null || echo 0
+import json, sys, datetime
+try:
+    d = json.load(open(sys.argv[1]))
+    first = datetime.date.fromisoformat(d["first_stale"])
+    print((datetime.date.today() - first).days + 1)
+except Exception:
+    print(0)
+PYEOF
+}
+
+majiu_note_stale() {
+  # 记一笔「今天仍过期」。**起始日只在文件不存在时写一次，之后绝不覆盖**
+  # ——初版无条件 setdefault 后紧跟回写，第二次跑就重新算起，连续天数永远回到 1（实测 3/4 卡在这）。
+  [ -f "$MAJIU_STATE" ] && return 0
+  "$PY" - "$MAJIU_STATE" <<'PYEOF' 2>/dev/null || true
+import json, sys, datetime, pathlib
+p = pathlib.Path(sys.argv[1])
+today = datetime.date.today().isoformat()
+p.parent.mkdir(parents=True, exist_ok=True)
+p.write_text(json.dumps({"first_stale": today, "last_seen": today}, ensure_ascii=False))
+PYEOF
+}
+
+majiu_mark_pushed() {
+  "$PY" - "$MAJIU_STATE" <<'PYEOF' 2>/dev/null || true
+import json, sys, pathlib
+p = pathlib.Path(sys.argv[1])
+try:
+    d = json.loads(p.read_text())
+except Exception:
+    d = {}
+d["pushed_for"] = d.get("first_stale")
+p.write_text(json.dumps(d, ensure_ascii=False))
+PYEOF
+}
+
+majiu_already_pushed() {
+  # 本轮起始日是否已推过卡（幂等：同一轮只推一次）
+  "$PY" - "$MAJIU_STATE" <<'PYEOF' 2>/dev/null || echo 0
+import json, sys, pathlib
+try:
+    d = json.loads(pathlib.Path(sys.argv[1]).read_text())
+    print(1 if d.get("pushed_for") and d["pushed_for"] == d.get("first_stale") else 0)
+except Exception:
+    print(0)
+PYEOF
+}
+
+majiu_clear_state() {
+  rm -f "$MAJIU_STATE" 2>/dev/null || true
+}
+
 # ---------- ⑤ 马厩归档总册是否过期（台账/档案/归档区变了而总册没重跑） ----------
 majiu_issue=""
 MAJIU_SCRIPT="$REPO/bin/majiu-archive-index.py"
@@ -96,9 +168,23 @@ if [ -f "$MAJIU_SCRIPT" ]; then
   [ -n "${MAJIU_HOME:-}" ] && mj_args+=(--workbuddy-home "$MAJIU_HOME")
   mj_out="$("$PY" "$MAJIU_SCRIPT" "${mj_args[@]}" 2>&1)"; mj_rc=$?
   case "$mj_rc" in
-    0) : ;;
-    1) majiu_issue="总册已过期（台账/档案/归档区有变动）"
-       log "STALE(majiu): $(printf '%s\n' "$mj_out" | tail -1)" ;;
+    0) majiu_clear_state ;;
+    1) # 2026-11-28（T-045）分档：**先算 streak 再决定是否记起始日**。
+       # 初版先 note_stale 再算，note_stale 会把「今天」写成起始日，导致同一次调用里
+       # 永远算出 streak=1，看起来对；但第二次跑时起始日已固定、无法再靠「先写后算」。
+       # 正确语义：用**既有**状态算连续天数；初次（0）当天不算升级，只记起始日。
+       streak="$(majiu_streak_days)"
+       [ "$streak" -eq 0 ] && { majiu_note_stale; streak=1; }
+       if [ "$streak" -ge "$MAJIU_ESCALATE_DAYS" ]; then
+         if [ "$(majiu_already_pushed)" = "1" ]; then
+           log "STALE(majiu): 连续 ${streak} 天过期，本轮已推过卡（去重），今日不再推"
+         else
+           majiu_issue="总册已过期 **连续 ${streak} 天**（阈值 ${MAJIU_ESCALATE_DAYS} 天）：$(printf '%s\n' "$mj_out" | tail -1)"
+           log "STALE(majiu): 连续 ${streak} 天，升级为卡片"
+         fi
+       else
+         log "STALE(majiu): 连续 ${streak} 天过期（< ${MAJIU_ESCALATE_DAYS} 天阈值，仅日志不推卡）"
+       fi ;;
     2) majiu_issue="总册不存在：$MAJIU_FILE"
        log "MISSING(majiu): $MAJIU_FILE" ;;
     3) # 读不到云端清单 = 比对没做成，不能当过期，更不能当 OK
@@ -158,4 +244,6 @@ args=(--title "🟠 中台基础设施漂移" --level warning)
 [ -n "$majiu_issue" ] && args+=(--section "⑤ 马厩归档总册" "${majiu_issue}
 修法：python3 ~/WorkBuddy/wb-local-infra/bin/majiu-archive-index.py --with-library --out ~/WorkBuddy/马厩归档总册.md，然后**把这份覆盖到资料库「马厩归档总册」文档**（本机侧无法自动上传；只重建本机文件，资料库那份仍是旧的）")
 "$PY" "$HOME/.local/bin/push_card.py" "${args[@]}" 2>>"$LOG" || log "push_card 失败（见上）"
+# T-045 去重：这一轮因「总册连续过期」进卡片时打标记，后续每天不再重复推
+[ -n "$majiu_issue" ] && majiu_mark_pushed
 exit 0

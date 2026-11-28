@@ -3,3 +3,4 @@ __pycache__/
 
 # WorkBuddy 运行时产物（automation 记忆等）；本仓不纳管
 .workbuddy/
+.tmp_t045/
