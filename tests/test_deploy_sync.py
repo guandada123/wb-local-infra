@@ -164,6 +164,19 @@ class TestInstallModes(unittest.TestCase):
                 if live_copy.exists() and snap.exists():
                     st = snap.stat()
                     os.utime(live_copy, ns=(st.st_atime_ns, st.st_mtime_ns))
+            # 2026-11-28：**先把临时目录内容与仓内快照对齐**再断言「刷新=0」。
+            # 原逻辑直接拷线上 plist 就断言全量一致，隐含假设「线上 == 仓内快照」——
+            # 一旦有人改了线上 plist 而未刷新快照（今天就是 `com.user.autopilot-gate`
+            # 多了 ASSISTANT_COMMIT=1），本用例必红，而**那正是 snapshot 模式要报的漂移**。
+            # 于是「漂移探测功能」被它自己的前置状态判成假红。现在先 apply 一次对齐，
+            # 再把 mtime 也按快照对齐，才进入「内容不一致才刷新」这条断言。
+            self._run("--snapshot-plists-apply", agents=td, extra={"FORCE": "1"})
+            for n in names:
+                live_copy = Path(td) / n
+                snap = self.SNAP / n
+                if live_copy.exists() and snap.exists():
+                    st = snap.stat()
+                    os.utime(live_copy, ns=(st.st_atime_ns, st.st_mtime_ns))
             # 全量一致时：刷新数应为 0
             r0 = self._run("--snapshot-plists", agents=td)
             self.assertRegex(r0.stdout, r"刷新=0", f"一致时不应报刷新\nstdout={r0.stdout}")
